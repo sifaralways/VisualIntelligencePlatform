@@ -1,0 +1,31 @@
+# VIP Python dependencies
+# Install via: pip install -r requirements.txt
+# Or use setup.sh for the full guided setup.
+
+# Core ML
+mlx
+insightface
+faiss-cpu
+hdbscan
+scikit-learn
+numpy
+
+# Image / RAW
+rawpy
+Pillow
+
+# API
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+python-multipart
+httpx
+
+# Database
+aiosqlite
+
+# Dev / testing
+pytest
+pytest-asyncio
+httpx
