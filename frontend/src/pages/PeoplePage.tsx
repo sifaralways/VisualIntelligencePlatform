@@ -17,7 +17,8 @@ export default function PeoplePage() {
   const [namingId, setNamingId] = useState<number | null>(null)  // cluster id being named
   const [nameInput, setNameInput] = useState('')
   const [saving, setSaving] = useState(false)
-  const [mergeCandidate, setMergeCandidate] = useState<{ personId: number; name: string } | null>(null)  const [reviewPerson, setReviewPerson] = useState<Person | null>(null)
+  const [mergeCandidate, setMergeCandidate] = useState<{ personId: number; name: string } | null>(null)
+  const [reviewPerson, setReviewPerson] = useState<Person | null>(null)
   const [reviewFaces, setReviewFaces] = useState<FaceRow[]>([])
   const [reviewLoading, setReviewLoading] = useState(false)
   async function load() {
