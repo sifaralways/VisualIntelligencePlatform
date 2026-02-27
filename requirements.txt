@@ -5,6 +5,7 @@
 # Core ML
 mlx
 insightface
+onnxruntime>=1.20      # Official ONNX runtime; supports Apple Silicon (CoreML EP) since 1.18
 faiss-cpu
 hdbscan
 scikit-learn
