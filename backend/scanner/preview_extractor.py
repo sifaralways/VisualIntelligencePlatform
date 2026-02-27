@@ -60,16 +60,19 @@ def _extract_sync(raw_path: Path, out_path: Path) -> bool:
     We redirect stdout to the output file directly.
     """
     try:
+        # 60 s per file — CR3 files on iCloud can be slow to materialise
+        _timeout = 60
         result = subprocess.run(
             [
                 "exiftool",
+                "-fast2",       # skip scanning past EOF — much faster on CR3
                 "-b",
                 "-PreviewImage",
                 "-charset", "filename=UTF8",
                 str(raw_path),
             ],
             capture_output=True,
-            timeout=settings.exiftool_timeout_sec,
+            timeout=_timeout,
         )
 
         if result.returncode != 0 or not result.stdout:
@@ -77,13 +80,14 @@ def _extract_sync(raw_path: Path, out_path: Path) -> bool:
             result = subprocess.run(
                 [
                     "exiftool",
+                    "-fast2",
                     "-b",
                     "-JpgFromRaw",
                     "-charset", "filename=UTF8",
                     str(raw_path),
                 ],
                 capture_output=True,
-                timeout=settings.exiftool_timeout_sec,
+                timeout=_timeout,
             )
 
         if not result.stdout:

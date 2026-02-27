@@ -14,12 +14,16 @@ import asyncio
 import json
 import logging
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
 from backend.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Per-file timeout (seconds). CR3 files are large; 20 s is generous.
+_PER_FILE_TIMEOUT = 20
 
 
 class ExifToolReader:
@@ -33,77 +37,102 @@ class ExifToolReader:
 
     def __init__(self) -> None:
         self._proc: subprocess.Popen | None = None
+        self._lock = asyncio.Lock()   # serialise calls; stdout is a sequential stream
 
     async def __aenter__(self) -> "ExifToolReader":
-        loop = asyncio.get_event_loop()
-        self._proc = await loop.run_in_executor(None, self._start)
+        self._start()
         return self
 
     async def __aexit__(self, *_: Any) -> None:
         await self.close()
 
-    def _start(self) -> subprocess.Popen:
-        proc = subprocess.Popen(
+    def _start(self) -> None:
+        self._proc = subprocess.Popen(
             [
                 "exiftool",
                 "-stay_open", "True",
                 "-@", "-",              # read args from stdin
                 "-common_args",
                 "-json",
+                "-fast2",               # skip scanning past end-of-file (faster on CR3)
                 "-charset", "filename=UTF8",
-                "-q",                   # quiet: suppress warnings to stdout
+                "-q",
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
-        logger.debug("ExifTool stay_open process started (pid=%d)", proc.pid)
-        return proc
+        logger.debug("ExifTool stay_open process started (pid=%d)", self._proc.pid)
+
+    def _restart(self) -> None:
+        """Kill the current (stuck) process and start a fresh one."""
+        if self._proc:
+            try:
+                self._proc.kill()
+                self._proc.wait(timeout=3)
+            except Exception:
+                pass
+        self._proc = None
+        self._start()
+        logger.warning("ExifTool process restarted after timeout")
 
     async def read(self, path: Path) -> dict[str, Any]:
         """Read EXIF metadata for a single file. Returns normalised dict."""
-        raw = await self._execute(str(path))
+        async with self._lock:
+            raw = await self._execute_one(path)
         if not raw:
             return {}
-        return _normalise(raw[0])
+        return _normalise(raw)
 
     async def read_batch(self, paths: list[Path]) -> list[dict[str, Any]]:
-        """Read EXIF for a batch of files. More efficient than calling read() N times."""
-        if not paths:
-            return []
-        args = "\n".join(str(p) for p in paths)
-        raw = await self._execute(args)
-        return [_normalise(r) for r in raw]
-
-    async def _execute(self, args_block: str) -> list[dict[str, Any]]:
         """
-        Send a block of arguments to the stay_open process and read JSON response.
-        ExifTool signals end of output with {ready} on its own line.
+        Read EXIF for a list of files.
+
+        We call read() per file (serialised via the lock) rather than sending
+        all paths in a single -execute block. This prevents a single large-batch
+        timeout from wedging the entire process and makes per-file error recovery
+        straightforward.
+        """
+        results = []
+        for path in paths:
+            results.append(await self.read(path))
+        return results
+
+    async def _execute_one(self, path: Path) -> dict[str, Any] | None:
+        """
+        Send one file to the stay_open process and read the JSON response.
+        On timeout, kill + restart the process so the next call is clean.
+        Caller must hold self._lock.
         """
         if self._proc is None or self._proc.poll() is not None:
-            raise RuntimeError("ExifTool process is not running")
+            self._start()
 
-        command = f"{args_block}\n-execute\n".encode()
+        command = f"{path}\n-execute\n".encode()
         loop = asyncio.get_event_loop()
 
+        # We read stdout in a daemon thread. If it times out we kill the process,
+        # which unblocks the thread (EOF on stdout), keeping the executor clean.
+        future = loop.run_in_executor(None, self._read_response, command)
         try:
-            result = await asyncio.wait_for(
-                loop.run_in_executor(None, self._read_response, command),
-                timeout=settings.exiftool_timeout_sec,
-            )
-            return json.loads(result) if result.strip() else []
+            result = await asyncio.wait_for(future, timeout=_PER_FILE_TIMEOUT)
+            parsed = json.loads(result) if result.strip() else []
+            return parsed[0] if parsed else None
         except asyncio.TimeoutError:
-            logger.error("ExifTool timed out reading: %s", args_block[:100])
-            return []
+            logger.warning("ExifTool timed out on %s — restarting process", path.name)
+            self._restart()
+            return None
         except json.JSONDecodeError as e:
-            logger.error("ExifTool JSON parse error: %s", e)
-            return []
+            logger.error("ExifTool JSON parse error for %s: %s", path.name, e)
+            return None
 
     def _read_response(self, command: bytes) -> str:
-        """Synchronous — runs in executor thread."""
+        """Synchronous — runs in executor thread. Unblocks when process is killed."""
         assert self._proc and self._proc.stdin and self._proc.stdout
-        self._proc.stdin.write(command)
-        self._proc.stdin.flush()
+        try:
+            self._proc.stdin.write(command)
+            self._proc.stdin.flush()
+        except BrokenPipeError:
+            return ""
 
         output_lines = []
         for line in self._proc.stdout:
