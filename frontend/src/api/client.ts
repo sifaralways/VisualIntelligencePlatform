@@ -72,6 +72,15 @@ export const api = {
       }),
     status: () => request<Record<string, number>>('/writeback/status'),
   },
+
+  // ─── Admin ──────────────────────────────────────────────────────────────────
+  admin: {
+    stats: () => request<AdminStats>('/admin/stats'),
+    reset: (scope: string) =>
+      request<{ status: string; scope: string; detail: string }>(`/admin/reset/${scope}`, {
+        method: 'DELETE',
+      }),
+  },
 }
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -127,6 +136,17 @@ export interface WritebackPreview {
   count: number
   items: WritebackItem[]
   warning: string
+}
+
+export interface AdminStats {
+  media_files: number
+  faces: number
+  embeddings: number
+  clusters: number
+  persons: number
+  writeback_queue: number
+  thumbnail_files: number
+  media_by_state: Record<string, number>
 }
 
 export interface WritebackItem {

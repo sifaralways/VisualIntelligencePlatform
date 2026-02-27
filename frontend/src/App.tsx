@@ -3,15 +3,17 @@ import PeoplePage from './pages/PeoplePage'
 import SearchPage from './pages/SearchPage'
 import WritebackPage from './pages/WritebackPage'
 import PipelinePage from './pages/PipelinePage'
+import AdminPage from './pages/AdminPage'
 import './index.css'
 
-type Page = 'people' | 'search' | 'writeback' | 'pipeline'
+type Page = 'people' | 'search' | 'writeback' | 'pipeline' | 'admin'
 
 const NAV: { id: Page; label: string }[] = [
   { id: 'people',   label: '👤 People' },
   { id: 'search',   label: '🔍 Search' },
   { id: 'writeback',label: '💾 Write to Files' },
   { id: 'pipeline', label: '⚙️ Pipeline' },
+  { id: 'admin',    label: '🛠 Admin' },
 ]
 
 export default function App() {
@@ -45,6 +47,7 @@ export default function App() {
         {page === 'search'    && <SearchPage />}
         {page === 'writeback' && <WritebackPage />}
         {page === 'pipeline'  && <PipelinePage />}
+        {page === 'admin'     && <AdminPage />}
       </main>
     </div>
   )
