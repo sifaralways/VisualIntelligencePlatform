@@ -49,10 +49,10 @@ export default function PeoplePage() {
     } finally { setSaving(false) }
   }
 
-  async function handleMerge(clusterId: number, intoName: string) {
+  async function handleMerge(clusterId: number, personId: number) {
     setSaving(true)
     try {
-      await api.persons.fromCluster(clusterId, intoName)
+      await api.persons.addCluster(personId, clusterId)
       setMergeCandidate(null)
       setNamingId(null)
       setNameInput('')
@@ -75,11 +75,17 @@ export default function PeoplePage() {
               "{nameInput}" is already used. Same person or different?
             </p>
             <div className="flex gap-3">
-              <button onClick={() => handleMerge(namingId!, mergeCandidate.name)} disabled={saving}
+              <button onClick={() => handleMerge(namingId!, mergeCandidate.personId)} disabled={saving}
                 className="flex-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg py-2 text-sm font-medium">
                 Same — merge
               </button>
-              <button onClick={() => handleMerge(namingId!, nameInput + ' (2)')} disabled={saving}
+              <button onClick={async () => {
+                setSaving(true)
+                try {
+                  await api.persons.fromCluster(namingId!, nameInput.trim() + ' (2)')
+                  setMergeCandidate(null); setNamingId(null); setNameInput(''); load()
+                } finally { setSaving(false) }
+              }} disabled={saving}
                 className="flex-1 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-white rounded-lg py-2 text-sm font-medium">
                 Different person
               </button>

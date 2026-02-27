@@ -74,7 +74,7 @@ class Settings(BaseSettings):
     insightface_model: str = "buffalo_l"
     embedding_dim: int = 512
     face_detection_threshold: float = 0.5   # RetinaFace min confidence
-    min_face_size_px: int = 40              # ignore faces smaller than this
+    min_face_size_px: int = 20              # ignore faces smaller than this (lowered for small/distant faces)
 
     # -------------------------------------------------------------------------
     # Clustering (HDBSCAN)

@@ -237,6 +237,28 @@ async def _phase_cluster() -> None:
     logger.info("Phase 3: Clustering")
     await broadcast("phase_start", phase="cluster")
 
+    # Step 1: Wipe unnamed clusters so their faces rejoin the pool.
+    # This ensures new arrivals get context from ALL unowned faces, not just
+    # themselves — critical when a single new photo brings few new faces.
+    async with get_db() as db:
+        unnamed = await db.execute_fetchall(
+            "SELECT id FROM clusters WHERE person_id IS NULL"
+        )
+        unnamed_ids = [r["id"] for r in unnamed]
+        if unnamed_ids:
+            ph = ",".join("?" * len(unnamed_ids))
+            # Release face → cluster assignments for unnamed clusters
+            await db.execute(
+                f"UPDATE faces SET cluster_id=NULL WHERE cluster_id IN ({ph})",
+                unnamed_ids,
+            )
+            await db.execute(
+                f"DELETE FROM clusters WHERE id IN ({ph})",
+                unnamed_ids,
+            )
+            logger.info("Cleared %d unnamed clusters; faces returned to pool", len(unnamed_ids))
+
+    # Step 2: Gather ALL faces not yet owned by a named person
     async with get_db() as db:
         rows = await db.execute_fetchall("""
             SELECT f.id as face_id, e.vector

@@ -131,3 +131,29 @@ async def create_person_from_cluster(cluster_id: int, req: NameClusterRequest):
         """, (cluster_id,))
 
     return {"status": "created", "person_id": person_id, "uuid": person_uuid}
+
+
+@router.post("/{person_id}/add-cluster/{cluster_id}")
+async def add_cluster_to_person(person_id: int, cluster_id: int):
+    """Assign an existing cluster to an existing person (merge path)."""
+    async with get_db() as db:
+        existing = await (
+            await db.execute("SELECT id FROM persons WHERE id=? AND is_merged=0", (person_id,))
+        ).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Person not found")
+
+        await db.execute(
+            "UPDATE clusters SET person_id=? WHERE id=?", (person_id, cluster_id)
+        )
+        await db.execute(
+            "UPDATE faces SET person_id=? WHERE cluster_id=?", (person_id, cluster_id)
+        )
+
+        # Queue photos for writeback
+        await db.execute("""
+            INSERT OR IGNORE INTO writeback_queue (media_file_id)
+            SELECT DISTINCT media_file_id FROM faces WHERE cluster_id=?
+        """, (cluster_id,))
+
+    return {"status": "merged", "person_id": person_id}

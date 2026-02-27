@@ -44,6 +44,8 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ name }),
       }),
+    addCluster: (personId: number, clusterId: number) =>
+      request(`/persons/${personId}/add-cluster/${clusterId}`, { method: 'POST' }),
   },
 
   // ─── Faces ────────────────────────────────────────────────────────────────

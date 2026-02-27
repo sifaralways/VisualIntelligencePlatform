@@ -58,7 +58,7 @@ class FaceDetector:
             name=settings.insightface_model,
             providers=["CoreMLExecutionProvider", "CPUExecutionProvider"],
         )
-        self._app.prepare(ctx_id=0, det_size=(640, 640))
+        self._app.prepare(ctx_id=0, det_size=(1280, 1280))
         logger.info("✅  Face detector ready")
 
     def detect(self, image_path: Path) -> list[DetectedFace]:
