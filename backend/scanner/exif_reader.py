@@ -22,8 +22,29 @@ from backend.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Per-file timeout (seconds). CR3 files are large; 20 s is generous.
-_PER_FILE_TIMEOUT = 20
+# Per-file timeout. Must cover iCloud on-demand download of a 40 MB CR3
+# on a slow connection before ExifTool can read it.
+_PER_FILE_TIMEOUT = 120
+
+
+def materialise_file(path: Path) -> bool:
+    """
+    Force iCloud to fully download a file before we read it with ExifTool.
+
+    iCloud stubs are already filtered out by the walker, but an iCloud file that
+    IS locally present may still be only partially downloaded on first access.
+    Reading the first byte via a regular open() call blocks until macOS has
+    materialised the file, which is exactly what we want.
+
+    Returns True if the file is readable, False on any error.
+    """
+    try:
+        with open(path, 'rb') as f:
+            f.read(1)   # triggers iCloud download block; returns when file is ready
+        return True
+    except OSError as e:
+        logger.warning("Cannot materialise %s: %s", path.name, e)
+        return False
 
 
 class ExifToolReader:
@@ -78,6 +99,12 @@ class ExifToolReader:
 
     async def read(self, path: Path) -> dict[str, Any]:
         """Read EXIF metadata for a single file. Returns normalised dict."""
+        # Materialise from iCloud before handing to ExifTool.
+        # run_in_executor so the blocking open() doesn't stall the event loop.
+        loop = asyncio.get_event_loop()
+        ok = await loop.run_in_executor(None, materialise_file, path)
+        if not ok:
+            return {}
         async with self._lock:
             raw = await self._execute_one(path)
         if not raw:

@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 from backend.config import settings
+from backend.scanner.exif_reader import materialise_file
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,9 @@ def _extract_sync(raw_path: Path, out_path: Path) -> bool:
     try:
         # 60 s per file — CR3 files on iCloud can be slow to materialise
         _timeout = 60
+        # Materialise from iCloud before running ExifTool
+        if not materialise_file(raw_path):
+            return False
         result = subprocess.run(
             [
                 "exiftool",
