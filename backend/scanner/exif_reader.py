@@ -31,16 +31,35 @@ def materialise_file(path: Path) -> bool:
     """
     Force iCloud to fully download a file before we read it with ExifTool.
 
-    iCloud stubs are already filtered out by the walker, but an iCloud file that
-    IS locally present may still be only partially downloaded on first access.
-    Reading the first byte via a regular open() call blocks until macOS has
-    materialised the file, which is exactly what we want.
+    Strategy:
+      1. `brctl download <path>` — the macOS iCloud control tool that blocks
+         until the file is 100% local. This is the correct API.
+      2. Fallback: read the whole file into /dev/null, which forces a full
+         APFS file-provider materialisation before returning.
 
-    Returns True if the file is readable, False on any error.
+    Returns True if the file is readable and local, False on any error.
     """
+    import subprocess
+
+    # Fast path: brctl is available on all macOS versions with iCloud Drive
+    try:
+        result = subprocess.run(
+            ["brctl", "download", str(path)],
+            timeout=300,   # 5 min max — enough for a 60 MB CR3 on slow iCloud
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            return True
+        # brctl may return non-zero even on success for already-local files
+        # fall through to the read fallback
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        logger.debug("brctl unavailable or timed out (%s) — falling back to full read", e)
+
+    # Fallback: read every byte to force full materialisation
     try:
         with open(path, 'rb') as f:
-            f.read(1)   # triggers iCloud download block; returns when file is ready
+            while f.read(8 * 1024 * 1024):  # 8 MB chunks
+                pass
         return True
     except OSError as e:
         logger.warning("Cannot materialise %s: %s", path.name, e)
@@ -100,11 +119,14 @@ class ExifToolReader:
     async def read(self, path: Path) -> dict[str, Any]:
         """Read EXIF metadata for a single file. Returns normalised dict."""
         # Materialise from iCloud before handing to ExifTool.
-        # run_in_executor so the blocking open() doesn't stall the event loop.
+        # run_in_executor so the blocking download doesn't stall the event loop.
+        logger.debug("Materialising %s …", path.name)
         loop = asyncio.get_event_loop()
         ok = await loop.run_in_executor(None, materialise_file, path)
         if not ok:
+            logger.warning("Could not materialise %s — skipping", path.name)
             return {}
+        logger.debug("Materialised %s  ✓", path.name)
         async with self._lock:
             raw = await self._execute_one(path)
         if not raw:
