@@ -602,15 +602,29 @@ echo "Run: ./start.sh"
 | Git repo + remote | ✅ Done | main branch, remote linked |
 | .gitignore | ✅ Done | macOS, Node, ML, media, project-specific |
 | SOLUTION_DESIGN.md | ✅ Done | This document |
-| setup.sh | 🔲 Not started | |
-| Backend skeleton | 🔲 Not started | |
-| Frontend skeleton | 🔲 Not started | |
-| DB schema + migrations | 🔲 Not started | |
-| Phase 0 benchmarks | 🔲 Not started | |
-| Phase 1: Scanner | 🔲 Not started | |
-| Phase 2: ML pipeline | 🔲 Not started | |
-| Phase 3: Clustering | 🔲 Not started | |
-| Phase 4: Web UI | 🔲 Not started | |
-| Phase 5: Writeback | 🔲 Not started | |
-| Phase 6: Object/OCR | 🔲 Not started | |
-| Phase 7: Search | 🔲 Not started | |
+| setup.sh / start.sh | ✅ Done | One-command bootstrap + launcher |
+| requirements.txt | ✅ Done | All Python deps listed |
+| backend/config.py | ✅ Done | All constants via Pydantic Settings |
+| backend/main.py | ✅ Done | FastAPI app, CORS, lifespan, routers |
+| DB schema + migrations | ✅ Done | 001_initial.sql — 7 tables + indices |
+| backend/database/models.py | ✅ Done | Pydantic response models |
+| backend/scanner/ | ✅ Done | walker, hasher, exif_reader, preview_extractor |
+| backend/ml/ | ✅ Done | face_detector, embedder, clusterer, FAISS index |
+| backend/pipeline/ingest.py | ✅ Done | 3-phase orchestrator (scan→embed→cluster) |
+| backend/api/websocket.py | ✅ Done | WebSocket progress broadcaster |
+| backend/api/routes/ | ✅ Done | pipeline, persons, faces, media, search, writeback |
+| backend/writeback/ | ✅ Done | exiftool writer, XMP fields, dry-run engine |
+| scripts/ | ✅ Done | benchmark.py, reset_db.py |
+| Frontend scaffold | ✅ Done | Vite + React 18 + Tailwind CSS v4, proxy config |
+| frontend/src/api/client.ts | ✅ Done | Fully-typed API client |
+| frontend pages | ✅ Done | PeoplePage, PipelinePage, SearchPage, WritebackPage |
+| Phase 0 benchmarks | 🔲 Not started | Requires real CR3 files — run locally |
+| Phase 1: Scanner (E2E test) | 🔲 Not started | Wire up & test on real library |
+| Phase 2: ML pipeline (E2E) | 🔲 Not started | Validate InsightFace output |
+| Phase 3: Clustering (E2E) | 🔲 Not started | Tune HDBSCAN params |
+| Phase 4: Web UI polish | 🔲 Not started | Error states, pagination, thumbnails |
+| Phase 5: Writeback (E2E) | 🔲 Not started | Test ExifTool atomic write on CR3 |
+| Phase 6: Object/OCR | 🔲 Not started | Deferred — post Phase 5 |
+| Phase 7: Search (E2E) | 🔲 Not started | FAISS ANN + SQLite keyword |
+
+**Last updated:** 2025-07-14 — Phase 0 complete; all skeleton code committed and pushed.
