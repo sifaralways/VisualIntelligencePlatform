@@ -8,20 +8,23 @@
 
 import { useEffect, useState } from 'react'
 import { api } from '../api/client'
-import type { Person } from '../api/client'
+import type { Cluster, Person } from '../api/client'
 
 export default function PeoplePage() {
+  const [clusters, setClusters] = useState<Cluster[]>([])
   const [persons, setPersons] = useState<Person[]>([])
   const [loading, setLoading] = useState(true)
-  const [namingId, setNamingId] = useState<number | null>(null)
+  const [namingId, setNamingId] = useState<number | null>(null)  // cluster id being named
   const [nameInput, setNameInput] = useState('')
-  const [mergeCandidate, setMergeCandidate] = useState<{ id: number; existingName: string } | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [mergeCandidate, setMergeCandidate] = useState<{ personId: number; name: string } | null>(null)
 
   async function load() {
     setLoading(true)
     try {
-      const data = await api.persons.list()
-      setPersons(data)
+      const [c, p] = await Promise.all([api.clusters.unnamed(), api.persons.list()])
+      setClusters(c)
+      setPersons(p)
     } finally {
       setLoading(false)
     }
@@ -29,66 +32,55 @@ export default function PeoplePage() {
 
   useEffect(() => { load() }, [])
 
-  async function handleName(personId: number) {
+  async function handleName(clusterId: number) {
     const name = nameInput.trim()
     if (!name) return
-
-    // Check if this name is already used by another person
-    const existing = persons.find(p => p.name?.toLowerCase() === name.toLowerCase() && p.id !== personId)
+    const existing = persons.find(p => p.name?.toLowerCase() === name.toLowerCase())
     if (existing) {
-      setMergeCandidate({ id: existing.id, existingName: existing.name! })
+      setMergeCandidate({ personId: existing.id, name: existing.name! })
       return
     }
-
-    await api.persons.namePerson(personId, name)
-    setNamingId(null)
-    setNameInput('')
-    load()
+    setSaving(true)
+    try {
+      await api.persons.fromCluster(clusterId, name)
+      setNamingId(null)
+      setNameInput('')
+      load()
+    } finally { setSaving(false) }
   }
 
-  async function handleMerge(sourceId: number, intoId: number) {
-    await api.persons.merge(sourceId, intoId)
-    setMergeCandidate(null)
-    setNamingId(null)
-    setNameInput('')
-    load()
+  async function handleMerge(clusterId: number, intoName: string) {
+    setSaving(true)
+    try {
+      await api.persons.fromCluster(clusterId, intoName)
+      setMergeCandidate(null)
+      setNamingId(null)
+      setNameInput('')
+      load()
+    } finally { setSaving(false) }
   }
 
   if (loading) return <div className="text-gray-400 text-sm">Loading people…</div>
-
-  const unnamed = persons.filter(p => !p.name)
-  const named   = persons.filter(p =>  p.name)
 
   return (
     <div>
       <h1 className="text-xl font-semibold mb-6">People</h1>
 
-      {/* Merge confirmation dialog */}
-      {mergeCandidate && namingId && (
+      {/* Merge dialog */}
+      {mergeCandidate && namingId !== null && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
           <div className="bg-gray-800 rounded-xl p-6 max-w-sm w-full shadow-xl">
             <p className="text-white font-medium mb-2">Same person?</p>
             <p className="text-gray-300 text-sm mb-6">
-              "{nameInput}" is already assigned to another cluster.
-              Are these the same person or two different people with the same name?
+              "{nameInput}" is already used. Same person or different?
             </p>
             <div className="flex gap-3">
-              <button
-                onClick={() => handleMerge(namingId, mergeCandidate.id)}
-                className="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg py-2 text-sm font-medium"
-              >
-                Same person — merge
+              <button onClick={() => handleMerge(namingId!, mergeCandidate.name)} disabled={saving}
+                className="flex-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg py-2 text-sm font-medium">
+                Same — merge
               </button>
-              <button
-                onClick={async () => {
-                  await api.persons.namePerson(namingId!, `${nameInput} (2)`)
-                  setMergeCandidate(null)
-                  setNamingId(null)
-                  setNameInput('')
-                  load()
-                }}
-                className="flex-1 bg-gray-700 hover:bg-gray-600 text-white rounded-lg py-2 text-sm font-medium"
-              >
+              <button onClick={() => handleMerge(namingId!, nameInput + ' (2)')} disabled={saving}
+                className="flex-1 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-white rounded-lg py-2 text-sm font-medium">
                 Different person
               </button>
             </div>
@@ -96,107 +88,88 @@ export default function PeoplePage() {
         </div>
       )}
 
+      {clusters.length === 0 && persons.length === 0 && (
+        <div className="text-gray-500 text-sm mt-12 text-center">
+          No people found yet. Run the pipeline first via the ⚙️ Pipeline tab.
+        </div>
+      )}
+
       {/* Unnamed clusters */}
-      {unnamed.length > 0 && (
+      {clusters.length > 0 && (
         <section className="mb-8">
           <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider mb-3">
-            Unnamed ({unnamed.length})
+            Unnamed clusters ({clusters.length})
           </h2>
-          <PersonGrid
-            persons={unnamed}
-            namingId={namingId}
-            nameInput={nameInput}
-            onStartNaming={(id) => { setNamingId(id); setNameInput('') }}
-            onNameInput={setNameInput}
-            onConfirmName={handleName}
-          />
+          <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-4">
+            {clusters.map(c => (
+              <ClusterTile key={c.id} cluster={c}
+                isNaming={namingId === c.id} nameInput={nameInput} saving={saving}
+                onStartNaming={() => { setNamingId(c.id); setNameInput('') }}
+                onNameInput={setNameInput}
+                onConfirm={() => handleName(c.id)}
+                onCancel={() => setNamingId(null)} />
+            ))}
+          </div>
         </section>
       )}
 
       {/* Named persons */}
-      {named.length > 0 && (
+      {persons.length > 0 && (
         <section>
           <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider mb-3">
-            Named ({named.length})
+            Named ({persons.length})
           </h2>
-          <PersonGrid
-            persons={named}
-            namingId={namingId}
-            nameInput={nameInput}
-            onStartNaming={(id) => { setNamingId(id); setNameInput('') }}
-            onNameInput={setNameInput}
-            onConfirmName={handleName}
-          />
+          <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-4">
+            {persons.map(p => (
+              <div key={p.id} className="flex flex-col items-center gap-2">
+                <div className="w-20 h-20 rounded-xl bg-gray-800 border border-gray-700 flex items-center justify-center text-2xl">👤</div>
+                <span className="text-xs text-center text-gray-200 truncate max-w-full px-1">{p.name}</span>
+                <span className="text-xs text-gray-500">{p.photo_count} photo{p.photo_count !== 1 ? 's' : ''}</span>
+              </div>
+            ))}
+          </div>
         </section>
-      )}
-
-      {persons.length === 0 && (
-        <div className="text-gray-500 text-sm mt-12 text-center">
-          No people found yet. Run the pipeline first via the ⚙️ Pipeline tab.
-        </div>
       )}
     </div>
   )
 }
 
-function PersonGrid({ persons, namingId, nameInput, onStartNaming, onNameInput, onConfirmName }: {
-  persons: Person[]
-  namingId: number | null
-  nameInput: string
-  onStartNaming: (id: number) => void
-  onNameInput: (v: string) => void
-  onConfirmName: (id: number) => void
+function ClusterTile({ cluster, isNaming, nameInput, saving, onStartNaming, onNameInput, onConfirm, onCancel }: {
+  cluster: Cluster; isNaming: boolean; nameInput: string; saving: boolean
+  onStartNaming: () => void; onNameInput: (v: string) => void; onConfirm: () => void; onCancel: () => void
 }) {
-  return (
-    <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-4">
-      {persons.map(p => (
-        <div key={p.id} className="flex flex-col items-center gap-2">
-          {/* Face tile */}
-          <button
-            onClick={() => onStartNaming(p.id)}
-            className="relative group rounded-xl overflow-hidden w-20 h-20 bg-gray-800 border border-gray-700 hover:border-indigo-500 transition-colors"
-          >
-            <img
-              src={`/api/faces/cluster/${p.id}/thumbnail`}  // placeholder until proper endpoint
-              alt={p.name ?? 'unnamed'}
-              className="w-full h-full object-cover"
-              onError={(e) => {
-                (e.target as HTMLImageElement).style.display = 'none'
-              }}
-            />
-            <div className="absolute inset-0 flex items-center justify-center text-gray-500 text-xs">
-              ?
-            </div>
-            <div className="absolute bottom-0 right-0 bg-indigo-600 text-white text-xs px-1 rounded-tl">
-              {p.photo_count}
-            </div>
-          </button>
+  const thumb = cluster.representative_thumbnail
+  const thumbUrl = thumb ? '/thumbnails/' + thumb.split('/thumbnails/').pop() : null
 
-          {/* Name or input */}
-          {namingId === p.id ? (
-            <div className="flex flex-col gap-1 w-full">
-              <input
-                autoFocus
-                value={nameInput}
-                onChange={e => onNameInput(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && onConfirmName(p.id)}
-                placeholder="Enter name…"
-                className="w-full bg-gray-800 border border-indigo-500 rounded px-2 py-0.5 text-xs text-white outline-none"
-              />
-              <button
-                onClick={() => onConfirmName(p.id)}
-                className="bg-indigo-600 hover:bg-indigo-500 text-white rounded px-2 py-0.5 text-xs"
-              >
-                Save
-              </button>
-            </div>
-          ) : (
-            <span className="text-xs text-center text-gray-300 truncate max-w-full px-1">
-              {p.name ?? <span className="text-gray-600 italic">tap to name</span>}
-            </span>
-          )}
+  return (
+    <div className="flex flex-col items-center gap-2">
+      <button onClick={onStartNaming}
+        className={'relative w-20 h-20 rounded-xl overflow-hidden bg-gray-800 border transition-colors ' +
+          (isNaming ? 'border-indigo-500' : 'border-gray-700 hover:border-indigo-400')}>
+        {thumbUrl
+          ? <img src={thumbUrl} alt="face" className="w-full h-full object-cover" />
+          : <span className="text-gray-500 text-2xl flex items-center justify-center h-full">?</span>}
+        <span className="absolute bottom-0 right-0 bg-indigo-700 text-white text-xs px-1 rounded-tl leading-tight">
+          {cluster.member_count}
+        </span>
+        {cluster.is_high_conf === 1 && (
+          <span className="absolute top-0 left-0 bg-green-700 text-white text-xs px-1 rounded-br leading-tight">✓</span>
+        )}
+      </button>
+      {isNaming ? (
+        <div className="flex flex-col gap-1 w-full">
+          <input autoFocus value={nameInput} onChange={e => onNameInput(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') onConfirm(); if (e.key === 'Escape') onCancel() }}
+            placeholder="Enter name…"
+            className="w-full bg-gray-800 border border-indigo-500 rounded px-2 py-0.5 text-xs text-white outline-none" />
+          <button onClick={onConfirm} disabled={saving || !nameInput.trim()}
+            className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded px-2 py-0.5 text-xs">
+            {saving ? '…' : 'Save'}
+          </button>
         </div>
-      ))}
+      ) : (
+        <span className="text-xs text-gray-500 italic">tap to name</span>
+      )}
     </div>
   )
 }

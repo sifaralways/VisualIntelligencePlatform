@@ -44,10 +44,9 @@ async def list_unnamed_clusters():
     async with get_db() as db:
         rows = await db.execute_fetchall("""
             SELECT c.id, c.member_count, c.intra_similarity, c.is_high_conf,
-                   f.thumbnail_path as representative_thumbnail
+                   MIN(f.thumbnail_path) as representative_thumbnail
             FROM clusters c
-            LEFT JOIN personas p ON p.id = c.person_id
-            LEFT JOIN faces f ON f.cluster_id = c.id
+            LEFT JOIN faces f ON f.cluster_id = c.id AND f.thumbnail_path IS NOT NULL
             WHERE c.person_id IS NULL
             GROUP BY c.id
             ORDER BY c.member_count DESC
@@ -104,14 +103,18 @@ async def merge_persons(req: MergeRequest, source_id: int):
     return {"status": "merged", "into": req.into_person_id}
 
 
+class NameClusterRequest(BaseModel):
+    name: str
+
+
 @router.post("/from-cluster/{cluster_id}")
-async def create_person_from_cluster(cluster_id: int):
-    """Create a new (unnamed) person record from a cluster."""
+async def create_person_from_cluster(cluster_id: int, req: NameClusterRequest):
+    """Create a named person from a cluster in one step."""
     async with get_db() as db:
         person_uuid = str(_uuid.uuid4())
         cursor = await db.execute("""
-            INSERT INTO persons (uuid) VALUES (?)
-        """, (person_uuid,))
+            INSERT INTO persons (uuid, name, named_at) VALUES (?, ?, datetime('now'))
+        """, (person_uuid, req.name.strip()))
         person_id = cursor.lastrowid
 
         await db.execute(
@@ -120,5 +123,11 @@ async def create_person_from_cluster(cluster_id: int):
         await db.execute(
             "UPDATE faces SET person_id=? WHERE cluster_id=?", (person_id, cluster_id)
         )
+
+        # Queue photos for writeback
+        await db.execute("""
+            INSERT OR IGNORE INTO writeback_queue (media_file_id)
+            SELECT DISTINCT media_file_id FROM faces WHERE cluster_id=?
+        """, (cluster_id,))
 
     return {"status": "created", "person_id": person_id, "uuid": person_uuid}

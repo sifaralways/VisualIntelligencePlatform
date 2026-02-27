@@ -24,6 +24,11 @@ export const api = {
     status: () => request<{ status: string; folder: string | null; error: string | null }>('/pipeline/status'),
   },
 
+  // ─── Clusters ─────────────────────────────────────────────────────────────
+  clusters: {
+    unnamed: () => request<Cluster[]>('/persons/unnamed'),
+  },
+
   // ─── Persons ──────────────────────────────────────────────────────────────
   persons: {
     list: () => request<Person[]>('/persons'),
@@ -34,8 +39,11 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ into_person_id: intoId }),
       }),
-    fromCluster: (clusterId: number) =>
-      request(`/persons/from-cluster/${clusterId}`, { method: 'POST' }),
+    fromCluster: (clusterId: number, name: string) =>
+      request<{ person_id: number; uuid: string }>(`/persons/from-cluster/${clusterId}`, {
+        method: 'POST',
+        body: JSON.stringify({ name }),
+      }),
   },
 
   // ─── Faces ────────────────────────────────────────────────────────────────
@@ -65,6 +73,14 @@ export const api = {
 }
 
 // ─── Types ───────────────────────────────────────────────────────────────────
+export interface Cluster {
+  id: number
+  member_count: number
+  intra_similarity: number | null
+  is_high_conf: number
+  representative_thumbnail: string | null
+}
+
 export interface Person {
   id: number
   uuid: string
