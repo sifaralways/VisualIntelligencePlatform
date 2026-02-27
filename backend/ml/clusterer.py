@@ -69,7 +69,6 @@ def cluster_embeddings(
             min_cluster_size=settings.hdbscan_min_cluster_size,
             metric="cosine",
             cluster_selection_method="eom",  # excess of mass — stable clusters
-            prediction_data=True,
         )
     except ImportError:
         import hdbscan

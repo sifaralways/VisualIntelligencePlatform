@@ -79,7 +79,7 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     # Clustering (HDBSCAN)
     # -------------------------------------------------------------------------
-    hdbscan_min_cluster_size: int = 5
+    hdbscan_min_cluster_size: int = 2
     # Cosine similarity threshold above which a cluster is "high confidence"
     # i.e., shown as a single tile + count without requiring manual review.
     # Calibrate empirically in Phase 0 benchmarks — 0.92 is a starting point.
