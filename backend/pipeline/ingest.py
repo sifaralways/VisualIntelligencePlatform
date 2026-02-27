@@ -45,7 +45,9 @@ def _ensure_models() -> None:
     global _models_loaded
     if not _models_loaded:
         _detector.load()
-        _embedder.load()
+        # _embedder.load() not needed — InsightFace computes embeddings
+        # during detection (face.normed_embedding). FaceEmbedder is only
+        # used here for vector_to_bytes / bytes_to_vector utility methods.
         _faiss.load()
         _models_loaded = True
 
@@ -202,10 +204,9 @@ async def _phase_embed() -> None:
                     (str(thumb_path), face_id)
                 )
 
-                # Generate embedding
-                vector = await asyncio.get_event_loop().run_in_executor(
-                    None, _embedder.embed, face.crop
-                )
+                # Embedding — InsightFace already computed it during detection.
+                # face.embedding is the 512-D normed ArcFace vector.
+                vector = face.embedding
                 if vector is not None:
                     await db.execute("""
                         INSERT INTO embeddings (face_id, vector, model_version)

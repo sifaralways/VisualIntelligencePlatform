@@ -35,7 +35,8 @@ class DetectedFace:
     bbox_w: float
     bbox_h: float
     detection_conf: float   # 0–1 from RetinaFace
-    crop: np.ndarray        # RGB uint8 face crop for embedding
+    crop: np.ndarray        # RGB uint8 face crop
+    embedding: Optional[np.ndarray] = None  # 512-D ArcFace vector, already L2-normalised
 
 
 class FaceDetector:
@@ -103,6 +104,11 @@ class FaceDetector:
 
             crop = img[y1:y2, x1:x2]
 
+            # InsightFace already computed the ArcFace embedding during get().
+            # Carry it through so the pipeline doesn't need to re-run inference.
+            emb = getattr(face, 'normed_embedding', None)
+            embedding = emb.astype(np.float32) if emb is not None else None
+
             results.append(DetectedFace(
                 bbox_x=x1 / img_w,
                 bbox_y=y1 / img_h,
@@ -110,6 +116,7 @@ class FaceDetector:
                 bbox_h=h / img_h,
                 detection_conf=conf,
                 crop=crop,
+                embedding=embedding,
             ))
 
         return results
