@@ -1,20 +1,30 @@
 """
 VIP Writeback — XMP field definitions and mapping.
 
-Maps our internal Person model to ExifTool tag names.
+Fields written per photo:
 
-Standard fields written (Spotlight-visible, app-agnostic):
-  • XMP:PersonInImage       — IPTC Extension, person names array
-  • XMP:Subject             — searchable keywords (names + scene tags)
-  • IPTC:Keywords           — same as Subject, wider compatibility
-  • XMP-mwg-rs:Regions      — MWG face regions (compatible with Lightroom, Capture One)
+  Person      → XMP:PersonInImage        (IPTC Extension, industry standard)
+                XMP-mwg-rs:Regions       (MWG face boxes, Lightroom/CaptureOne)
 
-Internal UUIDs and embeddings are NOT written to files — DB-only.
+  Object      → XMP:Subject keyword prefix "obj:"
+                e.g. "obj:Car", "obj:TV", "obj:Appliance"
+
+  Geography   → XMP:Subject keyword prefix "geo:"
+                e.g. "geo:Mountains", "geo:Ocean", "geo:Forest"
+
+  Places      → XMP:Location (IPTC Core free-text)
+                XMP:Subject keyword prefix "place:"
+                e.g. "place:Taj Mahal", "place:Harbour Bridge"
+                If GPS coords available: also written to EXIF:GPSLatitude/Longitude
+
+  IPTC:Keywords mirrors the full XMP:Subject array for broadest compatibility.
+
+Internal UUIDs and embeddings are NOT written — DB-only.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -29,37 +39,64 @@ class FaceRegion:
 
 
 def build_field_map(
-    person_names: list[str],
+    person_names: list[str] | None = None,
     face_regions: list[FaceRegion] | None = None,
-    extra_keywords: list[str] | None = None,
+    objects: list[str] | None = None,
+    geography: list[str] | None = None,
+    places: list[str] | None = None,
+    gps_lat: float | None = None,
+    gps_lon: float | None = None,
 ) -> dict[str, Any]:
     """
     Build the ExifTool field dictionary for a media file.
 
     Args:
-        person_names:    Names of all identified people in the photo.
-        face_regions:    Optional bounding box + name for MWG region metadata.
-        extra_keywords:  Additional tags (scene, object labels) from Phase 6+.
+        person_names:  Names of identified people.
+        face_regions:  Bounding boxes for MWG region metadata.
+        objects:       Object labels (Car, TV, Appliance …).
+        geography:     Scene labels (Mountains, Ocean, Forest …).
+        places:        Landmark / place names (Taj Mahal, Harbour Bridge …).
+        gps_lat/lon:   GPS coordinates to write if not already present.
 
     Returns:
-        Dict suitable for ExifToolWriter.write(file_path, fields=...)
+        Dict suitable for ExifToolWriter.write(file_path, fields=…)
     """
     fields: dict[str, Any] = {}
+    all_keywords: list[str] = []
 
+    # ── Person ──────────────────────────────────────────────────────────────
     if person_names:
         fields["XMP:PersonInImage"] = person_names
-
-        # Subject / Keywords — merge persons + extra keywords
-        all_keywords = list(person_names)
-        if extra_keywords:
-            all_keywords.extend(extra_keywords)
-        fields["XMP:Subject"] = all_keywords
-        fields["IPTC:Keywords"] = all_keywords
+        all_keywords.extend(person_names)
 
     if face_regions:
-        # MWG face region format
-        # ExifTool writes these as XMP struct — one entry per face
         fields["XMP-mwg-rs:Regions"] = _build_mwg_regions(face_regions)
+
+    # ── Object ──────────────────────────────────────────────────────────────
+    if objects:
+        all_keywords.extend(f"obj:{o}" for o in objects)
+
+    # ── Geography ───────────────────────────────────────────────────────────
+    if geography:
+        all_keywords.extend(f"geo:{g}" for g in geography)
+
+    # ── Places ──────────────────────────────────────────────────────────────
+    if places:
+        # Free-text location field (shown in Lightroom's Location field)
+        fields["XMP:Location"] = places[0] if len(places) == 1 else "; ".join(places)
+        all_keywords.extend(f"place:{p}" for p in places)
+
+    # ── GPS ─────────────────────────────────────────────────────────────────
+    if gps_lat is not None and gps_lon is not None:
+        fields["EXIF:GPSLatitude"] = abs(gps_lat)
+        fields["EXIF:GPSLatitudeRef"] = "N" if gps_lat >= 0 else "S"
+        fields["EXIF:GPSLongitude"] = abs(gps_lon)
+        fields["EXIF:GPSLongitudeRef"] = "E" if gps_lon >= 0 else "W"
+
+    # ── Keyword arrays (Subject + IPTC:Keywords for compatibility) ──────────
+    if all_keywords:
+        fields["XMP:Subject"] = all_keywords
+        fields["IPTC:Keywords"] = all_keywords
 
     return fields
 

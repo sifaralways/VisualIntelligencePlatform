@@ -17,8 +17,9 @@ export default function PeoplePage() {
   const [namingId, setNamingId] = useState<number | null>(null)  // cluster id being named
   const [nameInput, setNameInput] = useState('')
   const [saving, setSaving] = useState(false)
-  const [mergeCandidate, setMergeCandidate] = useState<{ personId: number; name: string } | null>(null)
-
+  const [mergeCandidate, setMergeCandidate] = useState<{ personId: number; name: string } | null>(null)  const [reviewPerson, setReviewPerson] = useState<Person | null>(null)
+  const [reviewFaces, setReviewFaces] = useState<FaceRow[]>([])
+  const [reviewLoading, setReviewLoading] = useState(false)
   async function load() {
     setLoading(true)
     try {
@@ -31,6 +32,24 @@ export default function PeoplePage() {
   }
 
   useEffect(() => { load() }, [])
+
+  async function openReview(person: Person) {
+    setReviewPerson(person)
+    setReviewFaces([])
+    setReviewLoading(true)
+    try {
+      const faces = await api.faces.byPerson(person.id)
+      setReviewFaces(faces)
+    } finally {
+      setReviewLoading(false)
+    }
+  }
+
+  async function ejectFace(faceId: number) {
+    await api.faces.removeFromPerson(faceId)
+    setReviewFaces(f => f.filter(x => x.id !== faceId))
+    load() // refresh counts
+  }
 
   async function handleName(clusterId: number) {
     const name = nameInput.trim()
@@ -65,6 +84,56 @@ export default function PeoplePage() {
   return (
     <div>
       <h1 className="text-xl font-semibold mb-6">People</h1>
+
+      {/* Face review panel */}
+      {reviewPerson && (
+        <div className="fixed inset-0 bg-black/70 flex items-start justify-center z-50 overflow-y-auto py-10">
+          <div className="bg-gray-900 rounded-xl p-6 w-full max-w-2xl shadow-xl mx-4">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h2 className="text-white font-semibold text-lg">{reviewPerson.name}</h2>
+                <p className="text-gray-400 text-xs mt-0.5">
+                  Click ✕ on any face to remove it (false positive correction)
+                </p>
+              </div>
+              <button onClick={() => setReviewPerson(null)}
+                className="text-gray-400 hover:text-white text-xl leading-none px-2">✕</button>
+            </div>
+            {reviewLoading
+              ? <p className="text-gray-400 text-sm">Loading…</p>
+              : reviewFaces.length === 0
+                ? <p className="text-gray-500 text-sm">No faces assigned.</p>
+                : (
+                  <div className="grid grid-cols-4 sm:grid-cols-6 gap-3">
+                    {reviewFaces.map(f => {
+                      const url = f.thumbnail_path
+                        ? '/thumbnails/' + f.thumbnail_path.split('/thumbnails/').pop()
+                        : null
+                      return (
+                        <div key={f.id} className="relative group">
+                          <div className="w-16 h-16 rounded-lg overflow-hidden bg-gray-800">
+                            {url
+                              ? <img src={url} alt="face" className="w-full h-full object-cover" />
+                              : <span className="flex items-center justify-center h-full text-gray-600 text-xl">?</span>}
+                          </div>
+                          <button
+                            onClick={() => ejectFace(f.id)}
+                            title="Remove — not this person"
+                            className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-red-600 hover:bg-red-500 text-white rounded-full text-xs leading-none flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                            ✕
+                          </button>
+                          <p className="text-gray-500 text-[10px] mt-0.5 text-center truncate">
+                            {(f.detection_conf * 100).toFixed(0)}%
+                          </p>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )
+            }
+          </div>
+        </div>
+      )}
 
       {/* Merge dialog */}
       {mergeCandidate && namingId !== null && (
@@ -131,11 +200,14 @@ export default function PeoplePage() {
               const thumbUrl = thumb ? '/thumbnails/' + thumb.split('/thumbnails/').pop() : null
               return (
                 <div key={p.id} className="flex flex-col items-center gap-2">
-                  <div className="w-20 h-20 rounded-xl bg-gray-800 border border-gray-700 overflow-hidden flex items-center justify-center">
+                  <button
+                    onClick={() => openReview(p)}
+                    title="Click to review faces"
+                    className="w-20 h-20 rounded-xl bg-gray-800 border border-gray-700 hover:border-indigo-400 overflow-hidden flex items-center justify-center transition-colors">
                     {thumbUrl
                       ? <img src={thumbUrl} alt={p.name ?? 'person'} className="w-full h-full object-cover" />
                       : <span className="text-2xl">👤</span>}
-                  </div>
+                  </button>
                   <span className="text-xs text-center text-gray-200 truncate max-w-full px-1">{p.name}</span>
                   <span className="text-xs text-gray-500">{p.photo_count} photo{p.photo_count !== 1 ? 's' : ''}</span>
                 </div>

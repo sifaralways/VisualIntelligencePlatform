@@ -61,8 +61,11 @@ class ExifToolWriter:
         else:
             cmd.append("-overwrite_original")
 
-        # Build tag arguments
+        # Build tag arguments.
+        # IMPORTANT: clear each tag first (e.g. -TAG=) before setting new values
+        # so that repeated writeback runs never accumulate duplicates.
         for tag, value in fields.items():
+            cmd.append(f"-{tag}=")   # clear existing values for this tag
             if isinstance(value, list):
                 for v in value:
                     cmd.append(f"-{tag}={v}")

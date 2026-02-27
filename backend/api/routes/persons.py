@@ -159,3 +159,19 @@ async def add_cluster_to_person(person_id: int, cluster_id: int):
         """, (cluster_id,))
 
     return {"status": "merged", "person_id": person_id}
+
+
+@router.get("/{person_id}/faces")
+async def get_person_faces(person_id: int, limit: int = 60):
+    """All face thumbnails assigned to a person, for review / false-positive removal."""
+    async with get_db() as db:
+        rows = await db.execute_fetchall("""
+            SELECT f.id, f.thumbnail_path, f.detection_conf,
+                   f.media_file_id, mf.file_path, mf.date_taken
+            FROM faces f
+            JOIN media_files mf ON mf.id = f.media_file_id
+            WHERE f.person_id = ?
+            ORDER BY f.detection_conf DESC
+            LIMIT ?
+        """, (person_id, limit))
+    return [dict(r) for r in rows]

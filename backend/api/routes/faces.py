@@ -53,3 +53,36 @@ async def remove_face_from_cluster(face_id: int):
             (face_id,),
         )
     return {"status": "removed", "face_id": face_id}
+
+
+@router.delete("/{face_id}/from-person")
+async def remove_face_from_person(face_id: int):
+    """
+    Remove a face from its person assignment (false positive correction).
+    The face is detached from person + cluster so it re-enters the unassigned pool.
+    The media file is re-queued for writeback so the person is removed from EXIF.
+    """
+    async with get_db() as db:
+        # Find what person this face belongs to (for writeback re-queue)
+        row = await (
+            await db.execute(
+                "SELECT person_id, media_file_id FROM faces WHERE id=?", (face_id,)
+            )
+        ).fetchone()
+
+        if not row:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail="Face not found")
+
+        await db.execute(
+            "UPDATE faces SET cluster_id=NULL, person_id=NULL WHERE id=?", (face_id,)
+        )
+
+        # Re-queue the media file so writeback rewrites EXIF without this person
+        if row["media_file_id"]:
+            await db.execute("""
+                INSERT OR REPLACE INTO writeback_queue (media_file_id, status, queued_at)
+                VALUES (?, 'pending', datetime('now'))
+            """, (row["media_file_id"],))
+
+    return {"status": "removed", "face_id": face_id}

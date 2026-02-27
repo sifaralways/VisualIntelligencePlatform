@@ -51,8 +51,11 @@ export const api = {
   // ─── Faces ────────────────────────────────────────────────────────────────
   faces: {
     byCluster: (clusterId: number) => request<FaceRow[]>(`/faces/cluster/${clusterId}`),
+    byPerson: (personId: number) => request<FaceRow[]>(`/persons/${personId}/faces`),
     removeFromCluster: (faceId: number) =>
       request(`/faces/${faceId}/from-cluster`, { method: 'DELETE' }),
+    removeFromPerson: (faceId: number) =>
+      request(`/faces/${faceId}/from-person`, { method: 'DELETE' }),
     thumbnailUrl: (faceId: number) => `${BASE}/faces/${faceId}/thumbnail`,
   },
 

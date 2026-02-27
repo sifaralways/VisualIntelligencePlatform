@@ -126,7 +126,7 @@ async def execute_writes(queue_ids: list[int] | None = None) -> dict:
 async def _build_fields_for_file(media_file_id: int) -> dict:
     """Assemble XMP field map for a given media file."""
     async with get_db() as db:
-        # Get all named persons appearing in this file
+        # Get all named persons appearing in this file (deduplicated by name)
         person_rows = await db.execute_fetchall("""
             SELECT DISTINCT p.name, f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h
             FROM faces f
@@ -136,10 +136,24 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
               AND p.is_merged = 0
         """, (media_file_id,))
 
+        # GPS from media_files
+        meta_row = await (
+            await db.execute(
+                "SELECT gps_lat, gps_lon FROM media_files WHERE id=?", (media_file_id,)
+            )
+        ).fetchone()
+
     if not person_rows:
         return {}
 
-    names = [r["name"] for r in person_rows]
+    # Deduplicate names (same person can appear multiple times via multiple faces)
+    seen: set[str] = set()
+    names: list[str] = []
+    for r in person_rows:
+        if r["name"] not in seen:
+            seen.add(r["name"])
+            names.append(r["name"])
+
     regions = [
         FaceRegion(
             name=r["name"],
@@ -152,4 +166,12 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
         if r["bbox_x"] is not None
     ]
 
-    return build_field_map(person_names=names, face_regions=regions)
+    gps_lat = meta_row["gps_lat"] if meta_row else None
+    gps_lon = meta_row["gps_lon"] if meta_row else None
+
+    return build_field_map(
+        person_names=names,
+        face_regions=regions,
+        gps_lat=gps_lat,
+        gps_lon=gps_lon,
+    )
