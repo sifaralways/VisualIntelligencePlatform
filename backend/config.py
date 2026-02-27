@@ -113,6 +113,14 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     thermal_sleep_sec: float = 2.0
 
+    # -------------------------------------------------------------------------
+    # Tagging models (Phase 4)
+    # -------------------------------------------------------------------------
+    yolo_conf_threshold: float = 0.40    # YOLOv11 minimum detection confidence
+    landmark_threshold: float = 0.26     # CLIP minimum cosine similarity for landmarks
+    species_threshold: float = 0.30      # BioCLIP minimum cosine similarity for species
+    places365_top_k: int = 5             # Places365 top-k scenes to evaluate
+
     class Config:
         env_prefix = "VIP_"   # override any setting with VIP_API_PORT=8080 etc.
 

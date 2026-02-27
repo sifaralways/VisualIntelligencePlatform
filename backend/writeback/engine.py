@@ -126,7 +126,7 @@ async def execute_writes(queue_ids: list[int] | None = None) -> dict:
 async def _build_fields_for_file(media_file_id: int) -> dict:
     """Assemble XMP field map for a given media file."""
     async with get_db() as db:
-        # Get all named persons appearing in this file (deduplicated by name)
+        # Named persons with bounding boxes
         person_rows = await db.execute_fetchall("""
             SELECT DISTINCT p.name, f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h
             FROM faces f
@@ -143,10 +143,17 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
             )
         ).fetchone()
 
-    if not person_rows:
+        # ML-generated tags
+        tag_rows = await db.execute_fetchall("""
+            SELECT category, label FROM media_tags
+            WHERE media_file_id = ?
+            ORDER BY category, rowid
+        """, (media_file_id,))
+
+    if not person_rows and not tag_rows:
         return {}
 
-    # Deduplicate names (same person can appear multiple times via multiple faces)
+    # Deduplicate person names
     seen: set[str] = set()
     names: list[str] = []
     for r in person_rows:
@@ -157,7 +164,7 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
     regions = [
         FaceRegion(
             name=r["name"],
-            x=r["bbox_x"] + r["bbox_w"] / 2,  # MWG uses centre point
+            x=r["bbox_x"] + r["bbox_w"] / 2,
             y=r["bbox_y"] + r["bbox_h"] / 2,
             w=r["bbox_w"],
             h=r["bbox_h"],
@@ -169,9 +176,29 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
     gps_lat = meta_row["gps_lat"] if meta_row else None
     gps_lon = meta_row["gps_lon"] if meta_row else None
 
+    # Group tags by category
+    objects: list[str] = []
+    animals: list[str] = []
+    geography: list[str] = []
+    places: list[str] = []
+    for t in tag_rows:
+        cat, label = t["category"], t["label"]
+        if cat == "object":
+            objects.append(label)
+        elif cat == "animal":
+            animals.append(label)
+        elif cat == "geography":
+            geography.append(label)
+        elif cat == "place":
+            places.append(label)
+
     return build_field_map(
-        person_names=names,
-        face_regions=regions,
+        person_names=names or None,
+        face_regions=regions or None,
+        objects=objects or None,
+        animals=animals or None,
+        geography=geography or None,
+        places=places or None,
         gps_lat=gps_lat,
         gps_lon=gps_lon,
     )

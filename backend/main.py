@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from backend.config import settings, ensure_dirs
 from backend.database.db import init_db
-from backend.api.routes import media, persons, faces, search, pipeline, writeback, admin
+from backend.api.routes import media, persons, faces, search, pipeline, writeback, admin, tags
 from backend.api.websocket import router as ws_router
 
 
@@ -103,6 +103,7 @@ app.include_router(faces.router,    prefix="/api/faces",    tags=["faces"])
 app.include_router(search.router,   prefix="/api/search",   tags=["search"])
 app.include_router(writeback.router, prefix="/api/writeback", tags=["writeback"])
 app.include_router(admin.router,    prefix="/api/admin",    tags=["admin"])
+app.include_router(tags.router,     prefix="/api/tags",     tags=["tags"])
 
 # ---------------------------------------------------------------------------
 # Static — serve face thumbnails and previews

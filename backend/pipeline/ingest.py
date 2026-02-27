@@ -30,6 +30,7 @@ from backend.ml.face_detector import FaceDetector
 from backend.ml.embedder import FaceEmbedder, save_face_thumbnail
 from backend.ml.clusterer import cluster_embeddings
 from backend.ml.index import FaissIndex
+from backend.ml.tagger import Tagger
 from backend.api.websocket import broadcast
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ logger = logging.getLogger(__name__)
 _detector = FaceDetector()
 _embedder = FaceEmbedder()
 _faiss = FaissIndex()
+_tagger = Tagger()
 _models_loaded = False
 
 
@@ -75,6 +77,9 @@ async def run_ingest(folder: str) -> None:
 
     # -- Phase 3: Cluster ---------------------------------------------------
     await _phase_cluster()
+
+    # -- Phase 4: Tag (objects, animals, geography, places) -----------------
+    await _phase_tag()
 
     await broadcast("pipeline_complete", folder=str(folder_path))
     logger.info("=== Pipeline complete: %s ===", folder_path)
@@ -217,8 +222,7 @@ async def _phase_embed() -> None:
                 "UPDATE media_files SET ingest_state='embedded' WHERE id=?", (media_id,)
             )
 
-        # Clean up temp preview
-        await delete_preview(preview_path)
+        # Previews are kept alive for Phase 4 tagging — deleted there.
 
         processed += 1
         if processed % 50 == 0:
@@ -307,3 +311,90 @@ async def _phase_cluster() -> None:
 
     await broadcast("phase_complete", phase="cluster", clusters=len(results))
     logger.info("Phase 3 complete: %d clusters", len(results))
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Tag — objects, animals, geography, places
+# ---------------------------------------------------------------------------
+async def _phase_tag() -> None:
+    logger.info("Phase 4: Tagging (objects, animals, geography, places)")
+    await broadcast("phase_start", phase="tag")
+
+    # Load tagging models lazily (first pipeline run only)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _tagger.load)
+
+    # Files that have been embedded/clustered but not yet tagged
+    async with get_db() as db:
+        rows = await db.execute_fetchall("""
+            SELECT id, file_path, gps_lat, gps_lon
+            FROM media_files
+            WHERE ingest_state IN ('embedded', 'clustered')
+              AND is_stub = 0
+        """)
+
+    total = len(rows)
+    logger.info("Phase 4: %d files to tag", total)
+    if total == 0:
+        await broadcast("phase_complete", phase="tag", tagged=0)
+        return
+
+    processed = 0
+    for row in rows:
+        media_id = row["id"]
+        file_path = row["file_path"]
+        gps_lat = row["gps_lat"]
+        gps_lon = row["gps_lon"]
+        path = Path(file_path)
+
+        # Preview may have been kept from Phase 2 or needs re-extraction
+        preview_path = settings.preview_dir / f"{path.stem}_{_hash_path(path)}.jpg"
+        if not preview_path.exists():
+            preview_path = await extract_preview(path) or preview_path
+
+        # Run all tagging models
+        result = await loop.run_in_executor(
+            None, _tagger.tag, preview_path, gps_lat, gps_lon
+        )
+
+        # Persist tags to DB
+        async with get_db() as db:
+            tag_rows: list[tuple] = []
+
+            for label in result.objects:
+                tag_rows.append((media_id, "object", label, None, "yolov11"))
+            for label in result.animals:
+                tag_rows.append((media_id, "animal", label, None, "bioclip"))
+            for label in result.geography:
+                tag_rows.append((media_id, "geography", label, None, "places365"))
+            for label in result.places:
+                model = "nominatim" if gps_lat is not None and label == result.places[0] else "clip"
+                tag_rows.append((media_id, "place", label, None, model))
+
+            for t in tag_rows:
+                await db.execute("""
+                    INSERT OR IGNORE INTO media_tags
+                        (media_file_id, category, label, confidence, model)
+                    VALUES (?,?,?,?,?)
+                """, t)
+
+            await db.execute(
+                "UPDATE media_files SET ingest_state='tagged' WHERE id=?", (media_id,)
+            )
+
+        # Clean up preview now that both Phase 2 and Phase 4 are done
+        if preview_path.exists():
+            await delete_preview(preview_path)
+
+        processed += 1
+        if processed % 20 == 0:
+            await broadcast("tag_progress", done=processed, total=total)
+
+    await broadcast("phase_complete", phase="tag", tagged=processed)
+    logger.info("Phase 4 complete: %d files tagged", processed)
+
+
+def _hash_path(path: Path) -> str:
+    """Short hash for preview filename (mirrors preview_extractor logic)."""
+    import hashlib
+    return hashlib.md5(str(path).encode()).hexdigest()[:8]

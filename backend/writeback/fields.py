@@ -42,6 +42,7 @@ def build_field_map(
     person_names: list[str] | None = None,
     face_regions: list[FaceRegion] | None = None,
     objects: list[str] | None = None,
+    animals: list[str] | None = None,
     geography: list[str] | None = None,
     places: list[str] | None = None,
     gps_lat: float | None = None,
@@ -54,6 +55,7 @@ def build_field_map(
         person_names:  Names of identified people.
         face_regions:  Bounding boxes for MWG region metadata.
         objects:       Object labels (Car, TV, Appliance …).
+        animals:       Animal/species labels (Dog, Golden Retriever …).
         geography:     Scene labels (Mountains, Ocean, Forest …).
         places:        Landmark / place names (Taj Mahal, Harbour Bridge …).
         gps_lat/lon:   GPS coordinates to write if not already present.
@@ -76,13 +78,16 @@ def build_field_map(
     if objects:
         all_keywords.extend(f"obj:{o}" for o in objects)
 
+    # ── Animal ──────────────────────────────────────────────────────────────
+    if animals:
+        all_keywords.extend(f"animal:{a}" for a in animals)
+
     # ── Geography ───────────────────────────────────────────────────────────
     if geography:
         all_keywords.extend(f"geo:{g}" for g in geography)
 
     # ── Places ──────────────────────────────────────────────────────────────
     if places:
-        # Free-text location field (shown in Lightroom's Location field)
         fields["XMP:Location"] = places[0] if len(places) == 1 else "; ".join(places)
         all_keywords.extend(f"place:{p}" for p in places)
 

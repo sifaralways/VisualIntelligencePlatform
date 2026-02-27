@@ -11,6 +11,15 @@ hdbscan
 scikit-learn
 numpy
 
+# Secondary ML — objects, animals, scene, landmarks, species
+ultralytics            # YOLOv11 (yolo11s.pt auto-downloads on first use)
+torch>=2.2             # PyTorch with MPS backend for Apple Silicon
+torchvision>=0.17      # Required by Places365 ResNet-50
+open-clip-torch        # OpenCLIP (landmarks) + BioCLIP (species)
+
+# Geo
+geopy                  # Reverse geocoding via Nominatim/OSM
+
 # Image / RAW
 rawpy
 Pillow
