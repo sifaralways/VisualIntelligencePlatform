@@ -126,13 +126,21 @@ export default function PeoplePage() {
             Named ({persons.length})
           </h2>
           <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-4">
-            {persons.map(p => (
-              <div key={p.id} className="flex flex-col items-center gap-2">
-                <div className="w-20 h-20 rounded-xl bg-gray-800 border border-gray-700 flex items-center justify-center text-2xl">👤</div>
-                <span className="text-xs text-center text-gray-200 truncate max-w-full px-1">{p.name}</span>
-                <span className="text-xs text-gray-500">{p.photo_count} photo{p.photo_count !== 1 ? 's' : ''}</span>
-              </div>
-            ))}
+            {persons.map(p => {
+              const thumb = p.representative_thumbnail
+              const thumbUrl = thumb ? '/thumbnails/' + thumb.split('/thumbnails/').pop() : null
+              return (
+                <div key={p.id} className="flex flex-col items-center gap-2">
+                  <div className="w-20 h-20 rounded-xl bg-gray-800 border border-gray-700 overflow-hidden flex items-center justify-center">
+                    {thumbUrl
+                      ? <img src={thumbUrl} alt={p.name ?? 'person'} className="w-full h-full object-cover" />
+                      : <span className="text-2xl">👤</span>}
+                  </div>
+                  <span className="text-xs text-center text-gray-200 truncate max-w-full px-1">{p.name}</span>
+                  <span className="text-xs text-gray-500">{p.photo_count} photo{p.photo_count !== 1 ? 's' : ''}</span>
+                </div>
+              )
+            })}
           </div>
         </section>
       )}

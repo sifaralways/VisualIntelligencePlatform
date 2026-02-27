@@ -61,45 +61,38 @@ def _extract_sync(raw_path: Path, out_path: Path) -> bool:
     We redirect stdout to the output file directly.
     """
     try:
-        # 60 s per file — CR3 files on iCloud can be slow to materialise
         _timeout = 60
-        # Materialise from iCloud before running ExifTool
         if not materialise_file(raw_path):
             return False
-        result = subprocess.run(
-            [
-                "exiftool",
-                "-fast2",       # skip scanning past EOF — much faster on CR3
-                "-b",
-                "-PreviewImage",
-                "-charset", "filename=UTF8",
-                str(raw_path),
-            ],
-            capture_output=True,
-            timeout=_timeout,
-        )
 
-        if result.returncode != 0 or not result.stdout:
-            # Try JpgFromRaw (Nikon NEF uses a different tag)
+        # Tag priority: LargePreviewImage (Canon CR3 full-size) → PreviewImage → JpgFromRaw
+        # Do NOT use -fast2; it stops before the large embedded JPEG in CR3 files.
+        # -fast (no number) skips the trailer scan only — safe and still quick.
+        for tag in ("-LargePreviewImage", "-PreviewImage", "-JpgFromRaw"):
             result = subprocess.run(
                 [
                     "exiftool",
-                    "-fast2",
+                    "-fast",
                     "-b",
-                    "-JpgFromRaw",
+                    tag,
                     "-charset", "filename=UTF8",
                     str(raw_path),
                 ],
                 capture_output=True,
                 timeout=_timeout,
             )
+            if result.stdout:
+                logger.debug(
+                    "Extracted preview via %s: %s → %s (%d bytes)",
+                    tag, raw_path.name, out_path.name, len(result.stdout)
+                )
+                break
 
         if not result.stdout:
             logger.warning("No embedded JPEG found in: %s", raw_path)
             return False
 
         out_path.write_bytes(result.stdout)
-        logger.debug("Extracted preview: %s → %s (%d bytes)", raw_path.name, out_path.name, len(result.stdout))
         return True
 
     except subprocess.TimeoutExpired:

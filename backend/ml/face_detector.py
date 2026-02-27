@@ -105,7 +105,14 @@ class FaceDetector:
                 logger.debug("Skipping tiny face (%dx%d) in %s", w, h, image_path.name)
                 continue
 
-            crop = img[y1:y2, x1:x2]
+            # Add 35% context padding so thumbnails aren't just a tight face box
+            pad_x = int(w * 0.35)
+            pad_y = int(h * 0.35)
+            cx1 = max(0, x1 - pad_x)
+            cy1 = max(0, y1 - pad_y)
+            cx2 = min(img_w, x2 + pad_x)
+            cy2 = min(img_h, y2 + pad_y)
+            crop = img[cy1:cy2, cx1:cx2]
 
             # InsightFace already computed the ArcFace embedding during get().
             # Carry it through so the pipeline doesn't need to re-run inference.

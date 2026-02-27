@@ -22,13 +22,15 @@ class MergeRequest(BaseModel):
     into_person_id: int     # merge source → target
 
 
-@router.get("", response_model=list[Person])
+@router.get("")
 async def list_persons():
     """All persons — named and unnamed (clusters awaiting a name)."""
     async with get_db() as db:
         rows = await db.execute_fetchall("""
-            SELECT p.*,
-                   COUNT(DISTINCT f.media_file_id) as photo_count
+            SELECT p.id, p.uuid, p.name, p.created_at, p.named_at,
+                   p.is_merged, p.merged_into_id,
+                   COUNT(DISTINCT f.media_file_id) as photo_count,
+                   MIN(f.thumbnail_path) as representative_thumbnail
             FROM persons p
             LEFT JOIN faces f ON f.person_id = p.id
             WHERE p.is_merged = 0

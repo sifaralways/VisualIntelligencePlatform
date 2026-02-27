@@ -118,6 +118,6 @@ def save_face_thumbnail(crop: np.ndarray, face_id: int) -> Path:
     settings.thumbnail_dir.mkdir(parents=True, exist_ok=True)
     out_path = settings.thumbnail_dir / f"{face_id}.jpg"
 
-    img = Image.fromarray(crop).resize((128, 128))
-    img.save(out_path, format="JPEG", quality=85)
+    img = Image.fromarray(crop).resize((200, 200), Image.LANCZOS)
+    img.save(out_path, format="JPEG", quality=90)
     return out_path

@@ -98,6 +98,7 @@ export interface Person {
   name: string | null
   photo_count: number
   is_merged: boolean
+  representative_thumbnail: string | null
 }
 
 export interface FaceRow {
