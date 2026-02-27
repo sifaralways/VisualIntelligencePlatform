@@ -1,11 +1,12 @@
 """
 VIP Scanner — ExifTool EXIF/metadata extraction.
 
-Uses ExifTool in "stay_open" batch mode for performance.
-A single ExifTool process is reused for the life of the pipeline run
-rather than spawning one process per file (~25ms startup cost each).
+One subprocess.run() call per file with a hard OS-level timeout.
 
-Output is JSON from ExifTool. Fields are normalised to our schema.
+Previous approach (stay_open batch mode) caused ExifTool to hang indefinitely
+on specific CR3 files, requiring a 120-second wait before the pipeline could
+move on. Per-file subprocess is ~25 ms slower per file but never hangs,
+always terminates cleanly, and is far simpler to reason about.
 """
 
 from __future__ import annotations
@@ -14,193 +15,115 @@ import asyncio
 import json
 import logging
 import subprocess
-import threading
 from pathlib import Path
 from typing import Any
 
-from backend.config import settings
-
 logger = logging.getLogger(__name__)
 
-# Per-file timeout. Must cover iCloud on-demand download of a 40 MB CR3
-# on a slow connection before ExifTool can read it.
-_PER_FILE_TIMEOUT = 120
+# Hard OS-level timeout per file. ExifTool on a local 60 MB CR3 should finish
+# in well under 5 seconds. 30 s gives plenty of headroom.
+_PER_FILE_TIMEOUT = 30
 
 
 def materialise_file(path: Path) -> bool:
     """
-    Force iCloud to fully download a file before we read it with ExifTool.
+    Check that the file is accessible. For iCloud stubs, the stat() call
+    itself triggers macOS to begin downloading the file synchronously.
 
-    Strategy:
-      1. `brctl download <path>` — the macOS iCloud control tool that blocks
-         until the file is 100% local. This is the correct API.
-      2. Fallback: read the whole file into /dev/null, which forces a full
-         APFS file-provider materialisation before returning.
-
-    Returns True if the file is readable and local, False on any error.
+    Returns True if the file exists and is readable.
     """
-    import subprocess
+    try:
+        return path.is_file()
+    except OSError as e:
+        logger.warning("Cannot access %s: %s", path.name, e)
+        return False
 
-    # Fast path: brctl is available on all macOS versions with iCloud Drive
+
+def _run_exiftool(path: Path) -> dict[str, Any] | None:
+    """
+    Run ExifTool on a single file. Blocking — call via run_in_executor.
+
+    Returns the first element of the JSON array, or None on any failure.
+    """
     try:
         result = subprocess.run(
-            ["brctl", "download", str(path)],
-            timeout=300,   # 5 min max — enough for a 60 MB CR3 on slow iCloud
+            [
+                "exiftool",
+                "-json",
+                "-fast2",
+                "-charset", "filename=UTF8",
+                "-q",
+                str(path),
+            ],
             capture_output=True,
+            timeout=_PER_FILE_TIMEOUT,
         )
-        if result.returncode == 0:
-            return True
-        # brctl may return non-zero even on success for already-local files
-        # fall through to the read fallback
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        logger.debug("brctl unavailable or timed out (%s) — falling back to full read", e)
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "ExifTool timed out (%ds) on %s — skipping", _PER_FILE_TIMEOUT, path.name
+        )
+        return None
+    except FileNotFoundError:
+        logger.error("exiftool not found — install with: brew install exiftool")
+        return None
+    except Exception as e:
+        logger.error("ExifTool error on %s: %s", path.name, e)
+        return None
 
-    # Fallback: read every byte to force full materialisation
+    if result.returncode != 0:
+        logger.debug("ExifTool returned %d for %s", result.returncode, path.name)
+        return None
+
     try:
-        with open(path, 'rb') as f:
-            while f.read(8 * 1024 * 1024):  # 8 MB chunks
-                pass
-        return True
-    except OSError as e:
-        logger.warning("Cannot materialise %s: %s", path.name, e)
-        return False
+        parsed = json.loads(result.stdout)
+        return parsed[0] if parsed else None
+    except json.JSONDecodeError as e:
+        logger.error("ExifTool JSON parse error for %s: %s", path.name, e)
+        return None
 
 
 class ExifToolReader:
     """
-    Long-lived ExifTool process in stay_open mode.
+    Async wrapper around per-file ExifTool subprocess calls.
 
-    Usage:
-        async with ExifToolReader() as reader:
-            meta = await reader.read(path)
+    Keeps the same context-manager interface as the old stay_open version
+    so call sites in the pipeline do not need to change.
     """
 
-    def __init__(self) -> None:
-        self._proc: subprocess.Popen | None = None
-        self._lock = asyncio.Lock()   # serialise calls; stdout is a sequential stream
-
     async def __aenter__(self) -> "ExifToolReader":
-        self._start()
         return self
 
     async def __aexit__(self, *_: Any) -> None:
-        await self.close()
-
-    def _start(self) -> None:
-        self._proc = subprocess.Popen(
-            [
-                "exiftool",
-                "-stay_open", "True",
-                "-@", "-",              # read args from stdin
-                "-common_args",
-                "-json",
-                "-fast2",               # skip scanning past end-of-file (faster on CR3)
-                "-charset", "filename=UTF8",
-                "-q",
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        logger.debug("ExifTool stay_open process started (pid=%d)", self._proc.pid)
-
-    def _restart(self) -> None:
-        """Kill the current (stuck) process and start a fresh one."""
-        if self._proc:
-            try:
-                self._proc.kill()
-                self._proc.wait(timeout=3)
-            except Exception:
-                pass
-        self._proc = None
-        self._start()
-        logger.warning("ExifTool process restarted after timeout")
+        pass  # nothing to clean up
 
     async def read(self, path: Path) -> dict[str, Any]:
         """Read EXIF metadata for a single file. Returns normalised dict."""
-        # Materialise from iCloud before handing to ExifTool.
-        # run_in_executor so the blocking download doesn't stall the event loop.
-        logger.debug("Materialising %s …", path.name)
+        if not materialise_file(path):
+            logger.warning("Cannot access %s — skipping", path.name)
+            return {}
+
+        logger.debug("ExifTool reading %s", path.name)
         loop = asyncio.get_event_loop()
-        ok = await loop.run_in_executor(None, materialise_file, path)
-        if not ok:
-            logger.warning("Could not materialise %s — skipping", path.name)
+        raw = await loop.run_in_executor(None, _run_exiftool, path)
+
+        if raw is None:
             return {}
-        logger.debug("Materialised %s  ✓", path.name)
-        async with self._lock:
-            raw = await self._execute_one(path)
-        if not raw:
-            return {}
-        return _normalise(raw)
+
+        normalised = _normalise(raw)
+        logger.debug(
+            "ExifTool done  %s  camera=%s  date=%s",
+            path.name,
+            normalised.get("camera_model"),
+            normalised.get("date_taken"),
+        )
+        return normalised
 
     async def read_batch(self, paths: list[Path]) -> list[dict[str, Any]]:
-        """
-        Read EXIF for a list of files.
-
-        We call read() per file (serialised via the lock) rather than sending
-        all paths in a single -execute block. This prevents a single large-batch
-        timeout from wedging the entire process and makes per-file error recovery
-        straightforward.
-        """
+        """Read EXIF for a list of files sequentially."""
         results = []
         for path in paths:
             results.append(await self.read(path))
         return results
-
-    async def _execute_one(self, path: Path) -> dict[str, Any] | None:
-        """
-        Send one file to the stay_open process and read the JSON response.
-        On timeout, kill + restart the process so the next call is clean.
-        Caller must hold self._lock.
-        """
-        if self._proc is None or self._proc.poll() is not None:
-            self._start()
-
-        command = f"{path}\n-execute\n".encode()
-        loop = asyncio.get_event_loop()
-
-        # We read stdout in a daemon thread. If it times out we kill the process,
-        # which unblocks the thread (EOF on stdout), keeping the executor clean.
-        future = loop.run_in_executor(None, self._read_response, command)
-        try:
-            result = await asyncio.wait_for(future, timeout=_PER_FILE_TIMEOUT)
-            parsed = json.loads(result) if result.strip() else []
-            return parsed[0] if parsed else None
-        except asyncio.TimeoutError:
-            logger.warning("ExifTool timed out on %s — restarting process", path.name)
-            self._restart()
-            return None
-        except json.JSONDecodeError as e:
-            logger.error("ExifTool JSON parse error for %s: %s", path.name, e)
-            return None
-
-    def _read_response(self, command: bytes) -> str:
-        """Synchronous — runs in executor thread. Unblocks when process is killed."""
-        assert self._proc and self._proc.stdin and self._proc.stdout
-        try:
-            self._proc.stdin.write(command)
-            self._proc.stdin.flush()
-        except BrokenPipeError:
-            return ""
-
-        output_lines = []
-        for line in self._proc.stdout:
-            decoded = line.decode("utf-8", errors="replace")
-            if decoded.strip() == "{ready}":
-                break
-            output_lines.append(decoded)
-        return "".join(output_lines)
-
-    async def close(self) -> None:
-        if self._proc and self._proc.poll() is None:
-            try:
-                self._proc.stdin.write(b"-stay_open\nFalse\n")  # type: ignore
-                self._proc.stdin.flush()
-                self._proc.wait(timeout=5)
-            except Exception:
-                self._proc.kill()
-            logger.debug("ExifTool process closed")
-        self._proc = None
 
 
 def _normalise(raw: dict[str, Any]) -> dict[str, Any]:
