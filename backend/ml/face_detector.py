@@ -54,9 +54,12 @@ class FaceDetector:
         from insightface.app import FaceAnalysis
 
         logger.info("Loading InsightFace Buffalo_L...")
+        # CoreML EP mishandles the det_10g.onnx dynamic spatial dims at det_size >640:
+        # ORT shape inference yields 3200 but CoreML compiles for 1280→12800 → rank mismatch.
+        # CPU provider uses Apple Silicon NEON SIMD and is reliable with any det_size.
         self._app = FaceAnalysis(
             name=settings.insightface_model,
-            providers=["CoreMLExecutionProvider", "CPUExecutionProvider"],
+            providers=["CPUExecutionProvider"],
         )
         self._app.prepare(ctx_id=0, det_size=(1280, 1280))
         logger.info("✅  Face detector ready")
