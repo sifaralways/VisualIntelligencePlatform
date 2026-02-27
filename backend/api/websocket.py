@@ -42,14 +42,25 @@ async def progress_ws(websocket: WebSocket) -> None:
     await websocket.accept()
     _connections.append(websocket)
     logger.info("WebSocket client connected (%d total)", len(_connections))
+
+    async def _ping_loop() -> None:
+        """Send a keepalive ping every 30 s while this connection is open."""
+        try:
+            while True:
+                await asyncio.sleep(30)
+                await websocket.send_text(json.dumps({"event": "ping"}))
+        except Exception:
+            pass  # client gone — receive loop will clean up
+
+    ping_task = asyncio.create_task(_ping_loop())
     try:
+        # Block here; receive() raises WebSocketDisconnect when the client leaves.
         while True:
-            # Keep the connection alive — we broadcast to clients, not the other way
-            await asyncio.sleep(30)
-            await websocket.send_text(json.dumps({"event": "ping"}))
-    except WebSocketDisconnect:
+            await websocket.receive_text()
+    except (WebSocketDisconnect, Exception):
         pass
     finally:
+        ping_task.cancel()
         if websocket in _connections:
             _connections.remove(websocket)
         logger.info("WebSocket client disconnected (%d remaining)", len(_connections))
