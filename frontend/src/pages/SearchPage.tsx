@@ -4,7 +4,8 @@
  */
 
 import { useState } from 'react'
-import { api, MediaResult } from '../api/client'
+import { api } from '../api/client'
+import type { MediaResult } from '../api/client'
 
 export default function SearchPage() {
   const [query, setQuery] = useState('')

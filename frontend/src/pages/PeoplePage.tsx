@@ -7,7 +7,8 @@
  */
 
 import { useEffect, useState } from 'react'
-import { api, Person } from '../api/client'
+import { api } from '../api/client'
+import type { Person } from '../api/client'
 
 export default function PeoplePage() {
   const [persons, setPersons] = useState<Person[]>([])

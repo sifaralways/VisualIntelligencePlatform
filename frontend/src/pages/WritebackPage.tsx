@@ -6,7 +6,8 @@
  */
 
 import { useEffect, useState } from 'react'
-import { api, WritebackItem } from '../api/client'
+import { api } from '../api/client'
+import type { WritebackItem } from '../api/client'
 
 export default function WritebackPage() {
   const [items, setItems] = useState<WritebackItem[]>([])
