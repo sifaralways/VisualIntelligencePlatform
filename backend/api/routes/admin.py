@@ -76,19 +76,24 @@ async def reset(scope: str):
 
     async with get_db() as db:
         if scope == "all":
-            # Wipe everything — full factory reset
-            for table in ["writeback_queue", "embeddings", "faces", "clusters", "persons", "media_files"]:
-                await db.execute(f"DELETE FROM {table}")
+            # Delete in FK dependency order:
+            # writeback_queue → embeddings → faces → clusters → persons → media_files
+            await db.execute("DELETE FROM writeback_queue")
+            await db.execute("DELETE FROM embeddings")
+            await db.execute("DELETE FROM faces")
+            await db.execute("UPDATE clusters SET person_id=NULL")
+            await db.execute("DELETE FROM clusters")
+            await db.execute("DELETE FROM persons")
+            await db.execute("DELETE FROM media_files")
             await _wipe_thumbnails()
             logger.warning("ADMIN: Full reset — all tables wiped")
             return {"status": "ok", "scope": "all", "detail": "All tables cleared + thumbnails deleted"}
 
         if scope in ("scan", "faces"):
-            # Keep media_files rows but reset them to 'scanned' so they get re-embedded.
-            # Drop all downstream derived data.
             await db.execute("DELETE FROM writeback_queue")
             await db.execute("DELETE FROM embeddings")
             await db.execute("DELETE FROM faces")
+            await db.execute("UPDATE clusters SET person_id=NULL")
             await db.execute("DELETE FROM clusters")
             await db.execute("DELETE FROM persons")
             await db.execute("UPDATE media_files SET ingest_state='scanned', needs_reprocess=0")
@@ -97,20 +102,19 @@ async def reset(scope: str):
             return {"status": "ok", "scope": scope, "detail": "All faces, embeddings, clusters and persons cleared. Media scan data kept."}
 
         if scope == "clusters":
-            # Keep faces + embeddings — just unlink clusters and persons so they get re-clustered.
             await db.execute("DELETE FROM writeback_queue")
+            await db.execute("UPDATE faces SET cluster_id=NULL, person_id=NULL")
+            await db.execute("UPDATE clusters SET person_id=NULL")
             await db.execute("DELETE FROM persons")
             await db.execute("DELETE FROM clusters")
-            await db.execute("UPDATE faces SET cluster_id=NULL, person_id=NULL")
             logger.warning("ADMIN: Cluster/person reset — faces and embeddings kept")
             return {"status": "ok", "scope": scope, "detail": "Clusters and persons cleared. Face embeddings kept — re-run pipeline to re-cluster."}
 
         if scope == "persons":
-            # Keep clusters intact — just strip person assignments so user can re-name.
             await db.execute("DELETE FROM writeback_queue")
-            await db.execute("DELETE FROM persons")
-            await db.execute("UPDATE clusters SET person_id=NULL")
             await db.execute("UPDATE faces SET person_id=NULL")
+            await db.execute("UPDATE clusters SET person_id=NULL")
+            await db.execute("DELETE FROM persons")
             logger.warning("ADMIN: Person reset — clusters kept, persons wiped")
             return {"status": "ok", "scope": scope, "detail": "All named persons cleared. Clusters remain — re-name them on the People tab."}
 
