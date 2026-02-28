@@ -6,7 +6,8 @@
  */
 
 import { useEffect, useMemo, useState } from 'react'
-import { api, AppSetting } from '../api/client'
+import { api } from '../api/client'
+import type { AppSetting } from '../api/client'
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
