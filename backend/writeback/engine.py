@@ -136,10 +136,10 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
               AND p.is_merged = 0
         """, (media_file_id,))
 
-        # GPS from media_files
+        # GPS + vip_id from media_files
         meta_row = await (
             await db.execute(
-                "SELECT gps_lat, gps_lon FROM media_files WHERE id=?", (media_file_id,)
+                "SELECT gps_lat, gps_lon, vip_id FROM media_files WHERE id=?", (media_file_id,)
             )
         ).fetchone()
 
@@ -149,6 +149,14 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
             WHERE media_file_id = ?
             ORDER BY category, rowid
         """, (media_file_id,))
+
+        # Analysis document (effective merged JSON for XMP-VIP:AnalysisJSON)
+        analysis_row = await (
+            await db.execute(
+                "SELECT model_document FROM photo_analysis WHERE media_file_id=?",
+                (media_file_id,)
+            )
+        ).fetchone()
 
     if not person_rows and not tag_rows:
         return {}
@@ -175,6 +183,7 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
 
     gps_lat = meta_row["gps_lat"] if meta_row else None
     gps_lon = meta_row["gps_lon"] if meta_row else None
+    vip_id  = meta_row["vip_id"]  if meta_row else None
 
     # Group tags by category
     objects: list[str] = []
@@ -192,6 +201,11 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
         elif cat == "place":
             places.append(label)
 
+    # Analysis JSON to embed in photo metadata (compact, no extra whitespace)
+    analysis_json: str | None = None
+    if analysis_row and analysis_row["model_document"]:
+        analysis_json = analysis_row["model_document"]
+
     return build_field_map(
         person_names=names or None,
         face_regions=regions or None,
@@ -201,4 +215,6 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
         places=places or None,
         gps_lat=gps_lat,
         gps_lon=gps_lon,
+        vip_id=vip_id,
+        analysis_json=analysis_json,
     )

@@ -140,5 +140,6 @@ def ensure_dirs() -> None:
         settings.app_support_dir,
         settings.thumbnail_dir,
         settings.preview_dir,
+        settings.photo_thumbs_dir,
     ]:
         d.mkdir(parents=True, exist_ok=True)

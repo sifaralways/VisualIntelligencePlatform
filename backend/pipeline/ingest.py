@@ -13,6 +13,7 @@ Design:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from pathlib import Path
@@ -87,6 +88,9 @@ async def run_ingest(folder: str) -> None:
     # -- Phase 4: Tag (objects, animals, geography, places) -----------------
     await _phase_tag()
 
+    # -- Phase 5: Build analysis documents (Rekognition-format JSON) --------
+    await _phase_analyse()
+
     await broadcast("pipeline_complete", folder=str(folder_path))
     logger.info("=== Pipeline complete: %s ===", folder_path)
 
@@ -139,13 +143,15 @@ async def _phase_scan(folder: Path) -> None:
                         meta.get("width"), meta.get("height"), int(is_stub), existing_id,
                     ))
                 else:
-                    # New file
+                    # New file — generate a stable UUID for XMP:Identifier
+                    new_vip_id = str(uuid.uuid4())
                     await db.execute("""
                         INSERT INTO media_files
-                            (file_path, file_hash, file_size, file_format, camera_make, camera_model,
+                            (vip_id, file_path, file_hash, file_size, file_format, camera_make, camera_model,
                              date_taken, gps_lat, gps_lon, width, height, is_stub, ingest_state)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'scanned')
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'scanned')
                     """, (
+                        new_vip_id,
                         str(file_path), file_hash, stat.st_size, meta.get("file_format"),
                         meta.get("camera_make"), meta.get("camera_model"),
                         meta.get("date_taken"), meta.get("gps_lat"), meta.get("gps_lon"),
@@ -226,11 +232,45 @@ async def _phase_embed() -> None:
 
         async with get_db() as db:
             for face in faces:
+                # Build face_attributes JSON from rich InsightFace data
+                face_attrs: dict = {}
+                if face.age is not None:
+                    face_attrs["AgeRange"] = {
+                        "Low":  max(0, face.age - 4),
+                        "High": face.age + 4,
+                    }
+                if face.gender is not None:
+                    face_attrs["Gender"] = {"Value": face.gender, "Confidence": 95.0}
+                if face.pose_yaw is not None:
+                    face_attrs["Pose"] = {
+                        "Yaw":   round(face.pose_yaw, 4),
+                        "Pitch": round(face.pose_pitch, 4),
+                        "Roll":  round(face.pose_roll, 4),
+                    }
+                if face.landmarks:
+                    face_attrs["Landmarks"] = face.landmarks
+                if face.quality_brightness is not None:
+                    face_attrs["Quality"] = {
+                        "Brightness": round(face.quality_brightness, 4),
+                        "Sharpness":  round(face.quality_sharpness, 4),
+                    }
+                # Stubs for attributes needing extra models (filled in a future phase)
+                face_attrs.setdefault("Smile",       None)
+                face_attrs.setdefault("Eyeglasses",  None)
+                face_attrs.setdefault("Sunglasses",  None)
+                face_attrs.setdefault("EyesOpen",    None)
+                face_attrs.setdefault("MouthOpen",   None)
+                face_attrs.setdefault("Beard",       None)
+                face_attrs.setdefault("Emotions",    None)
+                face_attrs.setdefault("FaceOccluded",None)
+
                 # Insert face record
                 cursor = await db.execute("""
-                    INSERT INTO faces (media_file_id, bbox_x, bbox_y, bbox_w, bbox_h, detection_conf)
-                    VALUES (?,?,?,?,?,?)
-                """, (media_id, face.bbox_x, face.bbox_y, face.bbox_w, face.bbox_h, face.detection_conf))
+                    INSERT INTO faces (media_file_id, bbox_x, bbox_y, bbox_w, bbox_h,
+                                       detection_conf, face_attributes)
+                    VALUES (?,?,?,?,?,?,?)
+                """, (media_id, face.bbox_x, face.bbox_y, face.bbox_w, face.bbox_h,
+                      face.detection_conf, json.dumps(face_attrs) if face_attrs else None))
                 face_id = cursor.lastrowid
 
                 # Save thumbnail
@@ -429,3 +469,51 @@ def _hash_path(path: Path) -> str:
     """Short hash for preview filename (mirrors preview_extractor logic)."""
     import hashlib
     return hashlib.md5(str(path).encode()).hexdigest()[:8]
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Build analysis documents (Rekognition-format JSON per photo)
+# ---------------------------------------------------------------------------
+async def _phase_analyse() -> None:
+    logger.info("Phase 5: Building analysis documents")
+    await broadcast("phase_start", phase="analyse")
+
+    from backend.ml.analysis_builder import (
+        build_analysis_document, save_analysis_document, MODEL_VERSION
+    )
+
+    # All tagged files that either have no analysis doc yet, or whose
+    # model_version has changed (i.e. models were upgraded).
+    async with get_db() as db:
+        rows = await db.execute_fetchall("""
+            SELECT mf.id
+            FROM media_files mf
+            LEFT JOIN photo_analysis pa ON pa.media_file_id = mf.id
+            WHERE mf.ingest_state = 'tagged'
+              AND mf.is_stub = 0
+              AND (pa.id IS NULL OR pa.model_version != ?)
+        """, (MODEL_VERSION,))
+
+    total = len(rows)
+    logger.info("Phase 5: %d files need analysis docs", total)
+    if total == 0:
+        await broadcast("phase_complete", phase="analyse", analysed=0)
+        return
+
+    processed = 0
+    for row in rows:
+        media_id = row["id"]
+        try:
+            async with get_db() as db:
+                doc = await build_analysis_document(media_id, db)
+                await save_analysis_document(media_id, doc, db)
+        except Exception as e:
+            logger.error("Analysis doc failed for media_id=%d: %s", media_id, e)
+            continue
+
+        processed += 1
+        if processed % 50 == 0:
+            await broadcast("analyse_progress", done=processed, total=total)
+
+    await broadcast("phase_complete", phase="analyse", analysed=processed)
+    logger.info("Phase 5 complete: %d analysis docs built/updated", processed)

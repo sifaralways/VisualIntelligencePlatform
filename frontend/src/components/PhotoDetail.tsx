@@ -1,10 +1,14 @@
 /**
  * PhotoDetail — modal showing full thumbnail + metadata + faces + ML tags.
  * Opens when a photo is clicked in PhotoGrid.
+ * Tabs: Details (faces + quick tag chips) | Analysis (editable analysis document)
  */
 
 import { useEffect, useState } from 'react'
 import { api, type TagsByCategory, type FaceRow } from '../api/client'
+import AnalysisPanel from './AnalysisPanel'
+
+type Tab = 'details' | 'analysis'
 
 interface Props {
   mediaId: number
@@ -16,6 +20,7 @@ export default function PhotoDetail({ mediaId, filePath, onClose }: Props) {
   const [tags,    setTags]    = useState<TagsByCategory | null>(null)
   const [faces,   setFaces]   = useState<FaceRow[]>([])
   const [loading, setLoading] = useState(true)
+  const [tab,     setTab]     = useState<Tab>('details')
 
   const filename = filePath.split('/').pop() ?? ''
   const thumbSrc = api.media.thumbnailUrl(mediaId)
@@ -56,9 +61,10 @@ export default function PhotoDetail({ mediaId, filePath, onClose }: Props) {
         </div>
 
         {/* ── Info panel ── */}
-        <div className="w-full md:w-80 flex-shrink-0 overflow-y-auto p-5 space-y-5">
+        <div className="w-full md:w-80 flex-shrink-0 flex flex-col overflow-hidden">
+
           {/* Header */}
-          <div className="flex items-start justify-between gap-2">
+          <div className="flex items-start justify-between gap-2 p-5 pb-3">
             <p className="text-sm font-medium text-white truncate">{filename}</p>
             <button
               onClick={onClose}
@@ -68,72 +74,102 @@ export default function PhotoDetail({ mediaId, filePath, onClose }: Props) {
             </button>
           </div>
 
-          {loading && (
-            <div className="text-gray-500 text-sm text-center py-6">Loading details…</div>
-          )}
+          {/* Tab bar */}
+          <div className="flex border-b border-gray-700 px-5">
+            {(['details', 'analysis'] as Tab[]).map(t => (
+              <button
+                key={t}
+                onClick={() => setTab(t)}
+                className={`pb-2 mr-4 text-xs font-medium capitalize border-b-2 transition-colors ${
+                  tab === t
+                    ? 'border-blue-500 text-white'
+                    : 'border-transparent text-gray-500 hover:text-gray-300'
+                }`}
+              >
+                {t}
+              </button>
+            ))}
+          </div>
 
-          {!loading && (
-            <>
-              {/* People in this photo */}
-              {faces.length > 0 && (
-                <Section title="People" icon="👤">
-                  <div className="flex flex-wrap gap-2">
-                    {faces.map(f => (
-                      <div key={f.id} className="flex flex-col items-center gap-1">
-                        <div className="w-12 h-12 rounded-full overflow-hidden bg-gray-800 border border-gray-700">
-                          {f.thumbnail_path ? (
-                            <img
-                              src={api.faces.thumbnailUrl(f.id)}
-                              alt={f.person_name ?? 'Unknown'}
-                              className="w-full h-full object-cover"
-                            />
-                          ) : (
-                            <span className="flex items-center justify-center h-full text-xl">👤</span>
-                          )}
+          {/* Tab content */}
+          <div className="flex-1 overflow-y-auto p-5 space-y-5">
+
+            {tab === 'details' && (
+              <>
+                {loading && (
+                  <div className="text-gray-500 text-sm text-center py-6">Loading details…</div>
+                )}
+
+                {!loading && (
+                  <>
+                    {/* People in this photo */}
+                    {faces.length > 0 && (
+                      <Section title="People" icon="👤">
+                        <div className="flex flex-wrap gap-2">
+                          {faces.map(f => (
+                            <div key={f.id} className="flex flex-col items-center gap-1">
+                              <div className="w-12 h-12 rounded-full overflow-hidden bg-gray-800 border border-gray-700">
+                                {f.thumbnail_path ? (
+                                  <img
+                                    src={api.faces.thumbnailUrl(f.id)}
+                                    alt={f.person_name ?? 'Unknown'}
+                                    className="w-full h-full object-cover"
+                                  />
+                                ) : (
+                                  <span className="flex items-center justify-center h-full text-xl">👤</span>
+                                )}
+                              </div>
+                              <span className="text-gray-300 text-[10px] text-center max-w-12 truncate">
+                                {f.person_name ?? '?'}
+                              </span>
+                            </div>
+                          ))}
                         </div>
-                        <span className="text-gray-300 text-[10px] text-center max-w-12 truncate">
-                          {f.person_name ?? '?'}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </Section>
-              )}
+                      </Section>
+                    )}
 
-              {/* ML Tags */}
-              {tags && Object.keys(tags).length > 0 && (
-                <>
-                  {tags.object && tags.object.length > 0 && (
-                    <Section title="Objects" icon="📦">
-                      <TagChips labels={tags.object} colour="bg-blue-800/60 text-blue-200" />
-                    </Section>
-                  )}
-                  {tags.animal && tags.animal.length > 0 && (
-                    <Section title="Animals" icon="🐾">
-                      <TagChips labels={tags.animal} colour="bg-green-800/60 text-green-200" />
-                    </Section>
-                  )}
-                  {tags.geography && tags.geography.length > 0 && (
-                    <Section title="Scene" icon="🌍">
-                      <TagChips labels={tags.geography} colour="bg-yellow-800/60 text-yellow-200" />
-                    </Section>
-                  )}
-                  {tags.place && tags.place.length > 0 && (
-                    <Section title="Places" icon="📍">
-                      <TagChips labels={tags.place} colour="bg-pink-800/60 text-pink-200" />
-                    </Section>
-                  )}
-                </>
-              )}
+                    {/* ML Tags */}
+                    {tags && Object.keys(tags).length > 0 && (
+                      <>
+                        {tags.object && tags.object.length > 0 && (
+                          <Section title="Objects" icon="📦">
+                            <TagChips labels={tags.object} colour="bg-blue-800/60 text-blue-200" />
+                          </Section>
+                        )}
+                        {tags.animal && tags.animal.length > 0 && (
+                          <Section title="Animals" icon="🐾">
+                            <TagChips labels={tags.animal} colour="bg-green-800/60 text-green-200" />
+                          </Section>
+                        )}
+                        {tags.geography && tags.geography.length > 0 && (
+                          <Section title="Scene" icon="🌍">
+                            <TagChips labels={tags.geography} colour="bg-yellow-800/60 text-yellow-200" />
+                          </Section>
+                        )}
+                        {tags.place && tags.place.length > 0 && (
+                          <Section title="Places" icon="📍">
+                            <TagChips labels={tags.place} colour="bg-pink-800/60 text-pink-200" />
+                          </Section>
+                        )}
+                      </>
+                    )}
 
-              {/* Nothing tagged yet */}
-              {(!tags || Object.keys(tags).length === 0) && faces.length === 0 && (
-                <p className="text-gray-600 text-sm text-center py-4">
-                  No tags yet — run the full pipeline to generate them.
-                </p>
-              )}
-            </>
-          )}
+                    {/* Nothing tagged yet */}
+                    {(!tags || Object.keys(tags).length === 0) && faces.length === 0 && (
+                      <p className="text-gray-600 text-sm text-center py-4">
+                        No tags yet — run the full pipeline to generate them.
+                      </p>
+                    )}
+                  </>
+                )}
+              </>
+            )}
+
+            {tab === 'analysis' && (
+              <AnalysisPanel mediaId={mediaId} />
+            )}
+
+          </div>
         </div>
       </div>
     </div>

@@ -47,6 +47,8 @@ def build_field_map(
     places: list[str] | None = None,
     gps_lat: float | None = None,
     gps_lon: float | None = None,
+    vip_id: str | None = None,
+    analysis_json: str | None = None,
 ) -> dict[str, Any]:
     """
     Build the ExifTool field dictionary for a media file.
@@ -59,12 +61,23 @@ def build_field_map(
         geography:     Scene labels (Mountains, Ocean, Forest …).
         places:        Landmark / place names (Taj Mahal, Harbour Bridge …).
         gps_lat/lon:   GPS coordinates to write if not already present.
+        vip_id:        Stable app UUID — written to XMP:Identifier for file tracking.
+        analysis_json: Full analysis document JSON — written to XMP-VIP:AnalysisJSON
+                       for round-tripping back into the app from any EXIF reader.
 
     Returns:
         Dict suitable for ExifToolWriter.write(file_path, fields=…)
     """
     fields: dict[str, Any] = {}
     all_keywords: list[str] = []
+
+    # ── Stable app UUID ────────────────────────────────────────────────────
+    if vip_id:
+        fields["XMP:Identifier"] = vip_id
+
+    # ── Full analysis JSON (round-trippable) ──────────────────────────────
+    if analysis_json:
+        fields["XMP-VIP:AnalysisJSON"] = analysis_json
 
     # ── Person ──────────────────────────────────────────────────────────────
     if person_names:

@@ -14,6 +14,7 @@ CLI usage (called by setup.sh):
 import asyncio
 import logging
 import sys
+import uuid as _uuid_mod
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator
@@ -92,6 +93,20 @@ async def init_db() -> None:
             )
             await db.commit()
             logger.info("✅  Applied: %s", migration_file.name)
+
+        # Backfill vip_id for any existing rows that pre-date migration 003
+        null_rows = await db.execute_fetchall(
+            "SELECT id FROM media_files WHERE vip_id IS NULL"
+        )
+        if null_rows:
+            logger.info("Backfilling vip_id for %d existing media rows…", len(null_rows))
+            for r in null_rows:
+                await db.execute(
+                    "UPDATE media_files SET vip_id=? WHERE id=?",
+                    (str(_uuid_mod.uuid4()), r[0]),
+                )
+            await db.commit()
+            logger.info("vip_id backfill complete")
 
     logger.info("Database ready.")
 

@@ -38,6 +38,16 @@ class DetectedFace:
     crop: np.ndarray        # RGB uint8 face crop
     embedding: Optional[np.ndarray] = None  # 512-D ArcFace vector, already L2-normalised
 
+    # ── Additional attributes from Buffalo_L (all optional — depend on model sub-modules) ──
+    age: Optional[int] = None             # estimated age in years (GenderAge model)
+    gender: Optional[str] = None          # 'Male' | 'Female' (GenderAge model)
+    pose_yaw: Optional[float] = None      # head yaw  in degrees
+    pose_pitch: Optional[float] = None    # head pitch in degrees
+    pose_roll: Optional[float] = None     # head roll  in degrees
+    landmarks: Optional[list] = None      # list of {Type, X, Y} following Rekognition naming
+    quality_brightness: Optional[float] = None   # mean pixel brightness 0–100
+    quality_sharpness: Optional[float] = None    # Laplacian variance → sharpness 0–100
+
 
 class FaceDetector:
     """
@@ -119,6 +129,45 @@ class FaceDetector:
             emb = getattr(face, 'normed_embedding', None)
             embedding = emb.astype(np.float32) if emb is not None else None
 
+            # ── Age & Gender (GenderAge sub-model of Buffalo_L) ──────────────
+            raw_age    = getattr(face, 'age', None)
+            raw_gender = getattr(face, 'gender', None)  # 0=female, 1=male
+            age    = int(round(float(raw_age))) if raw_age is not None else None
+            gender = ('Male' if raw_gender == 1 else 'Female') if raw_gender is not None else None
+
+            # ── Pose (3D head orientation) ────────────────────────────────────
+            pose_yaw = pose_pitch = pose_roll = None
+            raw_pose = getattr(face, 'pose', None)
+            if raw_pose is not None and len(raw_pose) >= 3:
+                # InsightFace convention: [pitch, yaw, roll] in degrees
+                pose_pitch = float(raw_pose[0])
+                pose_yaw   = float(raw_pose[1])
+                pose_roll  = float(raw_pose[2])
+
+            # ── 5-point landmarks (kps) mapped to Rekognition names ───────────
+            landmarks = None
+            raw_kps = getattr(face, 'kps', None)
+            if raw_kps is not None and len(raw_kps) == 5:
+                kps_names = ['eyeLeft', 'eyeRight', 'nose', 'mouthLeft', 'mouthRight']
+                landmarks = [
+                    {'Type': name, 'X': round(float(kp[0]) / img_w, 6),
+                                   'Y': round(float(kp[1]) / img_h, 6)}
+                    for name, kp in zip(kps_names, raw_kps)
+                ]
+
+            # ── Quality: brightness + sharpness from face crop ────────────────
+            quality_brightness = quality_sharpness = None
+            if crop.size > 0:
+                gray = np.mean(crop, axis=2)                       # luminance approx
+                quality_brightness = float(np.clip(np.mean(gray) / 255 * 100, 0, 100))
+                # Laplacian variance as sharpness proxy (normalised to 0–100)
+                laplacian = np.array([
+                    gray[:-2, 1:-1] + gray[2:, 1:-1] + gray[1:-1, :-2] + gray[1:-1, 2:]
+                    - 4 * gray[1:-1, 1:-1]
+                ])
+                lap_var = float(np.var(laplacian))
+                quality_sharpness = float(np.clip(lap_var / 500 * 100, 0, 100))
+
             results.append(DetectedFace(
                 bbox_x=x1 / img_w,
                 bbox_y=y1 / img_h,
@@ -127,6 +176,14 @@ class FaceDetector:
                 detection_conf=conf,
                 crop=crop,
                 embedding=embedding,
+                age=age,
+                gender=gender,
+                pose_yaw=pose_yaw,
+                pose_pitch=pose_pitch,
+                pose_roll=pose_roll,
+                landmarks=landmarks,
+                quality_brightness=quality_brightness,
+                quality_sharpness=quality_sharpness,
             ))
 
         return results

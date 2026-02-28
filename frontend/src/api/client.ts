@@ -115,6 +115,24 @@ export const api = {
     },
   },
 
+  // ─── Analysis ────────────────────────────────────────────────────────────
+  analysis: {
+    /** Merged effective document (model + user amendments, person_id resolved to name). */
+    get: (mediaId: number) => request<AnalysisDocument>(`/analysis/${mediaId}`),
+    /** Raw unmodified model document. */
+    raw: (mediaId: number) => request<AnalysisDocument>(`/analysis/${mediaId}/raw`),
+    /** Trigger a rebuild for a single photo (background). */
+    rebuild: (mediaId: number) => request(`/analysis/${mediaId}/rebuild`, { method: 'POST' }),
+    /** List all user amendments for a photo. */
+    amendments: (mediaId: number) => request<AnalysisAmendment[]>(`/analysis/${mediaId}/amendments`),
+    /** Add or update a user amendment. */
+    amend: (mediaId: number, req: AmendRequest) =>
+      request(`/analysis/${mediaId}/amend`, { method: 'PUT', body: JSON.stringify(req) }),
+    /** Remove an amendment (restores original model label). */
+    deleteAmend: (mediaId: number, labelName: string) =>
+      request(`/analysis/${mediaId}/amend/${encodeURIComponent(labelName)}`, { method: 'DELETE' }),
+  },
+
   // ─── Admin ──────────────────────────────────────────────────────────────────
   admin: {
     stats: () => request<AdminStats>('/admin/stats'),
@@ -241,4 +259,80 @@ export interface TopTag {
   category?: string
   label: string
   count: number
+}
+// ─── Analysis document types ──────────────────────────────────────────────────
+
+export interface BoundingBox {
+  Left: number; Top: number; Width: number; Height: number
+}
+
+export interface AnalysisLabel {
+  Name: string
+  Confidence: number            // 0–100 (Rekognition scale)
+  Source: string                // 'yolov11' | 'places365' | 'bioclip' | 'clip' | 'user'
+  Instances: { BoundingBox: BoundingBox; Confidence: number }[]
+  Parents: { Name: string }[]
+  Categories: { Name: string }[]
+  Aliases: { Name: string }[]
+  UserEdited: boolean
+  UserConfirmed: boolean
+  OriginalName?: string         // set when action='rename'
+}
+
+export interface AnalysisFaceAttribute {
+  Value: boolean | string; Confidence: number
+}
+
+export interface AnalysisFace {
+  face_id: number
+  person_id: number | null
+  person_name: string | null    // resolved at read time from persons table
+  detection_conf: number
+  bbox: BoundingBox
+  // Rekognition-format attributes (null = model not available yet)
+  AgeRange: { Low: number; High: number } | null
+  Gender: { Value: string; Confidence: number } | null
+  Pose: { Yaw: number; Pitch: number; Roll: number } | null
+  Landmarks: { Type: string; X: number; Y: number }[] | null
+  Quality: { Brightness: number; Sharpness: number } | null
+  Smile: AnalysisFaceAttribute | null
+  Eyeglasses: AnalysisFaceAttribute | null
+  Sunglasses: AnalysisFaceAttribute | null
+  EyesOpen: AnalysisFaceAttribute | null
+  MouthOpen: AnalysisFaceAttribute | null
+  Beard: AnalysisFaceAttribute | null
+  Emotions: { Type: string; Confidence: number }[] | null
+  FaceOccluded: AnalysisFaceAttribute | null
+}
+
+export interface AnalysisDocument {
+  schema_version: string
+  vip_id: string | null
+  media_id: number
+  file_path: string
+  date_taken: string | null
+  camera: string | null
+  image_size: { width: number | null; height: number | null }
+  file_format: string | null
+  Labels: AnalysisLabel[]
+  Faces: AnalysisFace[]
+  Geography: { gps_lat: number | null; gps_lon: number | null; labels: string[] }
+  model_version: string
+  generated_at: string
+  updated_at?: string
+}
+
+export interface AnalysisAmendment {
+  label_name: string
+  action: 'rename' | 'delete' | 'add' | 'confirm'
+  user_value: string | null
+  user_confidence: number | null
+  amended_at: string
+}
+
+export interface AmendRequest {
+  label_name: string
+  action: 'rename' | 'delete' | 'add' | 'confirm'
+  user_value?: string
+  user_confidence?: number
 }
