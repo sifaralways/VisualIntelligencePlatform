@@ -96,6 +96,19 @@ async def run_ingest(folder: str) -> None:
     # -- Phase 5: Build analysis documents (Rekognition-format JSON) --------
     await _phase_analyse()
 
+    # Sync denormalised photo_count on all active persons
+    async with get_db() as db:
+        await db.execute("""
+            UPDATE persons
+            SET photo_count = (
+                SELECT COUNT(DISTINCT f.media_file_id)
+                FROM faces f
+                WHERE f.person_id = persons.id
+            )
+            WHERE is_merged = 0
+        """)
+    logger.info("Synced photo_count for all persons")
+
     await broadcast("pipeline_complete", folder=str(folder_path))
     logger.info("=== Pipeline complete: %s ===", folder_path)
 

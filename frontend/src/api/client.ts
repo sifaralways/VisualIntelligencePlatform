@@ -72,6 +72,10 @@ export const api = {
       }),
     addCluster: (personId: number, clusterId: number) =>
       request(`/persons/${personId}/add-cluster/${clusterId}`, { method: 'POST' }),
+    mergeSuggestions: (personId: number) =>
+      request<MergeSuggestion[]>(`/persons/${personId}/merge-suggestions?limit=1`),
+    rejectSuggestion: (personId: number, clusterId: number) =>
+      request(`/persons/${personId}/reject-suggestion/${clusterId}`, { method: 'POST' }),
   },
 
   // ─── Faces ────────────────────────────────────────────────────────────────
@@ -202,8 +206,18 @@ export interface Person {
   uuid: string
   name: string | null
   photo_count: number
+  merge_sources_count: number
   is_merged: boolean
   representative_thumbnail: string | null
+}
+
+export interface MergeSuggestion {
+  cluster_id: number
+  member_count: number
+  intra_similarity: number | null
+  is_high_conf: number
+  representative_thumbnail: string | null
+  similarity: number   // cosine similarity to the named person's centroid
 }
 
 export interface FaceRow {

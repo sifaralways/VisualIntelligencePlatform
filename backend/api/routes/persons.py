@@ -5,11 +5,15 @@ from __future__ import annotations
 import uuid as _uuid
 from typing import Optional
 
+import numpy as np
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from backend.database.db import get_db
 from backend.database.models import Person
+
+# Minimum cosine similarity to surface a merge suggestion
+_SUGGEST_THRESHOLD = 0.55
 
 router = APIRouter()
 
@@ -29,8 +33,11 @@ async def list_persons():
         rows = await db.execute_fetchall("""
             SELECT p.id, p.uuid, p.name, p.created_at, p.named_at,
                    p.is_merged, p.merged_into_id,
-                   COUNT(DISTINCT f.media_file_id) as photo_count,
-                   MIN(f.thumbnail_path) as representative_thumbnail
+                   COUNT(DISTINCT f.media_file_id)            AS photo_count,
+                   (SELECT COUNT(*) FROM persons p2
+                    WHERE p2.merged_into_id = p.id
+                      AND p2.is_merged = 1)                   AS merge_sources_count,
+                   MIN(f.thumbnail_path)                      AS representative_thumbnail
             FROM persons p
             LEFT JOIN faces f ON f.person_id = p.id
             WHERE p.is_merged = 0
@@ -94,13 +101,8 @@ async def merge_persons(req: MergeRequest, source_id: int):
         await db.execute("""
             UPDATE persons SET is_merged=1, merged_into_id=? WHERE id=?
         """, (req.into_person_id, source_id))
-
-        # Update photo count on target
-        await db.execute("""
-            UPDATE persons SET photo_count=(
-                SELECT COUNT(DISTINCT media_file_id) FROM faces WHERE person_id=?
-            ) WHERE id=?
-        """, (req.into_person_id, req.into_person_id))
+        # Sync stored photo_count on target
+        await _sync_photo_count(db, req.into_person_id)
 
     return {"status": "merged", "into": req.into_person_id}
 
@@ -125,6 +127,7 @@ async def create_person_from_cluster(cluster_id: int, req: NameClusterRequest):
         await db.execute(
             "UPDATE faces SET person_id=? WHERE cluster_id=?", (person_id, cluster_id)
         )
+        await _sync_photo_count(db, person_id)
 
         # Queue photos for writeback
         await db.execute("""
@@ -151,6 +154,13 @@ async def add_cluster_to_person(person_id: int, cluster_id: int):
         await db.execute(
             "UPDATE faces SET person_id=? WHERE cluster_id=?", (person_id, cluster_id)
         )
+        await _sync_photo_count(db, person_id)
+
+        # Clear any rejection record — user just accepted this cluster
+        await db.execute(
+            "DELETE FROM rejected_suggestions WHERE person_id=? AND cluster_id=?",
+            (person_id, cluster_id),
+        )
 
         # Queue photos for writeback
         await db.execute("""
@@ -159,6 +169,115 @@ async def add_cluster_to_person(person_id: int, cluster_id: int):
         """, (cluster_id,))
 
     return {"status": "merged", "person_id": person_id}
+
+
+# ---------------------------------------------------------------------------
+# Proactive merge suggestions
+# ---------------------------------------------------------------------------
+
+@router.get("/{person_id}/merge-suggestions")
+async def get_merge_suggestions(person_id: int, limit: int = 1):
+    """
+    Return up to `limit` unnamed clusters that may contain the same person,
+    ranked by cosine similarity between embedding centroids.
+    Only clusters not previously rejected for this person are returned.
+    """
+    async with get_db() as db:
+        person = await (
+            await db.execute(
+                "SELECT id, name FROM persons WHERE id=? AND is_merged=0", (person_id,)
+            )
+        ).fetchone()
+        if not person:
+            raise HTTPException(status_code=404, detail="Person not found")
+
+        # Person's embeddings
+        emb_rows = await db.execute_fetchall("""
+            SELECT e.vector FROM embeddings e
+            JOIN faces f ON f.id = e.face_id
+            WHERE f.person_id = ?
+        """, (person_id,))
+        if not emb_rows:
+            return []
+
+        person_vecs = np.stack([
+            np.frombuffer(r["vector"], dtype=np.float32) for r in emb_rows
+        ])
+        person_centroid = person_vecs.mean(axis=0)
+        norm = np.linalg.norm(person_centroid)
+        if norm > 0:
+            person_centroid /= norm
+
+        # Unnamed clusters not yet rejected for this person
+        candidates = await db.execute_fetchall("""
+            SELECT c.id AS cluster_id, c.member_count,
+                   c.intra_similarity, c.is_high_conf,
+                   MIN(f.thumbnail_path) AS representative_thumbnail
+            FROM clusters c
+            JOIN faces f ON f.cluster_id = c.id
+            WHERE c.person_id IS NULL
+              AND c.id NOT IN (
+                  SELECT cluster_id FROM rejected_suggestions WHERE person_id = ?
+              )
+            GROUP BY c.id
+        """, (person_id,))
+
+        if not candidates:
+            return []
+
+        # Score each candidate
+        scored: list[dict] = []
+        for cand in candidates:
+            cid = cand["cluster_id"]
+            cand_embs = await db.execute_fetchall("""
+                SELECT e.vector FROM embeddings e
+                JOIN faces f ON f.id = e.face_id
+                WHERE f.cluster_id = ?
+            """, (cid,))
+            if not cand_embs:
+                continue
+            cand_vecs = np.stack([
+                np.frombuffer(r["vector"], dtype=np.float32) for r in cand_embs
+            ])
+            centroid = cand_vecs.mean(axis=0)
+            n = np.linalg.norm(centroid)
+            if n > 0:
+                centroid /= n
+            sim = float(np.dot(person_centroid, centroid))
+            if sim >= _SUGGEST_THRESHOLD:
+                scored.append({**dict(cand), "similarity": round(sim, 3)})
+
+        scored.sort(key=lambda x: x["similarity"], reverse=True)
+        return scored[:limit]
+
+
+@router.post("/{person_id}/reject-suggestion/{cluster_id}")
+async def reject_merge_suggestion(person_id: int, cluster_id: int):
+    """
+    Record that the user said 'Different person' for this cluster.
+    It will not be suggested again for this person.
+    """
+    async with get_db() as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO rejected_suggestions (person_id, cluster_id) VALUES (?,?)",
+            (person_id, cluster_id),
+        )
+    return {"status": "rejected"}
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+async def _sync_photo_count(db, person_id: int) -> None:
+    """Keep the denormalised persons.photo_count column accurate."""
+    await db.execute("""
+        UPDATE persons
+        SET photo_count = (
+            SELECT COUNT(DISTINCT media_file_id) FROM faces WHERE person_id = ?
+        )
+        WHERE id = ?
+    """, (person_id, person_id))
 
 
 @router.get("/{person_id}/faces")

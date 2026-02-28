@@ -8,7 +8,7 @@
 
 import { useEffect, useState } from 'react'
 import { api } from '../api/client'
-import type { Cluster, Person } from '../api/client'
+import type { Cluster, Person, MergeSuggestion, FaceRow } from '../api/client'
 
 interface Props {
   /** Called when user clicks a named person tile to view their photos. */
@@ -26,6 +26,52 @@ export default function PeoplePage({ onSelectPerson }: Props) {
   const [reviewPerson, setReviewPerson] = useState<Person | null>(null)
   const [reviewFaces, setReviewFaces] = useState<FaceRow[]>([])
   const [reviewLoading, setReviewLoading] = useState(false)
+
+  // ── Proactive merge suggestions ─────────────────────────────────────────
+  const [suggestion, setSuggestion] = useState<MergeSuggestion | null>(null)
+  const [suggestionPersonId, setSuggestionPersonId] = useState<number | null>(null)
+  const [suggestionPersonName, setSuggestionPersonName] = useState<string | null>(null)
+  const [suggestionBusy, setSuggestionBusy] = useState(false)
+
+  async function fetchNextSuggestion(personId: number) {
+    try {
+      const list = await api.persons.mergeSuggestions(personId)
+      setSuggestion(list.length > 0 ? list[0] : null)
+    } catch {
+      setSuggestion(null)
+    }
+  }
+
+  async function startSuggestions(personId: number, name: string) {
+    setSuggestionPersonId(personId)
+    setSuggestionPersonName(name)
+    await fetchNextSuggestion(personId)
+  }
+
+  async function acceptSuggestion() {
+    if (!suggestionPersonId || !suggestion) return
+    setSuggestionBusy(true)
+    try {
+      await api.persons.addCluster(suggestionPersonId, suggestion.cluster_id)
+      await load()
+      await fetchNextSuggestion(suggestionPersonId)
+    } finally { setSuggestionBusy(false) }
+  }
+
+  async function rejectSuggestion() {
+    if (!suggestionPersonId || !suggestion) return
+    setSuggestionBusy(true)
+    try {
+      await api.persons.rejectSuggestion(suggestionPersonId, suggestion.cluster_id)
+      await fetchNextSuggestion(suggestionPersonId)
+    } finally { setSuggestionBusy(false) }
+  }
+
+  function dismissSuggestions() {
+    setSuggestion(null)
+    setSuggestionPersonId(null)
+    setSuggestionPersonName(null)
+  }
   async function load() {
     setLoading(true)
     try {
@@ -70,6 +116,11 @@ export default function PeoplePage({ onSelectPerson }: Props) {
       await api.persons.fromCluster(clusterId, name)
       setNamingId(null)
       setNameInput('')
+      const refreshed = await api.persons.list()
+      setPersons(refreshed)
+      // Kick off proactive suggestions for the newly named person
+      const newPerson = refreshed.find(p => p.name?.toLowerCase() === name.toLowerCase())
+      if (newPerson) startSuggestions(newPerson.id, newPerson.name!)
       load()
     } finally { setSaving(false) }
   }
@@ -90,6 +141,76 @@ export default function PeoplePage({ onSelectPerson }: Props) {
   return (
     <div>
       <h1 className="text-xl font-semibold mb-6">People</h1>
+
+      {/* Suggestion modal — proactive same-person proposal */}
+      {suggestion && suggestionPersonId !== null && (
+        <div className="fixed inset-0 bg-black/75 flex items-center justify-center z-50">
+          <div className="bg-gray-900 border border-gray-700 rounded-2xl p-7 max-w-md w-full shadow-2xl mx-4">
+            <p className="text-white font-semibold text-lg mb-1">
+              Same person as <span className="text-indigo-400">{suggestionPersonName}</span>?
+            </p>
+            <p className="text-gray-400 text-xs mb-5">
+              Similarity {Math.round(suggestion.similarity * 100)}% —
+              cluster of {suggestion.member_count} face{suggestion.member_count !== 1 ? 's' : ''}
+              {suggestion.is_high_conf === 1 && <span className="ml-1 text-green-400">✓ high confidence</span>}
+            </p>
+            <div className="flex gap-6 items-center justify-center mb-6">
+              {/* Named person representative */}
+              <div className="flex flex-col items-center gap-1">
+                <div className="w-24 h-24 rounded-xl overflow-hidden bg-gray-800 border border-indigo-600">
+                  {(() => {
+                    const p = persons.find(x => x.id === suggestionPersonId)
+                    const url = p?.representative_thumbnail
+                      ? '/thumbnails/' + p.representative_thumbnail.split('/thumbnails/').pop()
+                      : null
+                    return url
+                      ? <img src={url} alt={suggestionPersonName ?? ''} className="w-full h-full object-cover" />
+                      : <span className="flex items-center justify-center h-full text-gray-500 text-2xl">👤</span>
+                  })()}
+                </div>
+                <span className="text-xs text-indigo-400 font-medium">{suggestionPersonName}</span>
+              </div>
+              <span className="text-gray-400 text-2xl">≈</span>
+              {/* Candidate cluster */}
+              <div className="flex flex-col items-center gap-1">
+                <div className="w-24 h-24 rounded-xl overflow-hidden bg-gray-800 border border-gray-600">
+                  {(() => {
+                    const url = suggestion.representative_thumbnail
+                      ? '/thumbnails/' + suggestion.representative_thumbnail.split('/thumbnails/').pop()
+                      : null
+                    return url
+                      ? <img src={url} alt="candidate" className="w-full h-full object-cover" />
+                      : <span className="flex items-center justify-center h-full text-gray-500 text-2xl">?</span>
+                  })()}
+                </div>
+                <span className="text-xs text-gray-500">{suggestion.member_count} face{suggestion.member_count !== 1 ? 's' : ''}</span>
+              </div>
+            </div>
+            <div className="flex gap-3">
+              <button
+                onClick={acceptSuggestion}
+                disabled={suggestionBusy}
+                className="flex-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-xl py-2.5 text-sm font-semibold transition-colors"
+              >
+                {suggestionBusy ? 'Merging…' : '✓ Yes, same person'}
+              </button>
+              <button
+                onClick={rejectSuggestion}
+                disabled={suggestionBusy}
+                className="flex-1 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-gray-300 rounded-xl py-2.5 text-sm font-medium transition-colors"
+              >
+                Different person
+              </button>
+            </div>
+            <button
+              onClick={dismissSuggestions}
+              className="mt-3 w-full text-center text-xs text-gray-600 hover:text-gray-400"
+            >
+              Stop checking (done for now)
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Face review panel */}
       {reviewPerson && (
@@ -227,6 +348,16 @@ export default function PeoplePage({ onSelectPerson }: Props) {
                   </div>
                   <span className="text-xs text-center text-gray-200 truncate max-w-full px-1">{p.name}</span>
                   <span className="text-xs text-gray-500">{p.photo_count} photo{p.photo_count !== 1 ? 's' : ''}</span>
+                  {p.merge_sources_count > 0 && (
+                    <span className="text-xs text-indigo-500">⇐ {p.merge_sources_count} merged</span>
+                  )}
+                  <button
+                    onClick={() => startSuggestions(p.id, p.name!)}
+                    title="Find similar faces"
+                    className="text-xs text-gray-600 hover:text-indigo-400 transition-colors"
+                  >
+                    ≈ find similar
+                  </button>
                 </div>
               )
             })}
