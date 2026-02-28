@@ -93,6 +93,28 @@ def _extract_sync(raw_path: Path, out_path: Path) -> bool:
             return False
 
         out_path.write_bytes(result.stdout)
+
+        # ── Orientation correction ────────────────────────────────────────
+        # Embedded JPEG previews inherit the RAW file's EXIF orientation tag
+        # but the pixel data is physically rotated (e.g., a portrait shot is
+        # stored as a landscape matrix and tagged Rotate 90 CW).  Finder and
+        # Photos read the tag at render time; cv2.imread, PIL Image.open, and
+        # every ML model we use do NOT.  Fix it once here so every downstream
+        # consumer — InsightFace, YOLO, Places365, CLIP, BioCLIP, and the UI
+        # thumbnail generator — always receives an upright image.
+        try:
+            from PIL import Image, ImageOps
+            with Image.open(out_path) as _img:
+                _corrected = ImageOps.exif_transpose(_img)
+                # Only re-save if the tag indicated a non-identity rotation
+                # (exif_transpose returns the same object when no rotation needed)
+                if _corrected is not _img:
+                    _corrected.save(out_path, "JPEG", quality=92, optimize=True)
+                    logger.debug("Applied EXIF orientation correction to preview: %s", out_path.name)
+        except Exception as _e:
+            # Non-fatal: the preview is usable even if we can't correct orientation
+            logger.warning("EXIF orientation correction failed for %s: %s", out_path.name, _e)
+
         return True
 
     except subprocess.TimeoutExpired:
