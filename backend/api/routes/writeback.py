@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 
-from backend.writeback.engine import preview_pending, execute_writes
+from backend.writeback.engine import preview_pending, execute_writes, write_single_file
 
 router = APIRouter()
 
@@ -39,6 +39,27 @@ async def confirm_writes(req: ConfirmRequest):
     """
     result = await execute_writes(req.queue_ids)
     return result
+
+
+@router.post("/single/{media_id}")
+async def write_single(media_id: int):
+    """
+    Write EXIF metadata for a single photo immediately.
+
+    Bypasses the writeback queue — useful for the per-photo "Write to EXIF"
+    button in the UI. Writes the *effective* document (model doc + user
+    amendments + resolved person names), NOT the raw model output.
+
+    The file must be locally present (not an iCloud stub).
+    Returns the list of EXIF fields written on success.
+    """
+    try:
+        result = await write_single_file(media_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"media_id": media_id, **result}
 
 
 @router.get("/status")

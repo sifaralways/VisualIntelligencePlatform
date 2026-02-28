@@ -46,6 +46,8 @@ export default function AnalysisPanel({ mediaId }: Props) {
   const [error,   setError]   = useState<string | null>(null)
   const [addingLabel, setAddingLabel] = useState(false)
   const [newLabel,    setNewLabel]    = useState('')
+  const [writing,     setWriting]     = useState(false)
+  const [writeResult, setWriteResult] = useState<string | null>(null)
   const addInputRef = useRef<HTMLInputElement>(null)
 
   const load = useCallback(() => {
@@ -80,6 +82,23 @@ export default function AnalysisPanel({ mediaId }: Props) {
     await amend(trimmed, 'add')
     setNewLabel('')
     setAddingLabel(false)
+  }
+
+  const writeToExif = async () => {
+    setWriting(true)
+    setWriteResult(null)
+    try {
+      const r = await api.writeback.writeOne(mediaId)
+      if (r.status === 'written') {
+        setWriteResult(`✓ Written — ${r.fields_written?.length ?? 0} fields embedded`)
+      } else {
+        setWriteResult(`⚡ Skipped — ${r.reason ?? 'no metadata to write'}`)
+      }
+    } catch (e: any) {
+      setWriteResult(`✕ ${e.message}`)
+    } finally {
+      setWriting(false)
+    }
   }
 
   const exportJson = () => {
@@ -195,19 +214,36 @@ export default function AnalysisPanel({ mediaId }: Props) {
       )}
 
       {/* ── Actions ──────────────────────────────────────────────────── */}
-      <div className="flex gap-2 pt-1 border-t border-gray-800">
-        <button
-          onClick={exportJson}
-          className="flex-1 text-xs text-gray-300 hover:text-white border border-gray-700 hover:border-gray-500 rounded py-1.5"
-        >
-          ⬇ Export JSON
-        </button>
-        <button
-          onClick={() => api.analysis.rebuild(mediaId).then(load)}
-          className="flex-1 text-xs text-gray-300 hover:text-white border border-gray-700 hover:border-gray-500 rounded py-1.5"
-        >
-          ↻ Rebuild
-        </button>
+      <div className="pt-1 border-t border-gray-800 space-y-1.5">
+        <div className="flex gap-2">
+          <button
+            onClick={exportJson}
+            className="flex-1 text-xs text-gray-300 hover:text-white border border-gray-700 hover:border-gray-500 rounded py-1.5 transition-colors"
+          >
+            ⬇ Export JSON
+          </button>
+          <button
+            onClick={() => api.analysis.rebuild(mediaId).then(load)}
+            className="flex-1 text-xs text-gray-300 hover:text-white border border-gray-700 hover:border-gray-500 rounded py-1.5 transition-colors"
+          >
+            ↻ Rebuild
+          </button>
+          <button
+            onClick={writeToExif}
+            disabled={writing}
+            className="flex-1 text-xs text-gray-300 hover:text-white border border-gray-700 hover:border-gray-500 rounded py-1.5 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {writing ? '…' : '✍ Write to EXIF'}
+          </button>
+        </div>
+        {writeResult && (
+          <p className={`text-[11px] text-center ${
+            writeResult.startsWith('✓') ? 'text-green-400' :
+            writeResult.startsWith('✕') ? 'text-red-400'   : 'text-yellow-400'
+          }`}>
+            {writeResult}
+          </p>
+        )}
       </div>
     </div>
   )

@@ -49,21 +49,24 @@ def build_field_map(
     gps_lon: float | None = None,
     vip_id: str | None = None,
     analysis_json: str | None = None,
+    hierarchical_subjects: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Build the ExifTool field dictionary for a media file.
 
     Args:
-        person_names:  Names of identified people.
-        face_regions:  Bounding boxes for MWG region metadata.
-        objects:       Object labels (Car, TV, Appliance …).
-        animals:       Animal/species labels (Dog, Golden Retriever …).
-        geography:     Scene labels (Mountains, Ocean, Forest …).
-        places:        Landmark / place names (Taj Mahal, Harbour Bridge …).
-        gps_lat/lon:   GPS coordinates to write if not already present.
-        vip_id:        Stable app UUID — written to XMP:Identifier for file tracking.
-        analysis_json: Full analysis document JSON — written to XMP-VIP:AnalysisJSON
-                       for round-tripping back into the app from any EXIF reader.
+        person_names:          Names of identified people.
+        face_regions:          Bounding boxes for MWG region metadata.
+        objects:               Object labels (Car, TV, Appliance …).
+        animals:               Animal/species labels (Dog, Golden Retriever …).
+        geography:             Scene labels (Mountains, Ocean, Forest …).
+        places:                Landmark / place names (Taj Mahal, Harbour Bridge …).
+        gps_lat/lon:           GPS coordinates to write if not already present.
+        vip_id:                Stable app UUID — written to XMP:Identifier for file tracking.
+        analysis_json:         Effective (amendment-merged) analysis document JSON.
+                               Written to XMP-VIP:AnalysisJSON for round-tripping.
+        hierarchical_subjects: "Category|Parent|Label" paths for XMP:HierarchicalSubject.
+                               Standard Lightroom/Bridge hierarchical keyword format.
 
     Returns:
         Dict suitable for ExifToolWriter.write(file_path, fields=…)
@@ -111,7 +114,12 @@ def build_field_map(
         fields["EXIF:GPSLongitude"] = abs(gps_lon)
         fields["EXIF:GPSLongitudeRef"] = "E" if gps_lon >= 0 else "W"
 
-    # ── Keyword arrays (Subject + IPTC:Keywords for compatibility) ──────────
+    # ── Hierarchical keywords (XMP:HierarchicalSubject — Lightroom/Bridge) ──
+    # Format: ["Category|Parent|Label", …] — enables nested keyword panels.
+    if hierarchical_subjects:
+        fields["XMP:HierarchicalSubject"] = hierarchical_subjects
+
+    # ── Flat keyword arrays (Subject + IPTC:Keywords for compatibility) ──────
     if all_keywords:
         fields["XMP:Subject"] = all_keywords
         fields["IPTC:Keywords"] = all_keywords

@@ -401,3 +401,159 @@ async def save_analysis_document(media_id: int, doc: dict, db: aiosqlite.Connect
             model_version  = excluded.model_version,
             updated_at     = datetime('now')
     """, (media_id, doc_json, MODEL_VERSION))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Effective document — canonical merge function (used by API routes AND writeback)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def merge_analysis_document(media_id: int, db: aiosqlite.Connection) -> dict:
+    """
+    Return the fully merged, effective analysis document for *media_id*.
+
+    Three layers are applied on top of the stored model document:
+      1. face.person_id is resolved to the current person.name via a DB JOIN so
+         renaming a person is reflected instantly without ever rewriting docs.
+      2. User amendments from photo_analysis_amendments are applied:
+           rename  → label Name changed, OriginalName preserved
+           delete  → label omitted entirely
+           add     → user-defined label appended
+           confirm → label marked UserConfirmed=True
+      3. Labels are annotated with UserEdited / UserConfirmed flags.
+
+    Returns {} if no model document exists yet — callers treat this as
+    "no analysis available" and skip downstream work gracefully.
+
+    This is the single source of truth for both the GET /analysis/{id} API
+    endpoint and the writeback engine — they always operate on the same data.
+    """
+    pa_row = await (await db.execute(
+        "SELECT model_document, model_version, generated_at, updated_at "
+        "FROM photo_analysis WHERE media_file_id = ?",
+        (media_id,)
+    )).fetchone()
+
+    if pa_row is None:
+        return {}
+
+    try:
+        doc: dict = json.loads(pa_row["model_document"])
+    except Exception:
+        logger.warning("Corrupt analysis document for media_id=%d — skipping merge", media_id)
+        return {}
+
+    doc["model_version"] = pa_row["model_version"]
+    doc["updated_at"]    = pa_row["updated_at"]
+
+    # ── 1. Resolve person_id → person_name ───────────────────────────────────
+    person_ids = [f["person_id"] for f in doc.get("Faces", []) if f.get("person_id")]
+    person_name_map: dict[int, str] = {}
+    if person_ids:
+        ph = ",".join("?" * len(person_ids))
+        rows = await db.execute_fetchall(
+            f"SELECT id, name FROM persons WHERE id IN ({ph}) AND is_merged=0",
+            person_ids,
+        )
+        person_name_map = {r["id"]: r["name"] for r in rows if r["name"]}
+
+    for face in doc.get("Faces", []):
+        pid = face.get("person_id")
+        face["person_name"] = person_name_map.get(pid) if pid else None
+
+    # ── 2. Load amendments ────────────────────────────────────────────────────
+    amendments = await db.execute_fetchall(
+        "SELECT label_name, action, user_value, user_confidence "
+        "FROM photo_analysis_amendments WHERE media_file_id = ?",
+        (media_id,)
+    )
+    amend_map = {r["label_name"]: r for r in amendments}
+
+    # ── 3. Apply amendments to Labels[] ──────────────────────────────────────
+    labels_out: list[dict] = []
+    for label in doc.get("Labels", []):
+        name  = label["Name"]
+        amend = amend_map.get(name)
+        if amend is None:
+            label["UserEdited"]    = False
+            label["UserConfirmed"] = False
+            labels_out.append(label)
+        elif amend["action"] == "delete":
+            pass  # intentionally omit
+        elif amend["action"] == "rename":
+            label = dict(label)
+            label["Name"]          = amend["user_value"]
+            label["OriginalName"]  = name
+            label["UserEdited"]    = True
+            label["UserConfirmed"] = False
+            if amend["user_confidence"] is not None:
+                label["Confidence"] = amend["user_confidence"]
+            labels_out.append(label)
+        elif amend["action"] == "confirm":
+            label = dict(label)
+            label["UserEdited"]    = False
+            label["UserConfirmed"] = True
+            labels_out.append(label)
+        else:
+            label["UserEdited"]    = False
+            label["UserConfirmed"] = False
+            labels_out.append(label)
+
+    # Append user-added labels (exist only in amendments, not in model doc)
+    for lname, amend in amend_map.items():
+        if amend["action"] == "add":
+            labels_out.append({
+                "Name":          lname,
+                "Confidence":    amend["user_confidence"] or 100.0,
+                "Source":        "user",
+                "Instances":     [],
+                "Parents":       [],
+                "Categories":    [{"Name": "User Defined"}],
+                "Aliases":       [],
+                "UserEdited":    True,
+                "UserConfirmed": False,
+            })
+
+    doc["Labels"] = labels_out
+    return doc
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# XMP:HierarchicalSubject builder
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_hierarchical_subjects(labels: list[dict]) -> list[str]:
+    """
+    Build XMP:HierarchicalSubject keyword paths from an effective Labels[] list.
+
+    Standard Lightroom / Bridge / IPTC format: "Category|Parent1|…|LeafLabel"
+    Each segment is separated by '|' from outermost to innermost.
+
+    Example:
+        Golden Retriever  →  Parents=[Dog], Categories=[Animals and Pets]
+        →  "Animals and Pets|Dog|Golden Retriever"
+
+    User-added labels are placed under "User Defined|<name>".
+    Output is sorted for deterministic, diffable EXIF values.
+    Duplicate paths are de-duplicated.
+    """
+    result: list[str] = []
+    seen:   set[str]  = set()
+
+    for label in labels:
+        name = label.get("Name", "").strip()
+        if not name:
+            continue
+
+        parents    = [p["Name"] for p in label.get("Parents", [])]
+        categories = label.get("Categories", [])
+        category   = categories[0]["Name"] if categories else "General"
+
+        # Full path root → leaf: Category | parents (broad→narrow) | Name
+        path = "|".join([category] + parents + [name])
+
+        if path not in seen:
+            seen.add(path)
+            result.append(path)
+
+    result.sort()
+    return result

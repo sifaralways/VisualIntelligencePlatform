@@ -101,6 +101,12 @@ export const api = {
         body: JSON.stringify({ queue_ids: queueIds ?? null }),
       }),
     status: () => request<Record<string, number>>('/writeback/status'),
+    /** Write EXIF for a single photo immediately (bypasses queue). */
+    writeOne: (mediaId: number) =>
+      request<{ status: string; media_id: number; fields_written?: string[]; reason?: string }>(
+        `/writeback/single/${mediaId}`,
+        { method: 'POST' },
+      ),
   },
 
   // ─── Tags ────────────────────────────────────────────────────────────────

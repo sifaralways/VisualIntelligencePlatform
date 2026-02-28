@@ -11,11 +11,13 @@ Flow:
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
 from backend.config import settings
 from backend.database.db import get_db
+from backend.ml.analysis_builder import merge_analysis_document, build_hierarchical_subjects
 from backend.writeback.exiftool import ExifToolWriter
 from backend.writeback.fields import build_field_map, FaceRegion
 
@@ -124,7 +126,12 @@ async def execute_writes(queue_ids: list[int] | None = None) -> dict:
 
 
 async def _build_fields_for_file(media_file_id: int) -> dict:
-    """Assemble XMP field map for a given media file."""
+    """Assemble the complete XMP field map for a given media file.
+
+    Uses the *effective* analysis document (model doc + user amendments +
+    resolved person names) so that EXIF always reflects the curator's intent,
+    not the raw model output.
+    """
     async with get_db() as db:
         # Named persons with bounding boxes
         person_rows = await db.execute_fetchall("""
@@ -150,13 +157,8 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
             ORDER BY category, rowid
         """, (media_file_id,))
 
-        # Analysis document (effective merged JSON for XMP-VIP:AnalysisJSON)
-        analysis_row = await (
-            await db.execute(
-                "SELECT model_document FROM photo_analysis WHERE media_file_id=?",
-                (media_file_id,)
-            )
-        ).fetchone()
+        # Effective analysis document (model doc + amendments + resolved person names)
+        effective_doc = await merge_analysis_document(media_file_id, db)
 
     if not person_rows and not tag_rows:
         return {}
@@ -201,10 +203,14 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
         elif cat == "place":
             places.append(label)
 
-    # Analysis JSON to embed in photo metadata (compact, no extra whitespace)
+    # Derive EXIF payload from effective document (amendments included)
     analysis_json: str | None = None
-    if analysis_row and analysis_row["model_document"]:
-        analysis_json = analysis_row["model_document"]
+    hierarchical_subjects: list[str] | None = None
+    if effective_doc:
+        # Compact JSON — minimise EXIF bloat without gzip
+        analysis_json         = json.dumps(effective_doc, ensure_ascii=False, separators=(',', ':'))
+        hs = build_hierarchical_subjects(effective_doc.get("Labels", []))
+        hierarchical_subjects = hs or None
 
     return build_field_map(
         person_names=names or None,
@@ -217,4 +223,55 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
         gps_lon=gps_lon,
         vip_id=vip_id,
         analysis_json=analysis_json,
+        hierarchical_subjects=hierarchical_subjects,
     )
+
+
+async def write_single_file(media_file_id: int) -> dict:
+    """
+    Write EXIF metadata for *one* file immediately — no writeback_queue entry needed.
+
+    This is the engine behind the per-photo "Write to EXIF" button in the UI.
+    The file must be present on local disk (not an iCloud stub).
+
+    Returns:
+        {"status": "written",  "fields_written": [...sorted field names...]}
+        {"status": "skipped",  "reason": "No metadata to write"}
+
+    Raises:
+        ValueError   — media_file_id not found, file is a stub, or not on disk
+        RuntimeError — ExifTool write failure
+    """
+    async with get_db() as db:
+        row = await (await db.execute(
+            "SELECT id, file_path, is_stub, writeback_done FROM media_files WHERE id=?",
+            (media_file_id,)
+        )).fetchone()
+
+    if row is None:
+        raise ValueError(f"Media file {media_file_id} not found")
+    if row["is_stub"]:
+        raise ValueError("File is an iCloud stub — download it first then retry")
+
+    file_path = Path(row["file_path"])
+    if not file_path.exists():
+        raise ValueError(f"File not found on disk: {file_path.name}")
+
+    fields = await _build_fields_for_file(media_file_id)
+    if not fields:
+        return {"status": "skipped", "reason": "No metadata to write yet", "fields_written": []}
+
+    is_first_write = not bool(row["writeback_done"])
+    success, msg = _writer.write(file_path, fields, dry_run=False, is_first_write=is_first_write)
+
+    if not success:
+        raise RuntimeError(f"ExifTool write failed: {msg}")
+
+    async with get_db() as db:
+        await db.execute(
+            "UPDATE media_files SET writeback_done=1, writeback_at=datetime('now') WHERE id=?",
+            (media_file_id,)
+        )
+
+    logger.info("Single write OK for media_id=%d — %d fields", media_file_id, len(fields))
+    return {"status": "written", "fields_written": sorted(fields.keys())}

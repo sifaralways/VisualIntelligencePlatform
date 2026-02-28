@@ -31,6 +31,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
 from backend.database.db import get_db
+from backend.ml.analysis_builder import merge_analysis_document
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -59,93 +60,17 @@ async def get_analysis(media_id: int):
     User amendments are applied on top of the model document.
     """
     async with get_db() as db:
-        # 1. Load model document
-        pa_row = await (await db.execute(
-            "SELECT model_document, model_version, generated_at, updated_at "
-            "FROM photo_analysis WHERE media_file_id = ?",
-            (media_id,)
+        # Confirm the media file exists so we can surface a clear 404
+        exists = await (await db.execute(
+            "SELECT 1 FROM media_files WHERE id=?", (media_id,)
         )).fetchone()
+        if exists is None:
+            raise HTTPException(status_code=404, detail="Media file not found")
 
-        if pa_row is None:
-            raise HTTPException(status_code=404, detail="No analysis document yet. Run the pipeline.")
+        doc = await merge_analysis_document(media_id, db)
 
-        try:
-            doc: dict = json.loads(pa_row["model_document"])
-        except Exception:
-            raise HTTPException(status_code=500, detail="Corrupt analysis document")
-
-        doc["model_version"] = pa_row["model_version"]
-        doc["updated_at"]    = pa_row["updated_at"]
-
-        # 2. Resolve person_id → person_name in Faces[]
-        person_ids = [f["person_id"] for f in doc.get("Faces", []) if f.get("person_id")]
-        person_name_map: dict[int, str] = {}
-        if person_ids:
-            ph = ",".join("?" * len(person_ids))
-            rows = await db.execute_fetchall(
-                f"SELECT id, name FROM persons WHERE id IN ({ph}) AND is_merged=0",
-                person_ids,
-            )
-            person_name_map = {r["id"]: r["name"] for r in rows if r["name"]}
-
-        for face in doc.get("Faces", []):
-            pid = face.get("person_id")
-            face["person_name"] = person_name_map.get(pid) if pid else None
-
-        # 3. Load amendments
-        amendments = await db.execute_fetchall(
-            "SELECT label_name, action, user_value, user_confidence "
-            "FROM photo_analysis_amendments WHERE media_file_id = ?",
-            (media_id,)
-        )
-        amend_map = {r["label_name"]: r for r in amendments}
-
-        # 4. Apply amendments to Labels[]
-        labels_out: list[dict] = []
-        for label in doc.get("Labels", []):
-            name = label["Name"]
-            amend = amend_map.get(name)
-            if amend is None:
-                label["UserEdited"] = False
-                label["UserConfirmed"] = False
-                labels_out.append(label)
-            elif amend["action"] == "delete":
-                pass  # omit from output
-            elif amend["action"] == "rename":
-                label = dict(label)
-                label["Name"]          = amend["user_value"]
-                label["OriginalName"]  = name
-                label["UserEdited"]    = True
-                label["UserConfirmed"] = False
-                if amend["user_confidence"] is not None:
-                    label["Confidence"] = amend["user_confidence"]
-                labels_out.append(label)
-            elif amend["action"] == "confirm":
-                label = dict(label)
-                label["UserEdited"]    = False
-                label["UserConfirmed"] = True
-                labels_out.append(label)
-            else:
-                label["UserEdited"] = False
-                label["UserConfirmed"] = False
-                labels_out.append(label)
-
-        # Append user-added labels
-        for lname, amend in amend_map.items():
-            if amend["action"] == "add":
-                labels_out.append({
-                    "Name":          lname,
-                    "Confidence":    amend["user_confidence"] or 100.0,
-                    "Source":        "user",
-                    "Instances":     [],
-                    "Parents":       [],
-                    "Categories":    [{"Name": "User Defined"}],
-                    "Aliases":       [],
-                    "UserEdited":    True,
-                    "UserConfirmed": False,
-                })
-
-        doc["Labels"] = labels_out
+    if not doc:
+        raise HTTPException(status_code=404, detail="No analysis document yet. Run the pipeline.")
 
     return doc
 
