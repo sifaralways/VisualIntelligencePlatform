@@ -18,6 +18,7 @@ import logging
 import shutil
 from pathlib import Path
 
+import aiosqlite
 from fastapi import APIRouter, HTTPException
 
 from backend.config import settings
@@ -78,6 +79,24 @@ async def _wipe_photo_thumbs():
         logger.info("Wiped photo_thumbs directory")
 
 
+async def _vacuum_db() -> int:
+    """Run VACUUM in a standalone connection (no open transaction allowed).
+
+    Returns the number of pages freed (before - after).
+    VACUUM rewrites the entire database file, reclaiming pages freed by
+    DELETE FROM.  Without this, SQLite keeps the file at its peak size.
+    Must be called OUTSIDE any get_db() block so there is no open writer.
+    """
+    async with aiosqlite.connect(settings.db_path) as db:
+        before = (await (await db.execute("PRAGMA page_count")).fetchone())[0]
+        await db.execute("VACUUM")
+        after = (await (await db.execute("PRAGMA page_count")).fetchone())[0]
+    freed = before - after
+    logger.info("VACUUM complete: %d → %d pages (%d pages / %.1f MB freed)",
+                before, after, freed, freed * 4096 / 1_048_576)
+    return freed
+
+
 @router.delete("/reset/{scope}")
 async def reset(scope: str):
     """Clear data at the specified scope level."""
@@ -85,8 +104,8 @@ async def reset(scope: str):
     if scope not in valid:
         raise HTTPException(status_code=400, detail=f"Unknown scope '{scope}'. Use: {valid}")
 
-    async with get_db() as db:
-        if scope == "all":
+    if scope == "all":
+        async with get_db() as db:
             # Delete in FK dependency order:
             # writeback_queue → embeddings → faces → clusters → persons → media_files
             await db.execute("DELETE FROM writeback_queue")
@@ -98,9 +117,12 @@ async def reset(scope: str):
             await db.execute("DELETE FROM media_files")
             await _wipe_thumbnails()
             logger.warning("ADMIN: Full reset — all tables wiped")
-            return {"status": "ok", "scope": "all", "detail": "All tables cleared + thumbnails deleted"}
+        freed = await _vacuum_db()
+        return {"status": "ok", "scope": "all", "detail": "All tables cleared + thumbnails deleted",
+                "pages_freed": freed}
 
-        if scope in ("scan", "faces"):
+    if scope in ("scan", "faces"):
+        async with get_db() as db:
             await db.execute("DELETE FROM writeback_queue")
             await db.execute("DELETE FROM embeddings")
             await db.execute("DELETE FROM faces")
@@ -110,29 +132,41 @@ async def reset(scope: str):
             await db.execute("UPDATE media_files SET ingest_state='scanned', needs_reprocess=0")
             await _wipe_thumbnails()
             logger.warning("ADMIN: Faces/scan reset — embeddings, clusters, persons wiped; media_files reset to 'scanned'")
-            return {"status": "ok", "scope": scope, "detail": "All faces, embeddings, clusters and persons cleared. Media scan data kept."}
+        freed = await _vacuum_db()
+        return {"status": "ok", "scope": scope,
+                "detail": "All faces, embeddings, clusters and persons cleared. Media scan data kept.",
+                "pages_freed": freed}
 
-        if scope == "clusters":
+    if scope == "clusters":
+        async with get_db() as db:
             await db.execute("DELETE FROM writeback_queue")
             await db.execute("UPDATE faces SET cluster_id=NULL, person_id=NULL")
             await db.execute("UPDATE clusters SET person_id=NULL")
             await db.execute("DELETE FROM persons")
             await db.execute("DELETE FROM clusters")
             logger.warning("ADMIN: Cluster/person reset — faces and embeddings kept")
-            return {"status": "ok", "scope": scope, "detail": "Clusters and persons cleared. Face embeddings kept — re-run pipeline to re-cluster."}
+        freed = await _vacuum_db()
+        return {"status": "ok", "scope": scope,
+                "detail": "Clusters and persons cleared. Face embeddings kept — re-run pipeline to re-cluster.",
+                "pages_freed": freed}
 
-        if scope == "persons":
+    if scope == "persons":
+        async with get_db() as db:
             await db.execute("DELETE FROM writeback_queue")
             await db.execute("UPDATE faces SET person_id=NULL")
             await db.execute("UPDATE clusters SET person_id=NULL")
             await db.execute("DELETE FROM persons")
             logger.warning("ADMIN: Person reset — clusters kept, persons wiped")
-            return {"status": "ok", "scope": scope, "detail": "All named persons cleared. Clusters remain — re-name them on the People tab."}
+        freed = await _vacuum_db()
+        return {"status": "ok", "scope": scope,
+                "detail": "All named persons cleared. Clusters remain — re-name them on the People tab.",
+                "pages_freed": freed}
 
-        if scope == "thumbs":
-            await _wipe_photo_thumbs()
-            logger.warning("ADMIN: Photo thumbnails wiped — will regenerate on next pipeline run")
-            return {"status": "ok", "scope": scope, "detail": "Photo thumbnail cache cleared. Re-run the pipeline scan to regenerate upright thumbnails."}
+    if scope == "thumbs":
+        await _wipe_photo_thumbs()
+        logger.warning("ADMIN: Photo thumbnails wiped — will regenerate on next pipeline run")
+        return {"status": "ok", "scope": scope,
+                "detail": "Photo thumbnail cache cleared. Re-run the pipeline scan to regenerate upright thumbnails."}
 
     # unreachable
     raise HTTPException(status_code=500, detail="Unexpected error")
