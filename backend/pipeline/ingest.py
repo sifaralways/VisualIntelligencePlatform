@@ -184,7 +184,12 @@ def _make_photo_thumb(src: Path, media_id: int) -> Path | None:
         return dst
     dst.parent.mkdir(parents=True, exist_ok=True)
     try:
+        from PIL import ImageOps as _ImageOps
         with _PILImage.open(src) as img:
+            # Respect EXIF orientation tag (same reason Finder shows photos upright
+            # but naive Image.open does not — the pixels are physically rotated in
+            # the file and must be transposed before any resize operation).
+            img = _ImageOps.exif_transpose(img)
             img.thumbnail((600, 800), _PILImage.LANCZOS)
             img.save(dst, "JPEG", quality=85, optimize=True)
         return dst

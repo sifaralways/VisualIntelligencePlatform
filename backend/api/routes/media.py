@@ -26,9 +26,11 @@ def _thumb_path(media_id: int) -> Path:
 
 def _make_thumbnail_sync(src: Path, dst: Path) -> None:
     """Resize a JPEG to a 600-px wide thumbnail. Requires Pillow."""
-    from PIL import Image
+    from PIL import Image, ImageOps
     dst.parent.mkdir(parents=True, exist_ok=True)
     with Image.open(src) as img:
+        # Apply EXIF orientation before resizing so portrait/landscape is correct.
+        img = ImageOps.exif_transpose(img)
         img.thumbnail((600, 800), Image.LANCZOS)
         img.save(dst, "JPEG", quality=85, optimize=True)
 

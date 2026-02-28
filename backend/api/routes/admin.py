@@ -4,11 +4,12 @@ These endpoints allow selective or full reset of the database so the user
 can re-run the pipeline without manually touching SQLite.
 
 Scopes (DELETE /api/admin/reset/{scope}):
-  all       → wipe every table + thumbnails on disk
+  all       → wipe every table + all thumbnails on disk
   scan      → reset media_files to 'scanned', drop faces/embeddings/clusters/persons
   faces     → drop faces, embeddings, clusters, persons; reset media_files ingest_state to 'scanned'
   clusters  → drop clusters, persons; unlink face.cluster_id / face.person_id
   persons   → drop persons; unlink cluster.person_id / face.person_id
+  thumbs    → delete cached photo thumbnails only (forces regeneration on next scan)
 """
 
 from __future__ import annotations
@@ -61,16 +62,26 @@ async def get_stats():
 # Reset helper
 # ---------------------------------------------------------------------------
 async def _wipe_thumbnails():
-    if settings.thumbnail_dir.exists():
-        shutil.rmtree(settings.thumbnail_dir)
-        settings.thumbnail_dir.mkdir(parents=True, exist_ok=True)
-        logger.info("Wiped thumbnails directory")
+    """Delete both face thumbnails and photo thumbnails."""
+    for d in (settings.thumbnail_dir, settings.photo_thumbs_dir):
+        if d.exists():
+            shutil.rmtree(d)
+            d.mkdir(parents=True, exist_ok=True)
+            logger.info("Wiped thumbnails directory: %s", d)
+
+
+async def _wipe_photo_thumbs():
+    """Delete *only* the cached photo thumbnails (face data untouched)."""
+    if settings.photo_thumbs_dir.exists():
+        shutil.rmtree(settings.photo_thumbs_dir)
+        settings.photo_thumbs_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("Wiped photo_thumbs directory")
 
 
 @router.delete("/reset/{scope}")
 async def reset(scope: str):
     """Clear data at the specified scope level."""
-    valid = {"all", "scan", "faces", "clusters", "persons"}
+    valid = {"all", "scan", "faces", "clusters", "persons", "thumbs"}
     if scope not in valid:
         raise HTTPException(status_code=400, detail=f"Unknown scope '{scope}'. Use: {valid}")
 
@@ -117,6 +128,11 @@ async def reset(scope: str):
             await db.execute("DELETE FROM persons")
             logger.warning("ADMIN: Person reset — clusters kept, persons wiped")
             return {"status": "ok", "scope": scope, "detail": "All named persons cleared. Clusters remain — re-name them on the People tab."}
+
+        if scope == "thumbs":
+            await _wipe_photo_thumbs()
+            logger.warning("ADMIN: Photo thumbnails wiped — will regenerate on next pipeline run")
+            return {"status": "ok", "scope": scope, "detail": "Photo thumbnail cache cleared. Re-run the pipeline scan to regenerate upright thumbnails."}
 
     # unreachable
     raise HTTPException(status_code=500, detail="Unexpected error")
