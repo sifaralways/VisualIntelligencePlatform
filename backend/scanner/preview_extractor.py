@@ -12,6 +12,16 @@ Why not decode the RAW?
 
 The extracted JPEG is written to settings.preview_dir as a temp file.
 After face embedding is complete, previews are deleted to reclaim disk space.
+
+Orientation handling:
+  Canon CR3 (and many other cameras) embed the preview JPEG with Orientation=1
+  (normal) regardless of how the camera was held, even though the RAW file's
+  own Orientation tag correctly describes the capture rotation.  Relying on the
+  *preview's* EXIF orientation tag is therefore wrong — we must read it from the
+  parent RAW and apply the rotation to the pixel data ourselves.  This makes the
+  saved preview physically upright so that every downstream consumer (InsightFace,
+  YOLO, Places365, CLIP, BioCLIP, and the UI thumbnail generator) receives correct
+  geometry without any changes to their own code.
 """
 
 from __future__ import annotations
@@ -27,6 +37,70 @@ from backend.scanner.exif_reader import materialise_file
 
 logger = logging.getLogger(__name__)
 
+# Maps numeric EXIF Orientation tag value → PIL Transpose method name.
+# Identical to the mapping used internally by PIL.ImageOps.exif_transpose,
+# except we read the tag from the RAW file, not from the (often wrong) preview.
+_EXIF_ORIENT_TO_PIL_TRANSPOSE = {
+    2: "FLIP_LEFT_RIGHT",   # mirrored horizontally
+    3: "ROTATE_180",        # upside-down
+    4: "FLIP_TOP_BOTTOM",   # mirrored vertically
+    5: "TRANSPOSE",         # 90°CW + mirror
+    6: "ROTATE_270",        # 90°CW (camera held right-side-right, sensor landscape)
+    7: "TRANSVERSE",        # 90°CCW + mirror
+    8: "ROTATE_90",         # 90°CCW / 270°CW (camera held left-side-right)
+}
+
+
+def _read_raw_orientation(raw_path: Path) -> int:
+    """
+    Read the EXIF Orientation tag (numeric value) from the RAW file.
+
+    Returns 1 (upright, no-op) on any error.
+    Uses the '#' notation so ExifTool returns the integer, not a string.
+    """
+    try:
+        r = subprocess.run(
+            ["exiftool", "-s3", "-n", "-Orientation", str(raw_path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        val = r.stdout.strip()
+        return int(val) if val.isdigit() else 1
+    except Exception:
+        return 1
+
+
+def _correct_preview_orientation(out_path: Path, orientation: int) -> None:
+    """
+    Apply a rotation/flip to the JPEG at *out_path* to bake in the correct
+    geometry described by *orientation* (EXIF tag 274 value read from RAW).
+
+    The saved file will have tag=1 (no further rotation needed) so that any
+    tool that reads the preview in isolation gets the right result.
+    """
+    if orientation == 1:
+        return   # already upright — nothing to do
+
+    method_name = _EXIF_ORIENT_TO_PIL_TRANSPOSE.get(orientation)
+    if method_name is None:
+        logger.warning("Unknown EXIF orientation value %d — skipping correction", orientation)
+        return
+
+    try:
+        from PIL import Image
+        method = getattr(Image.Transpose, method_name)
+        with Image.open(out_path) as img:
+            corrected = img.transpose(method)
+            # Strip the orientation tag — pixels are now geometrically correct
+            exif = img.getexif()
+            exif[274] = 1
+            corrected.save(out_path, "JPEG", quality=92, optimize=True, exif=exif.tobytes())
+        logger.debug(
+            "Orientation corrected (tag %d → %s): %s",
+            orientation, method_name, out_path.name,
+        )
+    except Exception as exc:
+        logger.warning("Orientation correction failed for %s: %s", out_path.name, exc)
+
 
 async def extract_preview(raw_path: Path) -> Optional[Path]:
     """
@@ -35,7 +109,6 @@ async def extract_preview(raw_path: Path) -> Optional[Path]:
     Returns:
         Path to the extracted JPEG in preview_dir, or None on failure.
     """
-    # Output filename: preserve stem, change suffix to .jpg
     out_path = settings.preview_dir / f"{raw_path.stem}_{_hash_path(raw_path)}.jpg"
 
     if out_path.exists():
@@ -57,13 +130,17 @@ def _extract_sync(raw_path: Path, out_path: Path) -> bool:
       -b           output binary data
       -PreviewImage  the embedded full-size JPEG preview
       -w! <ext>    write to file with given extension, overwrite if exists
-
-    We redirect stdout to the output file directly.
     """
     try:
         _timeout = 60
         if not materialise_file(raw_path):
             return False
+
+        # Read orientation from the RAW before touching the preview.
+        # Canon CR3 (and many other cameras) embed the preview with Orientation=1
+        # even when the RAW itself is tagged as portrait — we must apply the
+        # parent RAW's rotation to the extracted JPEG ourselves.
+        orientation = _read_raw_orientation(raw_path)
 
         # Tag priority: LargePreviewImage (Canon CR3 full-size) → PreviewImage → JpgFromRaw
         # Do NOT use -fast2; it stops before the large embedded JPEG in CR3 files.
@@ -94,26 +171,8 @@ def _extract_sync(raw_path: Path, out_path: Path) -> bool:
 
         out_path.write_bytes(result.stdout)
 
-        # ── Orientation correction ────────────────────────────────────────
-        # Embedded JPEG previews inherit the RAW file's EXIF orientation tag
-        # but the pixel data is physically rotated (e.g., a portrait shot is
-        # stored as a landscape matrix and tagged Rotate 90 CW).  Finder and
-        # Photos read the tag at render time; cv2.imread, PIL Image.open, and
-        # every ML model we use do NOT.  Fix it once here so every downstream
-        # consumer — InsightFace, YOLO, Places365, CLIP, BioCLIP, and the UI
-        # thumbnail generator — always receives an upright image.
-        try:
-            from PIL import Image, ImageOps
-            with Image.open(out_path) as _img:
-                _corrected = ImageOps.exif_transpose(_img)
-                # Only re-save if the tag indicated a non-identity rotation
-                # (exif_transpose returns the same object when no rotation needed)
-                if _corrected is not _img:
-                    _corrected.save(out_path, "JPEG", quality=92, optimize=True)
-                    logger.debug("Applied EXIF orientation correction to preview: %s", out_path.name)
-        except Exception as _e:
-            # Non-fatal: the preview is usable even if we can't correct orientation
-            logger.warning("EXIF orientation correction failed for %s: %s", out_path.name, _e)
+        # Bake the RAW's orientation into the preview pixel data.
+        _correct_preview_orientation(out_path, orientation)
 
         return True
 
