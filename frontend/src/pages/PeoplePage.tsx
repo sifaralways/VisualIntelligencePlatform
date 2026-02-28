@@ -2,7 +2,7 @@
  * PeoplePage — face tile grid with naming UX.
  *
  * Shows one representative tile per person/cluster.
- * High-confidence clusters: single tile + count.
+ * Named persons: click tile → see photos; click ≣ icon → face review.
  * Unnamed clusters: shown first, sorted by size.
  */
 
@@ -10,7 +10,12 @@ import { useEffect, useState } from 'react'
 import { api } from '../api/client'
 import type { Cluster, Person } from '../api/client'
 
-export default function PeoplePage() {
+interface Props {
+  /** Called when user clicks a named person tile to view their photos. */
+  onSelectPerson?: (personId: number, name: string) => void
+}
+
+export default function PeoplePage({ onSelectPerson }: Props) {
   const [clusters, setClusters] = useState<Cluster[]>([])
   const [persons, setPersons] = useState<Person[]>([])
   const [loading, setLoading] = useState(true)
@@ -201,14 +206,25 @@ export default function PeoplePage() {
               const thumbUrl = thumb ? '/thumbnails/' + thumb.split('/thumbnails/').pop() : null
               return (
                 <div key={p.id} className="flex flex-col items-center gap-2">
-                  <button
-                    onClick={() => openReview(p)}
-                    title="Click to review faces"
-                    className="w-20 h-20 rounded-xl bg-gray-800 border border-gray-700 hover:border-indigo-400 overflow-hidden flex items-center justify-center transition-colors">
-                    {thumbUrl
-                      ? <img src={thumbUrl} alt={p.name ?? 'person'} className="w-full h-full object-cover" />
-                      : <span className="text-2xl">👤</span>}
-                  </button>
+                  {/* Main tile — click to view photos */}
+                  <div className="relative group">
+                    <button
+                      onClick={() => onSelectPerson?.(p.id, p.name ?? 'Unknown')}
+                      title={`View photos of ${p.name}`}
+                      className="w-20 h-20 rounded-xl bg-gray-800 border border-gray-700 hover:border-indigo-400 overflow-hidden flex items-center justify-center transition-colors">
+                      {thumbUrl
+                        ? <img src={thumbUrl} alt={p.name ?? 'person'} className="w-full h-full object-cover" />
+                        : <span className="text-2xl">👤</span>}
+                    </button>
+                    {/* Review icon overlay */}
+                    <button
+                      onClick={() => openReview(p)}
+                      title="Review faces"
+                      className="absolute -top-1 -right-1 bg-gray-700 hover:bg-gray-600 border border-gray-600 rounded-full w-5 h-5 text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+                    >
+                      ⋯
+                    </button>
+                  </div>
                   <span className="text-xs text-center text-gray-200 truncate max-w-full px-1">{p.name}</span>
                   <span className="text-xs text-gray-500">{p.photo_count} photo{p.photo_count !== 1 ? 's' : ''}</span>
                 </div>

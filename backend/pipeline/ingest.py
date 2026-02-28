@@ -33,6 +33,12 @@ from backend.ml.index import FaissIndex
 from backend.ml.tagger import Tagger
 from backend.api.websocket import broadcast
 
+try:
+    from PIL import Image as _PILImage
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # Module-level singletons — loaded once per process
@@ -156,8 +162,30 @@ async def _phase_scan(folder: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: Extract previews, detect faces, generate embeddings
 # ---------------------------------------------------------------------------
+# Photo thumbnail helper (for UI grid)
+# ---------------------------------------------------------------------------
+
+def _make_photo_thumb(src: Path, media_id: int) -> Path | None:
+    """Resize the preview JPEG to a 600-px wide thumbnail for the UI grid.
+
+    Returns the saved thumbnail path, or None if PIL is unavailable.
+    """
+    if not _PIL_AVAILABLE:
+        return None
+    dst = settings.photo_thumbs_dir / f"{media_id}.jpg"
+    if dst.exists():
+        return dst
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with _PILImage.open(src) as img:
+            img.thumbnail((600, 800), _PILImage.LANCZOS)
+            img.save(dst, "JPEG", quality=85, optimize=True)
+        return dst
+    except Exception:
+        return None
+
+
 async def _phase_embed() -> None:
     logger.info("Phase 2: Embedding faces")
     await broadcast("phase_start", phase="embed")
@@ -188,7 +216,10 @@ async def _phase_embed() -> None:
                 )
             continue
 
-        # Detect faces
+        # Generate permanent photo thumbnail for the UI grid
+        await asyncio.get_event_loop().run_in_executor(
+            None, _make_photo_thumb, preview_path, media_id
+        )
         faces = await asyncio.get_event_loop().run_in_executor(
             None, _detector.detect, preview_path
         )

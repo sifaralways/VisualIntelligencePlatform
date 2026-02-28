@@ -44,6 +44,21 @@ async def get_cluster_faces(cluster_id: int, limit: int = 20):
     return [dict(r) for r in rows]
 
 
+@router.get("/media/{media_id}")
+async def get_faces_for_media(media_id: int):
+    """Return all faces detected in a specific media file, with person names."""
+    async with get_db() as db:
+        rows = await db.execute_fetchall("""
+            SELECT f.id, f.thumbnail_path, f.detection_conf,
+                   f.person_id, p.name AS person_name
+            FROM faces f
+            LEFT JOIN persons p ON p.id = f.person_id AND p.is_merged = 0
+            WHERE f.media_file_id = ?
+            ORDER BY f.detection_conf DESC
+        """, (media_id,))
+    return [dict(r) for r in rows]
+
+
 @router.delete("/{face_id}/from-cluster")
 async def remove_face_from_cluster(face_id: int):
     """Detach a face from its cluster (user flagged it as incorrect)."""

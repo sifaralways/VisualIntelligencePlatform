@@ -24,6 +24,32 @@ export const api = {
     status: () => request<{ status: string; folder: string | null; error: string | null }>('/pipeline/status'),
   },
 
+  // ─── Media ────────────────────────────────────────────────────────────────
+  media: {
+    list: (params: MediaFilter = {}) => {
+      const q = new URLSearchParams()
+      if (params.limit)        q.set('limit',        String(params.limit))
+      if (params.offset)       q.set('offset',       String(params.offset))
+      if (params.state)        q.set('state',        params.state)
+      if (params.person_id != null) q.set('person_id', String(params.person_id))
+      if (params.tag_category) q.set('tag_category', params.tag_category)
+      if (params.tag_label)    q.set('tag_label',    params.tag_label)
+      return request<MediaFile[]>(`/media?${q}`)
+    },
+    count: (params: Omit<MediaFilter, 'limit' | 'offset'> = {}) => {
+      const q = new URLSearchParams()
+      if (params.state)        q.set('state',        params.state)
+      if (params.person_id != null) q.set('person_id', String(params.person_id))
+      if (params.tag_category) q.set('tag_category', params.tag_category)
+      if (params.tag_label)    q.set('tag_label',    params.tag_label)
+      return request<{ count: number }>(`/media/count?${q}`)
+    },
+    get: (id: number) => request<MediaFile>(`/media/${id}`),
+    tags: (id: number) => request<TagsByCategory>(`/tags/${id}`),
+    thumbnailUrl: (id: number) => `${BASE}/media/${id}/thumbnail`,
+    previewUrl:   (id: number) => `${BASE}/media/${id}/preview`,
+  },
+
   // ─── Clusters ─────────────────────────────────────────────────────────────
   clusters: {
     unnamed: () => request<Cluster[]>('/persons/unnamed'),
@@ -52,6 +78,7 @@ export const api = {
   faces: {
     byCluster: (clusterId: number) => request<FaceRow[]>(`/faces/cluster/${clusterId}`),
     byPerson: (personId: number) => request<FaceRow[]>(`/persons/${personId}/faces`),
+    byMedia: (mediaId: number) => request<FaceRow[]>(`/faces/media/${mediaId}`),
     removeFromCluster: (faceId: number) =>
       request(`/faces/${faceId}/from-cluster`, { method: 'DELETE' }),
     removeFromPerson: (faceId: number) =>
@@ -99,6 +126,34 @@ export const api = {
 }
 
 // ─── Types ───────────────────────────────────────────────────────────────────
+
+export interface MediaFilter {
+  limit?: number
+  offset?: number
+  state?: string
+  person_id?: number
+  tag_category?: string
+  tag_label?: string
+}
+
+export interface MediaFile {
+  id: number
+  file_path: string
+  file_hash: string
+  file_size: number | null
+  file_format: string | null
+  camera_make: string | null
+  camera_model: string | null
+  date_taken: string | null
+  gps_lat: number | null
+  gps_lon: number | null
+  width: number | null
+  height: number | null
+  is_stub: number
+  ingest_state: string
+  writeback_done: number
+}
+
 export interface Cluster {
   id: number
   member_count: number
@@ -118,12 +173,13 @@ export interface Person {
 
 export interface FaceRow {
   id: number
-  media_file_id: number
+  media_file_id?: number
   thumbnail_path: string | null
   detection_conf: number
   person_id: number | null
-  cluster_id: number | null
-  date_taken: string | null
+  person_name: string | null
+  cluster_id?: number | null
+  date_taken?: string | null
 }
 
 export interface SearchRequest {

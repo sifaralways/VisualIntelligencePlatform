@@ -37,8 +37,13 @@ class Settings(BaseSettings):
         return self.app_support_dir / "thumbnails"
 
     @property
+    def photo_thumbs_dir(self) -> Path:
+        """Scaled-down photo thumbnails for the UI grid — permanent, one per media file."""
+        return self.app_support_dir / "photo_thumbs"
+
+    @property
     def preview_dir(self) -> Path:
-        """Extracted JPEG previews from RAW files — temporary, cleared after embedding."""
+        """Extracted JPEG previews from RAW files — temporary, cleared after tagging."""
         return self.app_support_dir / "previews"
 
     # -------------------------------------------------------------------------
