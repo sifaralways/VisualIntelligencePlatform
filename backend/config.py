@@ -97,11 +97,13 @@ class Settings(BaseSettings):
     # face is a candidate core point).  Keeps same-person singletons from
     # being labelled noise and left unmatched.
     hdbscan_min_samples: int = 1
-    # cluster_selection_epsilon (cosine distance): sub-clusters within this
-    # distance of each other are merged into one.  cosine_dist = 1 - similarity,
-    # so 0.20 ≈ similarity 0.80.  Prevents the same person across different
-    # lighting/pose from landing in separate clusters.
-    hdbscan_cluster_epsilon: float = 0.20
+    # cluster_selection_epsilon (cosine distance): only merge sub-clusters
+    # whose centroids are THIS close. cosine_dist = 1 - similarity.
+    # 0.04 = similarity 0.96: near-identical centroids only.
+    # Previous value 0.20 (similarity 0.80) was merging unrelated people
+    # whose subclusters happened to be within that radius — causing a single
+    # cluster to swallow all faces from a group photo (intra_sim 0.29-0.43).
+    hdbscan_cluster_epsilon: float = 0.04
     # Cosine similarity threshold above which a cluster is "high confidence"
     # i.e., shown as a single tile + count without requiring manual review.
     high_confidence_threshold: float = 0.92
