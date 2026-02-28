@@ -4,13 +4,15 @@ import SearchPage from './pages/SearchPage'
 import WritebackPage from './pages/WritebackPage'
 import PipelinePage from './pages/PipelinePage'
 import AdminPage from './pages/AdminPage'
+import TagsPage from './pages/TagsPage'
 import './index.css'
 
-type Page = 'people' | 'search' | 'writeback' | 'pipeline' | 'admin'
+type Page = 'people' | 'search' | 'tags' | 'writeback' | 'pipeline' | 'admin'
 
 const NAV: { id: Page; label: string }[] = [
   { id: 'people',   label: '👤 People' },
   { id: 'search',   label: '🔍 Search' },
+  { id: 'tags',     label: '🏷️ Tags' },
   { id: 'writeback',label: '💾 Write to Files' },
   { id: 'pipeline', label: '⚙️ Pipeline' },
   { id: 'admin',    label: '🛠 Admin' },
@@ -45,6 +47,7 @@ export default function App() {
       <main className="flex-1 p-6">
         {page === 'people'    && <PeoplePage />}
         {page === 'search'    && <SearchPage />}
+        {page === 'tags'      && <TagsPage />}
         {page === 'writeback' && <WritebackPage />}
         {page === 'pipeline'  && <PipelinePage />}
         {page === 'admin'     && <AdminPage />}

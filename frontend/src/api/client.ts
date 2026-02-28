@@ -76,6 +76,18 @@ export const api = {
     status: () => request<Record<string, number>>('/writeback/status'),
   },
 
+  // ─── Tags ────────────────────────────────────────────────────────────────
+  tags: {
+    /** All ML tags for one media file, grouped by category. */
+    byFile: (mediaFileId: number) =>
+      request<TagsByCategory>(`/tags/${mediaFileId}`),
+    /** Most frequent tags across the whole library, optional category filter. */
+    top: (category?: string, limit = 50) => {
+      const q = category ? `?category=${category}&limit=${limit}` : `?limit=${limit}`
+      return request<TopTag[]>(`/tags/summary/top${q}`)
+    },
+  },
+
   // ─── Admin ──────────────────────────────────────────────────────────────────
   admin: {
     stats: () => request<AdminStats>('/admin/stats'),
@@ -158,4 +170,19 @@ export interface WritebackItem {
   media_file_id: number
   file_path: string
   fields: Record<string, string[]>
+}
+
+export type TagCategory = 'object' | 'animal' | 'geography' | 'place'
+
+export interface TagsByCategory {
+  object?: string[]
+  animal?: string[]
+  geography?: string[]
+  place?: string[]
+}
+
+export interface TopTag {
+  category?: string
+  label: string
+  count: number
 }
