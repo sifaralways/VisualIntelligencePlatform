@@ -17,6 +17,45 @@ from backend.api.routes import media, persons, faces, search, pipeline, writebac
 from backend.api.websocket import router as ws_router
 
 
+def _patch_insightface_skimage() -> None:
+    """
+    Monkey-patch InsightFace's face_align.estimate_norm() to use the
+    skimage >= 0.26 constructor API instead of the deprecated instance method.
+
+    skimage 0.26 deprecated SimilarityTransform.estimate() and will remove it
+    in 2.2.  InsightFace upstream hasn't been updated yet.  This patch is
+    applied at startup so it survives venv rebuilds without touching installed
+    package files.
+    """
+    try:
+        import numpy as np
+        from skimage import transform as _trans
+        import insightface.utils.face_align as _fa
+
+        _arcface_dst = _fa.arcface_dst  # already defined in the module
+
+        def _estimate_norm_patched(lmk, image_size=112, mode="arcface"):
+            assert lmk.shape == (5, 2)
+            assert image_size % 112 == 0 or image_size % 128 == 0
+            if image_size % 112 == 0:
+                ratio = float(image_size) / 112.0
+                diff_x = 0.0
+            else:
+                ratio = float(image_size) / 128.0
+                diff_x = 8.0 * ratio
+            dst = _arcface_dst * ratio
+            dst[:, 0] += diff_x
+            # from_estimate() is the replacement for the deprecated instance .estimate()
+            tform = _trans.SimilarityTransform.from_estimate(lmk, dst)
+            return tform.params[0:2, :]
+
+        _fa.estimate_norm = _estimate_norm_patched
+    except Exception as exc:  # pragma: no cover
+        logging.getLogger(__name__).warning(
+            "InsightFace skimage patch failed (non-fatal): %s", exc
+        )
+
+
 def _setup_logging() -> None:
     """Configure rotating file + console logging for the whole application."""
     log_dir = Path.home() / "Library" / "Logs" / "VIP"
@@ -53,6 +92,7 @@ def _setup_logging() -> None:
 
 
 _setup_logging()
+_patch_insightface_skimage()
 
 
 @asynccontextmanager
