@@ -127,9 +127,9 @@ def _extract_sync(raw_path: Path, out_path: Path) -> bool:
     Synchronous ExifTool call — runs in executor thread.
 
     ExifTool flags used:
-      -b           output binary data
-      -PreviewImage  the embedded full-size JPEG preview
-      -w! <ext>    write to file with given extension, overwrite if exists
+      -b             output binary data
+      -JpgFromRaw    full sensor resolution JPEG embedded in the RAW (first choice)
+      -fast          skip trailer scan only; required to reach JpgFromRaw in CR3
     """
     try:
         _timeout = 60
@@ -142,10 +142,15 @@ def _extract_sync(raw_path: Path, out_path: Path) -> bool:
         # parent RAW's rotation to the extracted JPEG ourselves.
         orientation = _read_raw_orientation(raw_path)
 
-        # Tag priority: LargePreviewImage (Canon CR3 full-size) → PreviewImage → JpgFromRaw
-        # Do NOT use -fast2; it stops before the large embedded JPEG in CR3 files.
-        # -fast (no number) skips the trailer scan only — safe and still quick.
-        for tag in ("-LargePreviewImage", "-PreviewImage", "-JpgFromRaw"):
+        # Tag priority — highest resolution first:
+        #   JpgFromRaw        Canon CR3/Nikon: full sensor JPEG (6000×4000 etc.)
+        #                     Same pixels the camera would write for a JPEG shot.
+        #   LargePreviewImage Some cameras embed a separate high-res preview.
+        #   PreviewImage      Fallback: usually 1620×1080 — good enough for
+        #                     thumbnails but too small for group-shot face detection.
+        # Never use -PreviewImage as the first choice: Canon CR3 always has one
+        # at ~1620×1080 so we would never reach the 6000×4000 JpgFromRaw.
+        for tag in ("-JpgFromRaw", "-LargePreviewImage", "-PreviewImage"):
             result = subprocess.run(
                 [
                     "exiftool",
