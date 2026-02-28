@@ -97,13 +97,22 @@ export default function AdminPage() {
   const [settingsEdits, setSettingsEdits] = useState<Record<string, number>>({})
   const [settingsBusy, setSettingsBusy] = useState(false)
   const [settingsMsg, setSettingsMsg] = useState<string | null>(null)
+  const [settingsLoading, setSettingsLoading] = useState(true)
+  const [settingsError, setSettingsError] = useState<string | null>(null)
 
   async function loadSettings() {
+    setSettingsLoading(true)
+    setSettingsError(null)
     try {
       const s = await api.settings.getAll()
       setSettings(s)
       setSettingsEdits({})
-    } catch { /* non-fatal */ }
+    } catch (e: unknown) {
+      const err = e as { message?: string }
+      setSettingsError(err?.message ?? 'Failed to load settings')
+    } finally {
+      setSettingsLoading(false)
+    }
   }
 
   useEffect(() => { loadSettings() }, [])
@@ -273,8 +282,7 @@ export default function AdminPage() {
       )}
 
       {/* ── ML Settings ──────────────────────────────────────────── */}
-      {settings.length > 0 && (
-        <section className="mt-10">
+      <section className="mt-10">
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
               ML Model Settings
@@ -302,6 +310,27 @@ export default function AdminPage() {
           {settingsMsg && (
             <div className="mb-4 bg-gray-900 border border-gray-700 rounded-xl px-4 py-2.5 text-sm text-gray-300">
               {settingsMsg}
+            </div>
+          )}
+
+          {settingsLoading && (
+            <p className="text-gray-500 text-sm">Loading settings…</p>
+          )}
+
+          {settingsError && !settingsLoading && (
+            <div className="bg-gray-900 border border-red-900/60 rounded-xl px-5 py-4">
+              <p className="text-red-400 text-sm font-medium mb-1">Could not load settings</p>
+              <p className="text-gray-500 text-xs mb-3">{settingsError}</p>
+              <p className="text-gray-600 text-xs">
+                If this is a fresh deployment, restart the backend so migration 004 is applied,
+                then refresh this page.
+              </p>
+              <button
+                onClick={loadSettings}
+                className="mt-3 text-xs text-indigo-400 hover:text-indigo-300"
+              >
+                ↻ Retry
+              </button>
             </div>
           )}
 
@@ -355,7 +384,6 @@ export default function AdminPage() {
             ))}
           </div>
         </section>
-      )}
 
       {/* ── Confirmation modal ───────────────────────────────────── */}
       {confirm && confirmAction && (
