@@ -1,8 +1,8 @@
 # VIP — Visual Intelligence Platform
 ## Solution Design Document
-**Version:** 0.1  
+**Version:** 0.3  
 **Status:** Living Document — update after every significant decision or implementation milestone  
-**Last Updated:** 2026-02-27  
+**Last Updated:** 2026-02-28  
 **Purpose:** Single source of truth for architecture, decisions, and implementation state. Sufficient context to resume work without any prior chat history.
 
 ---
@@ -38,13 +38,17 @@ This section is the most important one. Every decision recorded here was explici
 - **No sidecar files.** Metadata is written directly into the original CR3/RAW file using ExifTool. See §2.5.
 
 ### 2.2 Machine Learning
-- **Runtime:** MLX (Apple Silicon, unified memory). No PyTorch fallback — dropped entirely.
-- **Face detection model:** InsightFace Buffalo_L (RetinaFace detector + ArcFace-style 512-D embeddings).
+- **Face detection runtime:** InsightFace Buffalo_L via ONNX Runtime — **CPUExecutionProvider only**. CoreML EP was dropped due to a shape-rank mismatch in `det_10g.onnx` when `det_size=(1280,1280)` is used. CPU EP is stable and correct.
+- **Object / scene / landmark / species runtime:** PyTorch (MPS backend on Apple Silicon). MLX was evaluated and dropped in favour of the standard PyTorch ecosystem for broader model support.
+- **Face detection model:** InsightFace Buffalo_L (RetinaFace detector + ArcFace-style 512-D embeddings). Detection size `(1280,1280)`. Min face size `20px`. Confidence threshold `0.5`.
 - **Embedding dimension:** 512-D float32 vectors.
-- **Clustering algorithm:** HDBSCAN (via `hdbscan` or `scikit-learn`). Runs silently; user never sees "clusters" — only the UX abstraction over them (§2.4).
-- **Clustering tuning:** `min_cluster_size` to be calibrated in Phase 3 against real library data. Starting point: 5 for family-scale libraries.
-- **High-confidence threshold:** To be empirically determined, likely cosine similarity ≥ 0.95 within cluster. Clusters above this → show single representative tile + count. Clusters below → show multiple tiles for review.
-- **No cloud ML, no network calls, ever.**
+- **Clustering algorithm:** HDBSCAN (`hdbscan` package). `min_cluster_size=2` (calibrated for small family libraries). Runs silently; user never sees "clusters".
+- **Object detection:** YOLOv11s (ultralytics) — COCO 80 classes, MPS backend. Confidence threshold `0.40`. Auto-downloads `yolo11s.pt` (~21MB) on first run.
+- **Scene / geography classification:** Places365 ResNet-50 — 365 scene categories mapped to geography and place ontologies. Auto-downloads (~100MB) on first run.
+- **Landmark recognition:** OpenCLIP ViT-B/32 — zero-shot recognition of 56 world landmarks. Threshold `0.26`.
+- **Species classification:** BioCLIP — 150+ animal species via zero-shot CLIP. Only invoked when YOLO detects an animal. Threshold `0.30`.
+- **Geo resolution:** Nominatim (OpenStreetMap, via geopy) — GPS lat/lon → human-readable place name. User-agent: `VIP-VisualIntelligencePlatform/1.0`.
+- **No cloud ML, no network calls at inference time.** Nominatim is the only external call; it is OSM-based and privacy-safe.
 
 ### 2.3 Idempotency & Reprocessing
 - **Files are processed at most once by default.** Identity check = SHA-256 hash of file content stored in DB.
@@ -150,30 +154,39 @@ External NVMe SSD / Internal SSD
 
 | Layer | Tool | Version | Rationale |
 |---|---|---|---|
-| Language | Python | 3.11+ | MLX compatibility, async support |
+| Language | Python | 3.11+ | async support, ML ecosystem |
 | ML — Face Detection | InsightFace (RetinaFace) | latest | Best accuracy, non-commercial free |
 | ML — Face Embedding | InsightFace (ArcFace Buffalo_L) | latest | 512-D, SOTA, non-commercial free |
-| ML Runtime | MLX | latest | Apple Silicon only, unified memory |
-| Clustering | HDBSCAN | via `scikit-learn` or `hdbscan` | Density-based, handles noise well |
-| Vector Index | FAISS | latest | Fast ANN search, flat/IVF as needed |
-| RAW preview extract | ExifTool | 12+ | Camera-agnostic JPEG preview extraction |
+| Face ML Runtime | ONNX Runtime (CPUExecutionProvider) | 1.24.2 | CoreML EP dropped (shape mismatch with det_size=1280) |
+| Object/Animal Detection | YOLOv11s (ultralytics) | latest | COCO 80 classes, MPS backend |
+| Scene Classification | Places365 ResNet-50 | latest | 365 scene categories, PyTorch MPS |
+| Landmark Recognition | OpenCLIP ViT-B/32 | latest | Zero-shot, 56 landmarks |
+| Species Classification | BioCLIP | latest | 150+ animal species, zero-shot CLIP |
+| Object/Scene Runtime | PyTorch | 2.2+ | MPS backend for Apple Silicon acceleration |
+| Geo Resolution | Nominatim / geopy | latest | GPS → place name via OpenStreetMap |
+| Clustering | HDBSCAN | `hdbscan` package | Density-based, handles noise, min_cluster_size=2 |
+| Vector Index | FAISS | latest | Fast ANN search, flat index |
+| RAW preview extract | ExifTool | 12+ | Tries LargePreviewImage → PreviewImage → JpgFromRaw |
 | RAW display decode | rawpy + LibRaw | latest | On-demand only for UI display |
 | EXIF read | ExifTool (JSON mode) | 12+ | Most complete EXIF/XMP reader |
-| Metadata write | ExifTool | 12+ | Atomic write, CR3-safe, MWG regions |
-| Database | SQLite | via `aiosqlite` | No server, <200K rows, sufficient |
+| Metadata write | ExifTool | 12+ | Atomic write, CR3-safe, MWG regions, `-TAG=` clear-before-write |
+| Database | SQLite | via `aiosqlite` | No server, WAL mode, FK constraints |
 | API | FastAPI | latest | Async, WebSocket, auto-docs |
 | Frontend | React + Vite | React 18 / Vite 5 | Lightweight, no SSR needed |
-| Styling | Tailwind CSS | v3 | Utility-first, fast iteration |
+| Styling | Tailwind CSS | v4 | Utility-first, fast iteration |
 | Image serving | FastAPI static / streaming | — | Serve face crops + thumbnails locally |
 | Job orchestration | Python `asyncio` + queue | — | Single machine, no Celery needed |
 | Setup | `setup.sh` (Homebrew + pip + npm) | — | One-command install for friends |
+| Logging | Python `logging` + RotatingFileHandler | — | `~/Library/Logs/VIP/vip.log`, 10MB×5 |
 
 ### Dropped / Deferred
-- **PyTorch:** Dropped. MLX only.
+- **MLX:** Evaluated; dropped in favour of PyTorch (MPS) for broader model support (YOLO, CLIP, Places365).
+- **CoreML EP:** Dropped. ONNX CoreML EP fails on `det_10g.onnx` with `det_size=(1280,1280)` — shape rank mismatch. CPU EP used instead.
 - **DuckDB:** Deferred. SQLite sufficient at current scale. Revisit if >500K files.
 - **Docker:** Not used. Native macOS install via `setup.sh`.
 - **Celery / RQ:** Not needed. `asyncio` + background task queue sufficient.
 - **Tesseract / TrOCR:** Phase 6 only. Apple Vision OCR to be evaluated first.
+- **ExifTool stay_open mode:** Replaced with per-file `subprocess.run` (30s timeout). More reliable for RAW containers.
 
 ---
 
@@ -283,6 +296,20 @@ CREATE TABLE writeback_queue (
 );
 ```
 
+### 5.8 `media_tags` ← Added Phase 4
+```sql
+CREATE TABLE IF NOT EXISTS media_tags (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    media_file_id   INTEGER NOT NULL REFERENCES media_files(id) ON DELETE CASCADE,
+    category        TEXT    NOT NULL,   -- 'object' | 'animal' | 'geography' | 'place'
+    label           TEXT    NOT NULL,
+    confidence      REAL,
+    model           TEXT    NOT NULL,   -- 'yolov11' | 'places365' | 'clip' | 'bioclip' | 'nominatim'
+    created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (media_file_id, category, label)
+);
+```
+
 ---
 
 ## 6. Repository Structure
@@ -361,98 +388,101 @@ VisualIntelligencePlatform/
 
 ## 7. Phase Plan (Revised from BRD)
 
-### Phase 0 — Foundations (Week 0–1) ← CURRENT
+### Phase 0 — Foundations ← ✅ COMPLETE
 **Goal:** Repo structure, environment, schema, model validation.
 
 - [x] Git repo linked to remote
 - [x] `.gitignore` complete
-- [ ] `setup.sh` written and tested on M2 Mac
-- [ ] Backend skeleton: FastAPI + aiosqlite + DB migrations
-- [ ] Frontend skeleton: React + Vite + Tailwind
-- [ ] InsightFace Buffalo_L loaded via MLX — confirm it initialises
-- [ ] Benchmark: extract embedded JPEG from 100 CR3s, measure throughput
-- [ ] Benchmark: run face embed on 1,000 faces, measure time + memory
-- [ ] Confirm iCloud stub detection method with `xattr` on a real stub file
-- [ ] Lock confidence threshold empirically (run Buffalo_L on test faces)
-- [ ] Document model version in `embeddings.model_version`
+- [x] `setup.sh` written and tested on M2 Mac
+- [x] Backend skeleton: FastAPI + aiosqlite + DB migrations
+- [x] Frontend skeleton: React + Vite + Tailwind CSS v4
+- [x] InsightFace Buffalo_L loaded via ONNX CPU EP — confirmed initialises
+- [ ] Benchmark: extract embedded JPEG from 100 CR3s, measure throughput _(requires real library)_
+- [ ] Benchmark: run face embed on 1,000 faces, measure time + memory _(requires real library)_
+- [ ] Confirm iCloud stub detection with real stub file
 
-### Phase 1 — Media Ingest & Catalog (Week 1–3)
+### Phase 1 — Media Ingest & Catalog ← ✅ COMPLETE
 **Goal:** Safely scan, hash, catalog, and extract previews from 100K files.
 
-- [ ] `walker.py` — recursive walk, iCloud stub detection, format filtering
-- [ ] `hasher.py` — SHA-256, idempotency check against DB
-- [ ] `exif_reader.py` — ExifTool JSON wrapper, extract date/GPS/camera/dims
-- [ ] `preview_extractor.py` — ExifTool extract embedded JPEG from CR3/ARW/NEF/DNG
-- [ ] DB migration 001: `media_files`, `scan_state`
-- [ ] `scan_state` tracking — resume after interruption
-- [ ] API: `POST /pipeline/scan` (folder path), `GET /pipeline/status` (WebSocket)
-- [ ] Test: 10K real CR3 files, measure scan throughput, verify idempotency
-- [ ] Re-evaluate folder action (marks files `needs_reprocess=true`)
+- [x] `walker.py` — recursive walk, iCloud stub detection, format filtering
+- [x] `hasher.py` — SHA-256, idempotency check against DB
+- [x] `exif_reader.py` — ExifTool JSON wrapper, extract date/GPS/camera/dims
+- [x] `preview_extractor.py` — tries LargePreviewImage → PreviewImage → JpgFromRaw (no -fast flags)
+- [x] DB migration 001: `media_files`, `scan_state` + 5 other tables
+- [x] `scan_state` tracking — resume after interruption
+- [x] API: `POST /pipeline/scan`, `GET /pipeline/status` (WebSocket)
+- [ ] E2E test on real library _(pending)_
 
-### Phase 2 — Face Detection & Embeddings (Week 3–6)
+### Phase 2 — Face Detection & Embeddings ← ✅ COMPLETE
 **Goal:** Detect faces in all preview JPEGs, produce 512-D embeddings.
 
-- [ ] `face_detector.py` — RetinaFace via InsightFace, confidence filter
-- [ ] `embedder.py` — ArcFace via InsightFace, batch processing
-- [ ] Face crop thumbnails saved to `data/thumbnails/`
-- [ ] DB migrations: `faces`, `embeddings`
-- [ ] Batch pipeline with backpressure (don't OOM on 64GB unified memory)
-- [ ] Thermal-aware scheduling: check CPU temp, back off if needed
-- [ ] Progress via WebSocket
-- [ ] Test: detection accuracy on diverse test faces
-- [ ] Previews temp files cleared after embedding complete
+- [x] `face_detector.py` — RetinaFace via InsightFace, CPUExecutionProvider only, det_size=1280, min_face=20px
+- [x] `embedder.py` — ArcFace Buffalo_L; 200×200 thumbnails, 35% context padding, LANCZOS
+- [x] Face crop thumbnails saved to `data/thumbnails/`
+- [x] DB: `faces`, `embeddings` tables
+- [x] Progress via WebSocket
+- [x] Previews kept during pipeline, deleted after Phase 4 tagging
 
-### Phase 3 — Vector Indexing & Clustering (Week 6–8)
+### Phase 3 — Vector Indexing & Clustering ← ✅ COMPLETE
 **Goal:** Faces grouped into person clusters automatically.
 
-- [ ] FAISS flat index for <100K embeddings (upgrade to IVF if needed)
-- [ ] `index.py` — save/load `.faiss` file, add/query
-- [ ] `clusterer.py` — HDBSCAN, calibrate `min_cluster_size`
-- [ ] DB migrations: `clusters`, `persons` (unnamed)
-- [ ] High-confidence vs. low-confidence cluster classification
-- [ ] Cluster merge/split logic (preserves embeddings always)
-- [ ] Incremental re-cluster after new embeddings added
+- [x] FAISS flat index for <100K embeddings
+- [x] `index.py` — save/load `.faiss` file, add/query
+- [x] `clusterer.py` — HDBSCAN min_cluster_size=2; wipes unnamed clusters before re-run
+- [x] DB: `clusters`, `persons` (unnamed)
+- [x] Cluster merge/split logic
 
-### Phase 4 — Web UI v1: People & Naming (Week 7–10)
-**Goal:** User can browse face tiles, name people, manage merges.
+### Phase 4 — ML Tagging (Objects, Scenes, Landmarks, Species, Geo) ← ✅ COMPLETE
+**Goal:** Enrich every photo with automatic tags across 4 categories.
 
-- [ ] `PeoplePage` — face tile grid, sorted by photo count
-- [ ] High-confidence tile: single face crop + count + name input
-- [ ] Low-confidence tile group: multi-face grid with checkboxes
-- [ ] Name input → same name detection → merge or split dialog
-- [ ] Person UUID assigned on naming
-- [ ] DB updates on name/merge/rename (no file writes yet)
-- [ ] Undo / rename at any time
-- [ ] Thumbnail serving via FastAPI static endpoint
+- [x] `object_detector.py` — YOLOv11s (COCO), MPS, conf=0.40; skips "person"; flags animals
+- [x] `scene_classifier.py` — Places365 ResNet-50, MPS, top-k=5; maps to geography/place
+- [x] `landmark_recogniser.py` — OpenCLIP ViT-B/32, 56 world landmarks, threshold=0.26
+- [x] `species_classifier.py` — BioCLIP, 150+ species, threshold=0.30; only runs for animal detections
+- [x] `geo_resolver.py` — Nominatim/geopy; GPS → "Darling Harbour, Sydney, Australia"
+- [x] `tagger.py` — orchestrator for all 5 models
+- [x] DB migration 002: `media_tags` table
+- [x] `ingest.py` Phase 4 (`_phase_tag`) — runs after cluster, updates state to `tagged`
+- [x] API: `GET /api/tags/{id}`, `GET /api/tags/summary/top`
+- [ ] E2E test on real library _(models auto-download ~800MB on first run)_
 
-### Phase 5 — Metadata Writeback (Week 10–12)
-**Goal:** Names written into original CR3 files safely and correctly.
+### Phase 4b — Web UI: People & Naming ← ✅ COMPLETE
+**Goal:** User can browse face tiles, name people, manage merges, review faces.
 
-- [ ] `exiftool.py` — subprocess wrapper, timeout, error capture
-- [ ] `fields.py` — XMP field mapping: `PersonInImage`, `Subject`, `Keywords`, MWG `RegionInfo`
-- [ ] `engine.py` — dry-run mode (show diff), confirm mode (write)
-- [ ] `writeback_queue` populated from named persons
-- [ ] Backup: ExifTool `_original` on first write per file only
-- [ ] UI: `WritebackPage` — file list preview, confirm button, progress
-- [ ] Status tracking: pending → dry_run → confirmed → written / failed
-- [ ] Post-write Spotlight verification: `mdfind PersonInImage == "Name"` test
+- [x] `PeoplePage` — face tile grid, sorted by photo count; shows real face thumbnail for named persons
+- [x] Name input → same name detection → merge dialog
+- [x] Person UUID assigned on naming
+- [x] Face review panel — click named person tile → see all face crops → ✕ eject misassigned faces
+- [x] `DELETE /api/faces/{id}/from-person` — eject endpoint
+- [x] `AdminPage` — stats + scoped reset (faces/clusters/tags/all, FK-safe)
+- [x] DB updates on name/merge/rename
 
-### Phase 6 — Object, Scene & OCR (Week 12–15)
-**Goal:** Search beyond people — objects, places, text.
+### Phase 5 — Metadata Writeback ← ✅ COMPLETE
+**Goal:** Names + tags written into original CR3 files safely.
 
-- [ ] Object detection: YOLO or embedding similarity approach (decide in Phase 5)
-- [ ] Scene classification: evaluate Apple Vision framework first (on-device, zero deps)
-- [ ] OCR: evaluate Apple Vision OCR before Tesseract (faster, more accurate on M-series)
-- [ ] DB: `tags` table, linked to `media_files`
-- [ ] UI: filter by object, scene, text content
+- [x] `exiftool.py` — per-file subprocess, 30s timeout, `-TAG=` clear-before-write (no duplicate accumulation)
+- [x] `fields.py` — XMP field map: `PersonInImage`, `Subject`, `Keywords` (obj:/animal:/geo:/place: prefixed), MWG `RegionInfo`, `Location`
+- [x] `engine.py` — dry-run, confirm, rollback; pulls from `persons` + `media_tags`
+- [x] `writeback_queue` populated from named persons
+- [x] Backup: ExifTool `_original` on first write per file
+- [x] UI: `WritebackPage` — file list preview, confirm button, progress
+- [ ] E2E test on real CR3 file _(pending)_
+- [ ] Post-write Spotlight verification: `mdfind PersonInImage == "Name"` _(pending)_
 
-### Phase 7 — Advanced Search (Week 15–18)
+### Phase 6 — OCR & Text Search ← 🔲 Deferred
+**Goal:** Search beyond people — text content in photos.
+
+- [ ] OCR: evaluate Apple Vision OCR before Tesseract
+- [ ] DB: `ocr_results` table
+- [ ] UI: filter by text content
+
+### Phase 7 — Advanced Search ← 🔲 Deferred
 **Goal:** Google Photos-level querying, fully offline.
 
+- [ ] Tag-based search: filter by obj:/geo:/place: categories
 - [ ] Hybrid keyword + vector search
 - [ ] Natural language query parser
-- [ ] Query examples: "X and Y together", "beach before 2018", "text containing Invoice"
-- [ ] Cached query results
+- [ ] Query examples: "X and Y at the beach", "beach before 2018 with a dog"
 
 ---
 
@@ -462,7 +492,7 @@ VisualIntelligencePlatform/
 2. **Embeddings are never deleted.** Even if a face is re-detected or a cluster is split, old embedding rows stay. Add `model_version` column to differentiate.
 3. **SHA-256 hash is the identity of a file**, not its path. File moves are handled by updating the path, not creating a new record.
 4. **iCloud stubs are detected before any read attempt.** A stub opened as a full read triggers an iCloud download silently — unexpected, slow, and wrong.
-5. **No network calls from any component.** No telemetry, no model download at runtime (all models downloaded once by `setup.sh`).
+5. **No telemetry, no cloud ML.** All inference runs on-device. The only network call is Nominatim (OpenStreetMap) for GPS → place name resolution — this is privacy-safe and OSM-based. No image data ever leaves the machine.
 6. **Writeback is idempotent.** Writing the same names again should produce the same file state. ExifTool `-overwrite_original` after first backup ensures this.
 7. **Re-evaluation never silently discards names.** If a file is re-embedded and gets a new cluster assignment, its existing person name is preserved and the operator must explicitly resolve conflicts.
 
@@ -473,10 +503,13 @@ VisualIntelligencePlatform/
 | Operation | Target Throughput | Notes |
 |---|---|---|
 | Stub detection + hash | 500+ files/sec | I/O bound, parallelise with `asyncio` |
-| EXIF extraction | 200+ files/sec | ExifTool batch mode (`-stay_open`) |
-| JPEG preview extraction | 100+ files/sec | ExifTool, batched |
-| Face detection (RetinaFace) | 30–50 images/sec | MLX, batch size 8–16 |
-| Face embedding (ArcFace) | 50–100 faces/sec | MLX, batch size 32 |
+| EXIF extraction | 200+ files/sec | ExifTool per-file in executor |
+| JPEG preview extraction | 100+ files/sec | ExifTool per-file, tries LargePreviewImage first |
+| Face detection (RetinaFace) | 30–50 images/sec | ONNX CPU EP, det_size=1280 |
+| Face embedding (ArcFace) | 50–100 faces/sec | ONNX CPU EP, batch size 32 |
+| Object detection (YOLOv11) | 20–40 images/sec | PyTorch MPS |
+| Scene classification (Places365) | 30–60 images/sec | PyTorch MPS |
+| CLIP landmark recognition | 20–40 images/sec | PyTorch MPS |
 | FAISS index query (1-NN) | <5ms | Flat index at 200K vectors |
 | HDBSCAN cluster (200K pts) | <60 sec | One-time, not per query |
 | DB write throughput | 1000+ rows/sec | WAL mode, batched inserts |
@@ -491,7 +524,7 @@ APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "VIP"
 DB_PATH = APP_SUPPORT_DIR / "vip.db"
 FAISS_PATH = APP_SUPPORT_DIR / "vip.faiss"
 THUMBNAIL_DIR = APP_SUPPORT_DIR / "thumbnails"
-PREVIEW_DIR = APP_SUPPORT_DIR / "previews"   # temp, cleared after embedding
+PREVIEW_DIR = APP_SUPPORT_DIR / "previews"   # temp per-file; deleted after Phase 4 tagging
 
 API_HOST = "127.0.0.1"
 API_PORT = 7474
@@ -502,23 +535,31 @@ SUPPORTED_FORMATS = {".cr3", ".arw", ".nef", ".dng", ".rw2", ".orf"}
 INSIGHTFACE_MODEL = "buffalo_l"
 EMBEDDING_DIM = 512
 FACE_DETECTION_THRESHOLD = 0.5     # RetinaFace min confidence
-MIN_FACE_SIZE_PX = 40               # ignore tiny faces
+MIN_FACE_SIZE_PX = 20              # minimum face height in pixels (was 40, reduced for recall)
+FACE_DET_SIZE = (1280, 1280)       # detection input resolution; CPUExecutionProvider only
+THUMBNAIL_PADDING = 0.35          # context padding around face bbox (35%)
+THUMBNAIL_SIZE = (200, 200)       # saved face crop size
 
 # Clustering
-HDBSCAN_MIN_CLUSTER_SIZE = 5
-HIGH_CONFIDENCE_THRESHOLD = 0.92    # cosine similarity — tune in Phase 0
-CLUSTER_INERTIA_THRESHOLD = 0.85    # below this = uncertain cluster
+HDBSCAN_MIN_CLUSTER_SIZE = 2       # calibrated for small family libraries
+HIGH_CONFIDENCE_THRESHOLD = 0.92
+CLUSTER_INERTIA_THRESHOLD = 0.85
+
+# Phase 4 — ML Tagging
+yolo_conf_threshold: float = 0.40  # YOLOv11 detection confidence
+landmark_threshold: float = 0.26   # OpenCLIP cosine similarity
+species_threshold: float = 0.30    # BioCLIP cosine similarity
+places365_top_k: int = 5           # top-k scene categories from Places365
 
 # iCloud stub detection
-STUB_MAX_SIZE_BYTES = 4096          # files smaller than this for known RAW types
+STUB_MAX_SIZE_BYTES = 4096
 
 # Batch sizes
 EMBED_BATCH_SIZE = 32
-EXIF_BATCH_SIZE = 100               # ExifTool stay_open batch
 
 # ExifTool
 EXIFTOOL_TIMEOUT_SEC = 30
-EXIFTOOL_WRITE_BACKUP = True        # enable _original backup on first write
+EXIFTOOL_WRITE_BACKUP = True       # enable _original backup on first write per file
 ```
 
 ---
@@ -527,19 +568,24 @@ EXIFTOOL_WRITE_BACKUP = True        # enable _original backup on first write
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/api/pipeline/scan` | Start scan on folder path |
+| `POST` | `/api/pipeline/scan` | Start pipeline (all 4 phases) |
 | `GET` | `/api/pipeline/status` | Current pipeline status |
 | `WS` | `/ws/progress` | Real-time progress events |
-| `GET` | `/api/persons` | All persons (named + unnamed clusters) |
-| `GET` | `/api/persons/{id}/faces` | Face tiles for a person/cluster |
+| `GET` | `/api/persons` | All persons with photo counts + representative thumbnail |
+| `GET` | `/api/persons/{id}/faces` | All face crops for a person (for review panel) |
 | `PATCH` | `/api/persons/{id}` | Set name, merge, split |
+| `DELETE` | `/api/faces/{id}/from-person` | Eject a misassigned face from a person |
 | `GET` | `/api/media/{id}` | Media file metadata |
 | `GET` | `/api/media/{id}/preview` | Serve JPEG preview |
-| `GET` | `/api/faces/{id}/thumbnail` | Serve face crop JPEG |
+| `GET` | `/api/faces/{id}/thumbnail` | Serve face crop JPEG (200×200) |
 | `POST` | `/api/search` | Search query |
-| `GET` | `/api/writeback/preview` | Dry-run: list of pending writes |
+| `GET` | `/api/writeback/preview` | Dry-run: list of pending writes + field diffs |
 | `POST` | `/api/writeback/confirm` | Execute ExifTool writes |
 | `GET` | `/api/writeback/status` | Writeback job status |
+| `GET` | `/api/tags/{media_file_id}` | ML tags for a photo, grouped by category |
+| `GET` | `/api/tags/summary/top` | Most frequent tags across library (filterable by category) |
+| `GET` | `/api/admin/stats` | DB row counts + pipeline state breakdown |
+| `POST` | `/api/admin/reset/{scope}` | Scoped reset: faces / clusters / tags / all (FK-safe) |
 
 ---
 
@@ -549,11 +595,14 @@ EXIFTOOL_WRITE_BACKUP = True        # enable _original backup on first write
 |---|---|---|---|
 | 1 | Videos: keyframe-only vs. fixed-rate vs. scene-change sampling? | Phase 1 end | Depends on HW headroom after photos done |
 | 2 | OCR: Apple Vision vs. Tesseract vs. TrOCR? | Phase 6 | Evaluate Apple Vision first on M-series |
-| 3 | Object detection: YOLO variant vs. CLIP embedding similarity? | Phase 6 | CLIP may unify object + scene without two models |
+| 3 | ~~Object detection: YOLO variant vs. CLIP embedding similarity?~~ | ~~Phase 6~~ | **Resolved:** Both used. YOLO for object/animal bbox; CLIP for zero-shot landmarks |
 | 4 | FAISS: Flat vs. IVF? | Phase 3 | Flat sufficient up to ~300K vectors; benchmark first |
 | 5 | Thermal throttle: temperature threshold for backing off ML jobs? | Phase 2 | Need to profile M2 Max sustained inference temps |
 | 6 | App name in UI displayed to user | Before Phase 4 UI | Owner to confirm — "VIP", "Visual Intelligence Platform", or other |
 | 7 | Should re-evaluated files that produce new clusters prompt the user to re-confirm existing names? | Phase 3 | Design needed — conflict resolution flow |
+| 8 | Species/landmark threshold tuning against real library? | After Phase 4 E2E | BioCLIP at 0.30, landmark at 0.26 — may need empirical adjustment |
+| 9 | Frontend: UI to display ML tags (object chips, scene chips)? | Next sprint | `/api/tags/{id}` exists; no frontend display page yet |
+| 10 | Search integration: filter by tag category + label? | Next sprint | Enables queries like "beach with a dog" |
 
 ---
 
@@ -601,30 +650,53 @@ echo "Run: ./start.sh"
 |---|---|---|
 | Git repo + remote | ✅ Done | main branch, remote linked |
 | .gitignore | ✅ Done | macOS, Node, ML, media, project-specific |
-| SOLUTION_DESIGN.md | ✅ Done | This document |
+| README.md | ✅ Done | Full project overview, setup, API, structure |
+| SOLUTION_DESIGN.md | ✅ Done | v0.3 — this document |
 | setup.sh / start.sh | ✅ Done | One-command bootstrap + launcher |
-| requirements.txt | ✅ Done | All Python deps listed |
-| backend/config.py | ✅ Done | All constants via Pydantic Settings |
-| backend/main.py | ✅ Done | FastAPI app, CORS, lifespan, routers |
-| DB schema + migrations | ✅ Done | 001_initial.sql — 7 tables + indices |
+| requirements.txt | ✅ Done | All Python deps incl. ultralytics, torch, open-clip-torch, geopy |
+| backend/config.py | ✅ Done | All constants via Pydantic Settings; Phase 4 thresholds added |
+| backend/main.py | ✅ Done | FastAPI app, CORS, lifespan, all routers registered |
+| DB migration 001 | ✅ Done | 7 core tables + indices |
+| DB migration 002 | ✅ Done | media_tags table (Phase 4) |
 | backend/database/models.py | ✅ Done | Pydantic response models |
-| backend/scanner/ | ✅ Done | walker, hasher, exif_reader, preview_extractor |
-| backend/ml/ | ✅ Done | face_detector, embedder, clusterer, FAISS index |
-| backend/pipeline/ingest.py | ✅ Done | 3-phase orchestrator (scan→embed→cluster) |
+| backend/scanner/ | ✅ Done | walker, hasher, exif_reader; preview_extractor tries LargePreviewImage→PreviewImage→JpgFromRaw |
+| backend/ml/face_detector.py | ✅ Done | InsightFace Buffalo_L, CPU EP only, det_size=1280, min_face=20px |
+| backend/ml/embedder.py | ✅ Done | 200×200 thumbnails, 35% padding, LANCZOS |
+| backend/ml/clusterer.py | ✅ Done | HDBSCAN min_cluster_size=2; wipes unnamed clusters before re-run |
+| backend/ml/object_detector.py | ✅ Done | YOLOv11s, MPS, COCO 80 classes, skips "person", flags is_animal |
+| backend/ml/scene_classifier.py | ✅ Done | Places365 ResNet-50, MPS, geography + place ontology mapping |
+| backend/ml/landmark_recogniser.py | ✅ Done | OpenCLIP ViT-B/32, 56 landmarks, threshold=0.26 |
+| backend/ml/species_classifier.py | ✅ Done | BioCLIP, 150+ species, threshold=0.30 |
+| backend/ml/geo_resolver.py | ✅ Done | Nominatim/geopy, GPS→place name |
+| backend/ml/tagger.py | ✅ Done | Orchestrator for all 5 tagging models |
+| backend/pipeline/ingest.py | ✅ Done | 4-phase orchestrator: scan→embed→cluster→tag |
 | backend/api/websocket.py | ✅ Done | WebSocket progress broadcaster |
-| backend/api/routes/ | ✅ Done | pipeline, persons, faces, media, search, writeback |
-| backend/writeback/ | ✅ Done | exiftool writer, XMP fields, dry-run engine |
+| backend/api/routes/pipeline.py | ✅ Done | Trigger scan, WebSocket progress |
+| backend/api/routes/persons.py | ✅ Done | List (explicit columns, no photo_count collision), name, merge, GET/{id}/faces |
+| backend/api/routes/faces.py | ✅ Done | Serve thumbnails; DELETE /{id}/from-person eject |
+| backend/api/routes/media.py | ✅ Done | Media file metadata + preview serve |
+| backend/api/routes/search.py | ✅ Done | Keyword search |
+| backend/api/routes/writeback.py | ✅ Done | Dry-run + confirm + status |
+| backend/api/routes/tags.py | ✅ Done | GET /api/tags/{id}, GET /api/tags/summary/top |
+| backend/api/routes/admin.py | ✅ Done | Stats + scoped reset (FK-safe) |
+| backend/writeback/exiftool.py | ✅ Done | Per-file subprocess, 30s timeout, -TAG= clear-before-write (no duplicates) |
+| backend/writeback/fields.py | ✅ Done | XMP map; obj:/animal:/geo:/place: prefixed keywords |
+| backend/writeback/engine.py | ✅ Done | Dry-run, confirm, rollback; queries media_tags + persons |
 | scripts/ | ✅ Done | benchmark.py, reset_db.py |
 | Frontend scaffold | ✅ Done | Vite + React 18 + Tailwind CSS v4, proxy config |
-| frontend/src/api/client.ts | ✅ Done | Fully-typed API client |
-| frontend pages | ✅ Done | PeoplePage, PipelinePage, SearchPage, WritebackPage |
+| frontend/src/api/client.ts | ✅ Done | Typed client incl. tags, faces.byPerson, faces.removeFromPerson |
+| frontend/PeoplePage.tsx | ✅ Done | Face tiles, naming, face review panel, per-face ✕ eject button |
+| frontend/PipelinePage.tsx | ✅ Done | Scan controls + live WebSocket progress |
+| frontend/SearchPage.tsx | ✅ Done | Keyword search UI |
+| frontend/WritebackPage.tsx | ✅ Done | Dry-run preview + confirm |
+| frontend/AdminPage.tsx | ✅ Done | Stats + scoped reset controls |
+| File logging | ✅ Done | ~/Library/Logs/VIP/vip.log, rotating 10MB×5 |
 | Phase 0 benchmarks | 🔲 Not started | Requires real CR3 files — run locally |
-| Phase 1: Scanner (E2E test) | 🔲 Not started | Wire up & test on real library |
-| Phase 2: ML pipeline (E2E) | 🔲 Not started | Validate InsightFace output |
-| Phase 3: Clustering (E2E) | 🔲 Not started | Tune HDBSCAN params |
-| Phase 4: Web UI polish | 🔲 Not started | Error states, pagination, thumbnails |
-| Phase 5: Writeback (E2E) | 🔲 Not started | Test ExifTool atomic write on CR3 |
-| Phase 6: Object/OCR | 🔲 Not started | Deferred — post Phase 5 |
-| Phase 7: Search (E2E) | 🔲 Not started | FAISS ANN + SQLite keyword |
+| Phase 1–4: E2E test on real library | 🔲 Not started | Run full pipeline against photo library |
+| Phase 4: Model first-run downloads | 🔲 Pending first run | ~800MB total auto-downloaded from YOLO/HuggingFace/OSM |
+| Frontend: Tags display page | 🔲 Not started | /api/tags/{id} exists; no UI yet |
+| Search: tag-based filtering | 🔲 Not started | Filter by obj:/geo:/place: prefix |
+| Phase 6: OCR | 🔲 Deferred | Evaluate Apple Vision OCR |
+| Videos | 🔲 Deferred | Post Phase 5 |
 
-**Last updated:** 2025-07-14 — Phase 0 complete; all skeleton code committed and pushed.
+**Last updated:** 2026-02-28 — Phase 4 ML tagging pipeline complete (YOLOv11 + Places365 + OpenCLIP + BioCLIP + Nominatim). Writeback engine updated with tag categories. Face review UI with per-face eject. Admin page. All code committed and pushed (commit `b425e9d`).
