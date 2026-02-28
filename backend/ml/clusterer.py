@@ -86,7 +86,8 @@ def cluster_embeddings(
 
     labels = clusterer.fit_predict(matrix)
     unique_labels = set(labels)
-    logger.info("HDBSCAN found %d clusters (noise=%d)", len(unique_labels - {-1}), (labels == -1).sum())
+    noise_count = int((labels == -1).sum())
+    logger.info("HDBSCAN found %d clusters (noise=%d)", len(unique_labels - {-1}), noise_count)
 
     results = []
 
@@ -94,6 +95,24 @@ def cluster_embeddings(
         indices = np.where(labels == label)[0]
         cluster_face_ids = [face_ids[i] for i in indices]
         cluster_vectors = matrix[indices]
+
+        if label == -1:
+            # Noise faces: each becomes its own singleton cluster for manual review.
+            # Grouping ALL noise into one cluster is wrong — they are different people
+            # that HDBSCAN couldn't confidently place, not the same person.
+            for fid, vec in zip(cluster_face_ids, cluster_vectors):
+                v = vec.copy()
+                norm = np.linalg.norm(v)
+                if norm > 0:
+                    v /= norm
+                results.append(ClusterResult(
+                    label=-1,
+                    face_ids=[fid],
+                    centroid=v.astype(np.float32),
+                    intra_similarity=1.0,   # singleton: perfect self-similarity
+                    is_high_conf=False,     # always show singletons for review
+                ))
+            continue
 
         centroid = cluster_vectors.mean(axis=0)
         # Normalise centroid back to unit sphere
