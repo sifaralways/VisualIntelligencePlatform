@@ -122,6 +122,29 @@ def cluster_embeddings(
 
         intra_sim = _mean_cosine_similarity(cluster_vectors)
 
+        # Validity gate: if HDBSCAN grouped faces whose mean pairwise similarity
+        # is below the inertia threshold, the cluster is unreliable — different
+        # people ended up in the same density region.  Break it into singletons
+        # for manual review rather than surfacing it as a single "person".
+        if intra_sim < settings.cluster_inertia_threshold and len(cluster_face_ids) > 1:
+            logger.info(
+                "Cluster label=%d rejected (intra_sim=%.3f < %.3f) — splitting %d faces into singletons",
+                label, intra_sim, settings.cluster_inertia_threshold, len(cluster_face_ids),
+            )
+            for fid, vec in zip(cluster_face_ids, cluster_vectors):
+                v = vec.copy()
+                norm_v = np.linalg.norm(v)
+                if norm_v > 0:
+                    v /= norm_v
+                results.append(ClusterResult(
+                    label=-1,
+                    face_ids=[fid],
+                    centroid=v.astype(np.float32),
+                    intra_similarity=1.0,
+                    is_high_conf=False,
+                ))
+            continue
+
         results.append(ClusterResult(
             label=label,
             face_ids=cluster_face_ids,
