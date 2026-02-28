@@ -114,7 +114,8 @@ class Tagger:
 
             # ── Species (BioCLIP) — only when YOLO found an animal ──────────
             if has_animal:
-                species = self._species.classify(image_path)
+                from backend.database.settings_store import get as _gs
+                species = self._species.classify(image_path, threshold=float(_gs('species_threshold')))
                 if species and species.label not in result.animals:
                     result.animals.insert(0, species.label)
 
@@ -123,7 +124,8 @@ class Tagger:
 
         # ── Scene / Geography (Places365) ───────────────────────────────────
         try:
-            scenes = self._scene_classifier.classify(image_path)
+            from backend.database.settings_store import get as _gs
+            scenes = self._scene_classifier.classify(image_path, top_k=int(_gs('places365_top_k')))
             for s in scenes:
                 if s.category == "geography" and s.label not in result.geography:
                     result.geography.append(s.label)
@@ -134,7 +136,8 @@ class Tagger:
 
         # ── Landmarks (CLIP) ────────────────────────────────────────────────
         try:
-            landmarks = self._landmark.recognise(image_path)
+            from backend.database.settings_store import get as _gs
+            landmarks = self._landmark.recognise(image_path, threshold=float(_gs('landmark_threshold')))
             for lm in landmarks:
                 if lm.label not in result.places:
                     result.places.append(lm.label)

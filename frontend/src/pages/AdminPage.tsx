@@ -5,8 +5,8 @@
  * a confirmation step so the user can't accidentally wipe data.
  */
 
-import { useEffect, useState } from 'react'
-import { api } from '../api/client'
+import { useEffect, useMemo, useState } from 'react'
+import { api, AppSetting } from '../api/client'
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -91,6 +91,78 @@ export default function AdminPage() {
   const [confirm, setConfirm] = useState<Scope | null>(null)
   const [busy, setBusy] = useState(false)
   const [result, setResult] = useState<string | null>(null)
+
+  // ── Settings state ───────────────────────────────────────────────────────
+  const [settings, setSettings] = useState<AppSetting[]>([])
+  const [settingsEdits, setSettingsEdits] = useState<Record<string, number>>({})
+  const [settingsBusy, setSettingsBusy] = useState(false)
+  const [settingsMsg, setSettingsMsg] = useState<string | null>(null)
+
+  async function loadSettings() {
+    try {
+      const s = await api.settings.getAll()
+      setSettings(s)
+      setSettingsEdits({})
+    } catch { /* non-fatal */ }
+  }
+
+  useEffect(() => { loadSettings() }, [])
+
+  const isDirty = useMemo(
+    () => Object.keys(settingsEdits).length > 0,
+    [settingsEdits],
+  )
+
+  function editSetting(key: string, raw: string) {
+    const num = parseFloat(raw)
+    if (!isNaN(num)) setSettingsEdits(prev => ({ ...prev, [key]: num }))
+  }
+
+  function val(s: AppSetting): number {
+    return s.key in settingsEdits ? settingsEdits[s.key] : s.value
+  }
+
+  async function saveSettings() {
+    if (!isDirty) return
+    setSettingsBusy(true)
+    setSettingsMsg(null)
+    try {
+      await api.settings.update(settingsEdits)
+      setSettingsMsg('Settings saved.')
+      await loadSettings()
+    } catch (e: unknown) {
+      const err = e as { message?: string }
+      setSettingsMsg('Error: ' + (err?.message ?? 'unknown'))
+    } finally {
+      setSettingsBusy(false)
+    }
+  }
+
+  async function resetSettings() {
+    setSettingsBusy(true)
+    setSettingsMsg(null)
+    try {
+      await api.settings.reset()
+      setSettingsMsg('Reset to defaults.')
+      await loadSettings()
+    } catch (e: unknown) {
+      const err = e as { message?: string }
+      setSettingsMsg('Error: ' + (err?.message ?? 'unknown'))
+    } finally {
+      setSettingsBusy(false)
+    }
+  }
+
+  // Group settings by the `group` field
+  const settingGroups = useMemo(() => {
+    const map = new Map<string, AppSetting[]>()
+    for (const s of settings) {
+      const arr = map.get(s.group) ?? []
+      arr.push(s)
+      map.set(s.group, arr)
+    }
+    return map
+  }, [settings])
 
   async function loadStats() {
     setLoading(true)
@@ -198,6 +270,91 @@ export default function AdminPage() {
         <div className="mt-6 bg-gray-900 border border-gray-700 rounded-xl px-5 py-3 text-sm text-gray-300">
           {result}
         </div>
+      )}
+
+      {/* ── ML Settings ──────────────────────────────────────────── */}
+      {settings.length > 0 && (
+        <section className="mt-10">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
+              ML Model Settings
+            </h2>
+            <div className="flex gap-2">
+              {isDirty && (
+                <button
+                  onClick={saveSettings}
+                  disabled={settingsBusy}
+                  className="text-xs bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg px-3 py-1.5 font-medium transition-colors"
+                >
+                  {settingsBusy ? 'Saving…' : 'Save Changes'}
+                </button>
+              )}
+              <button
+                onClick={resetSettings}
+                disabled={settingsBusy}
+                className="text-xs border border-gray-700 text-gray-400 hover:bg-gray-800 disabled:opacity-40 rounded-lg px-3 py-1.5 font-medium transition-colors"
+              >
+                Reset to Defaults
+              </button>
+            </div>
+          </div>
+
+          {settingsMsg && (
+            <div className="mb-4 bg-gray-900 border border-gray-700 rounded-xl px-4 py-2.5 text-sm text-gray-300">
+              {settingsMsg}
+            </div>
+          )}
+
+          <div className="flex flex-col gap-6">
+            {Array.from(settingGroups.entries()).map(([group, items]) => (
+              <div key={group}>
+                <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">
+                  {group}
+                </h3>
+                <div className="flex flex-col gap-3">
+                  {items.map(s => (
+                    <div
+                      key={s.key}
+                      className="bg-gray-900 border border-gray-800 rounded-xl px-5 py-4"
+                    >
+                      <div className="flex items-start justify-between gap-4 mb-2">
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-200">{s.label}</p>
+                          <p className="text-xs text-gray-500 mt-0.5">{s.description}</p>
+                        </div>
+                        <div className="shrink-0 flex items-center gap-2">
+                          <input
+                            type="number"
+                            min={s.min}
+                            max={s.max}
+                            step={s.step}
+                            value={val(s)}
+                            onChange={e => editSetting(s.key, e.target.value)}
+                            className="w-24 bg-gray-800 border border-gray-700 text-white text-right text-sm rounded-lg px-2 py-1 focus:outline-none focus:border-indigo-500"
+                          />
+                        </div>
+                      </div>
+                      <input
+                        type="range"
+                        min={s.min}
+                        max={s.max}
+                        step={s.step}
+                        value={val(s)}
+                        onChange={e => editSetting(s.key, e.target.value)}
+                        className="w-full accent-indigo-500"
+                      />
+                      <div className="flex justify-between text-xs text-gray-600 mt-0.5">
+                        <span>{s.min}</span>
+                        <span className="text-gray-500">default: {s.default}</span>
+                        <span>{s.max}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
       )}
 
       {/* ── Confirmation modal ───────────────────────────────────── */}

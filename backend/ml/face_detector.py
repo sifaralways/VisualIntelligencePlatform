@@ -23,6 +23,7 @@ import numpy as np
 from PIL import Image
 
 from backend.config import settings
+from backend.database.settings_store import get as get_setting
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +102,7 @@ class FaceDetector:
         results = []
         for face in faces:
             conf = float(face.det_score)
-            if conf < settings.face_detection_threshold:
+            if conf < get_setting('face_detection_threshold'):
                 continue
 
             x1, y1, x2, y2 = face.bbox.astype(int)
@@ -111,7 +112,8 @@ class FaceDetector:
             x2, y2 = min(img_w, x2), min(img_h, y2)
 
             w, h = x2 - x1, y2 - y1
-            if w < settings.min_face_size_px or h < settings.min_face_size_px:
+            min_px = int(get_setting('min_face_size_px'))
+            if w < min_px or h < min_px:
                 logger.debug("Skipping tiny face (%dx%d) in %s", w, h, image_path.name)
                 continue
 

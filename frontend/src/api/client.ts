@@ -147,6 +147,17 @@ export const api = {
         method: 'DELETE',
       }),
   },
+
+  // ─── Settings ────────────────────────────────────────────────────────────
+  settings: {
+    getAll: () => request<AppSetting[]>('/settings'),
+    update: (updates: Record<string, number | string>) =>
+      request<{ status: string; updated: string[] }>('/settings', {
+        method: 'PATCH',
+        body: JSON.stringify({ updates }),
+      }),
+    reset: () => request<{ status: string; detail: string }>('/settings/reset', { method: 'POST' }),
+  },
 }
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -341,4 +352,19 @@ export interface AmendRequest {
   action: 'rename' | 'delete' | 'add' | 'confirm'
   user_value?: string
   user_confidence?: number
+}
+
+// ─── Settings ─────────────────────────────────────────────────────────────
+
+export interface AppSetting {
+  key: string
+  value: number
+  default: number
+  type: 'float' | 'int'
+  min: number
+  max: number
+  step: number
+  label: string
+  description: string
+  group: string
 }

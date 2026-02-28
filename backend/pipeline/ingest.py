@@ -33,6 +33,7 @@ from backend.ml.clusterer import cluster_embeddings
 from backend.ml.index import FaissIndex
 from backend.ml.tagger import Tagger
 from backend.api.websocket import broadcast
+from backend.database import settings_store
 
 try:
     from PIL import Image as _PILImage
@@ -73,6 +74,10 @@ async def run_ingest(folder: str) -> None:
     logger.info("=== Pipeline start: %s ===", folder_path)
 
     await broadcast("pipeline_start", folder=str(folder_path))
+
+    # Refresh the in-process settings cache from DB so any tweaks made in
+    # the Admin UI take effect on the next pipeline run without a restart.
+    await settings_store.load_cache()
 
     _ensure_models()
 
@@ -243,7 +248,7 @@ async def _phase_embed() -> None:
                 # Gate gender/age on sharpness: the GenderAge sub-model produces
                 # near-random results on blurry or tiny crops.  quality_sharpness
                 # is a Laplacian-variance proxy normalised to 0–100.
-                _sharp_enough = (face.quality_sharpness or 0) >= settings.gender_min_sharpness
+                _sharp_enough = (face.quality_sharpness or 0) >= settings_store.get('gender_min_sharpness')
                 if face.age is not None and _sharp_enough:
                     face_attrs["AgeRange"] = {
                         "Low":  max(0, face.age - 4),

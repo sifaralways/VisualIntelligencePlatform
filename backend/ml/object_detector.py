@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from backend.config import settings
+from backend.database.settings_store import get as get_setting
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +80,7 @@ class ObjectDetector:
         if self._model is None:
             return []
 
-        threshold = conf_threshold if conf_threshold is not None else settings.yolo_conf_threshold
+        threshold = conf_threshold if conf_threshold is not None else get_setting('yolo_conf_threshold')
         try:
             results = self._model(
                 str(image_path),

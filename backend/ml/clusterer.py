@@ -21,6 +21,7 @@ from typing import Optional
 import numpy as np
 
 from backend.config import settings
+from backend.database.settings_store import get as get_setting
 from backend.ml.embedder import FaceEmbedder
 
 logger = logging.getLogger(__name__)
@@ -66,22 +67,20 @@ def cluster_embeddings(
     try:
         from sklearn.cluster import HDBSCAN  # sklearn >= 1.3
         clusterer = HDBSCAN(
-            min_cluster_size=settings.hdbscan_min_cluster_size,
-            min_samples=settings.hdbscan_min_samples,
+            min_cluster_size=int(get_setting('hdbscan_min_cluster_size')),
+            min_samples=int(get_setting('hdbscan_min_samples')),
             metric="cosine",
-            cluster_selection_method="eom",   # excess of mass — stable clusters
-            cluster_selection_epsilon=settings.hdbscan_cluster_epsilon,
-            # same person across lighting/pose has cosine distance up to ~0.22;
-            # epsilon merges sub-clusters within that range so they stay together
+            cluster_selection_method="eom",
+            cluster_selection_epsilon=float(get_setting('hdbscan_cluster_epsilon')),
         )
     except ImportError:
         import hdbscan
         clusterer = hdbscan.HDBSCAN(
-            min_cluster_size=settings.hdbscan_min_cluster_size,
-            min_samples=settings.hdbscan_min_samples,
+            min_cluster_size=int(get_setting('hdbscan_min_cluster_size')),
+            min_samples=int(get_setting('hdbscan_min_samples')),
             metric="cosine",
             cluster_selection_method="eom",
-            cluster_selection_epsilon=settings.hdbscan_cluster_epsilon,
+            cluster_selection_epsilon=float(get_setting('hdbscan_cluster_epsilon')),
         )
 
     labels = clusterer.fit_predict(matrix)
@@ -126,10 +125,11 @@ def cluster_embeddings(
         # is below the inertia threshold, the cluster is unreliable — different
         # people ended up in the same density region.  Break it into singletons
         # for manual review rather than surfacing it as a single "person".
-        if intra_sim < settings.cluster_inertia_threshold and len(cluster_face_ids) > 1:
+        inertia_threshold = float(get_setting('cluster_inertia_threshold'))
+        if intra_sim < inertia_threshold and len(cluster_face_ids) > 1:
             logger.info(
                 "Cluster label=%d rejected (intra_sim=%.3f < %.3f) — splitting %d faces into singletons",
-                label, intra_sim, settings.cluster_inertia_threshold, len(cluster_face_ids),
+                label, intra_sim, inertia_threshold, len(cluster_face_ids),
             )
             for fid, vec in zip(cluster_face_ids, cluster_vectors):
                 v = vec.copy()
@@ -150,7 +150,7 @@ def cluster_embeddings(
             face_ids=cluster_face_ids,
             centroid=centroid.astype(np.float32),
             intra_similarity=intra_sim,
-            is_high_conf=intra_sim >= settings.high_confidence_threshold,
+            is_high_conf=intra_sim >= float(get_setting('high_confidence_threshold')),
         ))
 
     return results
