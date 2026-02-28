@@ -19,6 +19,8 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from backend.config import settings
+
 logger = logging.getLogger(__name__)
 
 # COCO classes that are animals — routed to the "animal" category
@@ -55,16 +57,18 @@ class ObjectDetector:
             from ultralytics import YOLO
 
             self._device = "mps" if torch.backends.mps.is_available() else "cpu"
-            logger.info("Loading YOLOv11s (device=%s) …", self._device)
-            # yolo11s.pt auto-downloads to ~/.cache/ultralytics/ on first use
-            self._model = YOLO("yolo11s.pt")
-            logger.info("✅  YOLOv11s ready")
+            logger.info("Loading %s (device=%s) …", settings.yolo_model, self._device)
+            # Model auto-downloads to ~/.cache/ultralytics/ on first use.
+            # Default: yolo11m.pt — medium model balances accuracy vs speed.
+            # Change VIP_YOLO_MODEL=yolo11l.pt for highest accuracy.
+            self._model = YOLO(settings.yolo_model)
+            logger.info("✅  %s ready", settings.yolo_model)
         except ImportError as e:
             logger.warning("YOLOv11 unavailable — install ultralytics: %s", e)
         except Exception as e:
             logger.error("Failed to load YOLOv11: %s", e)
 
-    def detect(self, image_path: Path, conf_threshold: float = 0.40) -> list[ObjectTag]:
+    def detect(self, image_path: Path, conf_threshold: float | None = None) -> list[ObjectTag]:
         """
         Detect objects and animals in a JPEG image.
 
@@ -75,12 +79,13 @@ class ObjectDetector:
         if self._model is None:
             return []
 
+        threshold = conf_threshold if conf_threshold is not None else settings.yolo_conf_threshold
         try:
             results = self._model(
                 str(image_path),
                 device=self._device,
                 verbose=False,
-                conf=conf_threshold,
+                conf=threshold,
             )
         except Exception as e:
             logger.warning("YOLOv11 detection failed on %s: %s", image_path.name, e)

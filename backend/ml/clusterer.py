@@ -67,15 +67,21 @@ def cluster_embeddings(
         from sklearn.cluster import HDBSCAN  # sklearn >= 1.3
         clusterer = HDBSCAN(
             min_cluster_size=settings.hdbscan_min_cluster_size,
+            min_samples=settings.hdbscan_min_samples,
             metric="cosine",
-            cluster_selection_method="eom",  # excess of mass — stable clusters
+            cluster_selection_method="eom",   # excess of mass — stable clusters
+            cluster_selection_epsilon=settings.hdbscan_cluster_epsilon,
+            # same person across lighting/pose has cosine distance up to ~0.22;
+            # epsilon merges sub-clusters within that range so they stay together
         )
     except ImportError:
         import hdbscan
         clusterer = hdbscan.HDBSCAN(
             min_cluster_size=settings.hdbscan_min_cluster_size,
+            min_samples=settings.hdbscan_min_samples,
             metric="cosine",
             cluster_selection_method="eom",
+            cluster_selection_epsilon=settings.hdbscan_cluster_epsilon,
         )
 
     labels = clusterer.fit_predict(matrix)

@@ -78,16 +78,32 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     insightface_model: str = "buffalo_l"
     embedding_dim: int = 512
-    face_detection_threshold: float = 0.5   # RetinaFace min confidence
-    min_face_size_px: int = 20              # ignore faces smaller than this (lowered for small/distant faces)
+    # Raise from 0.5 → 0.6: filter borderline face detections that degrade
+    # gender/age accuracy and pollute clusters with unreliable embeddings.
+    face_detection_threshold: float = 0.6
+    # 60px minimum: ArcFace accuracy degrades noticeably on crops smaller than
+    # this; GenderAge predictions on tiny crops are near-random.
+    min_face_size_px: int = 60
+    # Gate gender/age output: only emit these attributes when the face crop
+    # has sufficient sharpness (Laplacian variance proxy, 0–100 scale).
+    # Below this threshold the GenderAge model's predictions are unreliable.
+    gender_min_sharpness: float = 15.0
 
     # -------------------------------------------------------------------------
     # Clustering (HDBSCAN)
     # -------------------------------------------------------------------------
     hdbscan_min_cluster_size: int = 2
+    # min_samples controls cluster conservatism.  1 = most permissive (every
+    # face is a candidate core point).  Keeps same-person singletons from
+    # being labelled noise and left unmatched.
+    hdbscan_min_samples: int = 1
+    # cluster_selection_epsilon (cosine distance): sub-clusters within this
+    # distance of each other are merged into one.  cosine_dist = 1 - similarity,
+    # so 0.20 ≈ similarity 0.80.  Prevents the same person across different
+    # lighting/pose from landing in separate clusters.
+    hdbscan_cluster_epsilon: float = 0.20
     # Cosine similarity threshold above which a cluster is "high confidence"
     # i.e., shown as a single tile + count without requiring manual review.
-    # Calibrate empirically in Phase 0 benchmarks — 0.92 is a starting point.
     high_confidence_threshold: float = 0.92
     # Below this mean intra-cluster similarity → uncertain cluster, show grid
     cluster_inertia_threshold: float = 0.85
@@ -121,7 +137,12 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     # Tagging models (Phase 4)
     # -------------------------------------------------------------------------
-    yolo_conf_threshold: float = 0.40    # YOLOv11 minimum detection confidence
+    # yolo11s (21 MB) → yolo11m (40 MB): the medium model has significantly
+    # better precision on ambiguous detections; false positives drop sharply.
+    yolo_model: str = "yolo11m.pt"
+    # Raise from 0.40 → 0.50: eliminates most hallucinated detections that
+    # come from the small model's uncertainty at the decision boundary.
+    yolo_conf_threshold: float = 0.50    # YOLOv11 minimum detection confidence
     landmark_threshold: float = 0.26     # CLIP minimum cosine similarity for landmarks
     species_threshold: float = 0.30      # BioCLIP minimum cosine similarity for species
     places365_top_k: int = 5             # Places365 top-k scenes to evaluate

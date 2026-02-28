@@ -239,12 +239,17 @@ async def _phase_embed() -> None:
             for face in faces:
                 # Build face_attributes JSON from rich InsightFace data
                 face_attrs: dict = {}
-                if face.age is not None:
+
+                # Gate gender/age on sharpness: the GenderAge sub-model produces
+                # near-random results on blurry or tiny crops.  quality_sharpness
+                # is a Laplacian-variance proxy normalised to 0–100.
+                _sharp_enough = (face.quality_sharpness or 0) >= settings.gender_min_sharpness
+                if face.age is not None and _sharp_enough:
                     face_attrs["AgeRange"] = {
                         "Low":  max(0, face.age - 4),
                         "High": face.age + 4,
                     }
-                if face.gender is not None:
+                if face.gender is not None and _sharp_enough:
                     face_attrs["Gender"] = {"Value": face.gender, "Confidence": 95.0}
                 if face.pose_yaw is not None:
                     face_attrs["Pose"] = {
