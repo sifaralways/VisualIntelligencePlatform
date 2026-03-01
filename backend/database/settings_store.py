@@ -120,6 +120,21 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "description": "BioCLIP minimum cosine similarity required to identify an animal species.",
         "group": "Scene & Tags",
     },
+    "log_level": {
+        "value": 1, "type": "int", "min": 0, "max": 2, "step": 1,
+        "label": "Log level",
+        "description": (
+            "Error: only errors and warnings are recorded. "
+            "Info: phase start/end and summary stats (recommended). "
+            "Debug: full verbose output — every file, face, and decision."
+        ),
+        "group": "System",
+        "options": [
+            {"value": 0, "label": "Error"},
+            {"value": 1, "label": "Info"},
+            {"value": 2, "label": "Debug"},
+        ],
+    },
 }
 
 # ---------------------------------------------------------------------------

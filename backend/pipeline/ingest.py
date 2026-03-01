@@ -810,7 +810,7 @@ async def _phase_auto_merge() -> None:
                     await update_person_centroid(db, pid)
                 named_cluster_ids.add(cid)
                 auto_named += 1
-                logger.info(
+                logger.debug(
                     "Auto-named cluster %d → '%s' (sim=%.3f)", cid, pname, sim
                 )
             elif sim >= suggest_threshold:
@@ -994,7 +994,7 @@ async def _phase_restore_vip_names() -> None:
                         VALUES (?, ?, datetime('now'))
                     """, (str(_uuid.uuid4()), person_name))
                     person_id = cursor.lastrowid
-                    logger.info(
+                    logger.debug(
                         "Phase 3c: Created person '%s' (id=%d) from VIP History",
                         person_name, person_id
                     )
@@ -1023,7 +1023,7 @@ async def _phase_restore_vip_names() -> None:
                     VALUES (?)
                 """, (media_id,))
 
-                logger.info(
+                logger.debug(
                     "Phase 3c: Restored '%s' → face_id=%d, cluster_id=%s (media_id=%d)",
                     person_name, face_id, cluster_id, media_id
                 )

@@ -130,8 +130,8 @@ class FaceDetector:
                         session = getattr(getattr(model_obj, 'model', None), 'session', None)
                     if session is not None:
                         active = session.get_providers()
-                        logger.info("    [%s] %s → ORT providers in use: %s",
-                                    label, model_name, active)
+                        logger.debug("    [%s] %s → ORT providers in use: %s",
+                                     label, model_name, active)
                     else:
                         logger.debug("    [%s] %s — could not find ORT session to introspect",
                                      label, model_name)
@@ -139,12 +139,12 @@ class FaceDetector:
                 logger.warning("    [%s] provider introspection failed: %s", label, exc)
 
         if mode in (0, 2):      # Accuracy or Intelligent need the 1280 CPU session
-            logger.info("  Loading accurate session (CPU, 1280×1280) …")
+            logger.debug("  Loading accurate session (CPU, 1280×1280) …")
             self._app_accurate = _make(["CPUExecutionProvider"], (1280, 1280))
             _log_providers(self._app_accurate, "accurate")
 
         if mode in (1, 2):      # Performance or Intelligent need the 640 CoreML session
-            logger.info("  Loading fast session (CoreML ANE/GPU + CPU fallback, 640×640) …")
+            logger.debug("  Loading fast session (CoreML ANE/GPU + CPU fallback, 640×640) …")
             try:
                 self._app_fast = _make(
                     ["CoreMLExecutionProvider", "CPUExecutionProvider"], (640, 640)
@@ -230,7 +230,7 @@ class FaceDetector:
         # ── Signal 1: focal length ───────────────────────────────────────────
         focal_mm = self._read_focal_length(image_path, exif_data)
         if focal_mm is not None and focal_mm <= self._WIDE_ANGLE_MM:
-            logger.info(
+            logger.debug(
                 "Intelligent [%s]: wide-angle (%.0f mm ≤ %d mm) → accurate (1280)",
                 image_path.name, focal_mm, self._WIDE_ANGLE_MM,
             )
@@ -239,7 +239,7 @@ class FaceDetector:
         # ── Signal 2: 640 oracle ─────────────────────────────────────────────
         # If CoreML failed to load, skip the oracle and go straight to accurate
         if self._app_fast is None:
-            logger.info("Intelligent [%s]: no fast session — accurate (1280) only", image_path.name)
+            logger.debug("Intelligent [%s]: no fast session — accurate (1280) only", image_path.name)
             return self._run_session(self._app_accurate, img, img_w, img_h, image_path)
 
         fast_results = self._run_session(self._app_fast, img, img_w, img_h, image_path)
@@ -258,13 +258,13 @@ class FaceDetector:
                 reasons.append(f"crowd: {len(fast_results)} faces ≥ {self._ESCALATE_MIN_FACES}")
             if small:
                 reasons.append(f"small faces: min_bbox_w={min_face_w:.3f} < {self._ESCALATE_MIN_FACE_W:.2f}")
-            logger.info(
+            logger.debug(
                 "Intelligent [%s]: escalating → accurate (1280)  [%s]",
                 image_path.name, ", ".join(reasons),
             )
             return self._run_session(self._app_accurate, img, img_w, img_h, image_path)
 
-        logger.info(
+        logger.debug(
             "Intelligent [%s]: fast (640 CoreML) sufficient  "
             "[faces=%d, min_bbox_w=%.3f]",
             image_path.name, len(fast_results), min_face_w,

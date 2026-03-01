@@ -56,8 +56,35 @@ def _patch_insightface_skimage() -> None:
         )
 
 
+# Module-level handler refs so apply_log_level() can adjust them at runtime
+_file_handler: logging.handlers.RotatingFileHandler | None = None
+_console_handler: logging.StreamHandler | None = None
+
+# Mapping: 0=Error, 1=Info, 2=Debug
+_LEVEL_MAP = {0: logging.ERROR, 1: logging.INFO, 2: logging.DEBUG}
+
+
+def apply_log_level(level: int) -> None:
+    """
+    Apply a log-level setting (0=Error, 1=Info, 2=Debug) to both handlers
+    and the root logger.  Safe to call at any time — takes effect immediately.
+    """
+    py_level = _LEVEL_MAP.get(int(level), logging.INFO)
+    root = logging.getLogger()
+    root.setLevel(py_level)
+    if _file_handler:
+        _file_handler.setLevel(py_level)
+    if _console_handler:
+        _console_handler.setLevel(py_level)
+    logging.getLogger(__name__).info(
+        "Log level set to %s", logging.getLevelName(py_level)
+    )
+
+
 def _setup_logging() -> None:
     """Configure rotating file + console logging for the whole application."""
+    global _file_handler, _console_handler
+
     log_dir = Path.home() / "Library" / "Logs" / "VIP"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "vip.log"
@@ -68,21 +95,21 @@ def _setup_logging() -> None:
     )
 
     # Rotating file: 10 MB × 5 backups → max 50 MB on disk
-    fh = logging.handlers.RotatingFileHandler(
+    _file_handler = logging.handlers.RotatingFileHandler(
         log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
     )
-    fh.setFormatter(fmt)
-    fh.setLevel(logging.DEBUG)
+    _file_handler.setFormatter(fmt)
+    _file_handler.setLevel(logging.INFO)  # default Info until DB setting is read
 
-    # Console: INFO and above
-    ch = logging.StreamHandler()
-    ch.setFormatter(fmt)
-    ch.setLevel(logging.INFO)
+    # Console handler
+    _console_handler = logging.StreamHandler()
+    _console_handler.setFormatter(fmt)
+    _console_handler.setLevel(logging.INFO)
 
     root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
-    root.addHandler(fh)
-    root.addHandler(ch)
+    root.setLevel(logging.INFO)
+    root.addHandler(_file_handler)
+    root.addHandler(_console_handler)
 
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)  # quieten access log spam
 
@@ -102,6 +129,9 @@ async def lifespan(app: FastAPI):
     ensure_dirs()
     # Initialise database (creates tables if not exist)
     await init_db()
+    # Apply the persisted log level now that the DB / settings cache is ready
+    from backend.database.settings_store import get as _get_setting
+    apply_log_level(int(_get_setting('log_level')))
     yield
     # Cleanup on shutdown (none required currently)
 

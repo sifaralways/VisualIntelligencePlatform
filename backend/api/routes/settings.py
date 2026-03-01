@@ -28,6 +28,10 @@ async def patch_settings(body: SettingsUpdate):
     if unknown:
         raise HTTPException(status_code=400, detail=f"Unknown setting keys: {unknown}")
     await settings_store.update(body.updates)
+    # Apply log level immediately if it was part of this update
+    if "log_level" in body.updates:
+        from backend.main import apply_log_level
+        apply_log_level(int(body.updates["log_level"]))
     return {"status": "ok", "updated": list(body.updates.keys())}
 
 
