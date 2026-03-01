@@ -64,26 +64,34 @@ def cluster_embeddings(
     matrix = np.stack(vectors).astype(np.float32)
     logger.info("Clustering %d face embeddings...", len(matrix))
 
+    # Embeddings are already L2-normalised (unit sphere).  On unit vectors
+    # euclidean distance is a monotonic transformation of cosine distance:
+    #   euclidean = sqrt(2 * cosine_distance)
+    # so clustering results are identical, but the euclidean code path in
+    # sklearn's HDBSCAN Cython extension avoids a bug in epsilon_search that
+    # triggers a TypeError when metric="cosine" and cluster_selection_epsilon>0.
+    # Rescale epsilon accordingly: eps_euc = sqrt(2 * eps_cos).
+    cos_epsilon = float(get_setting('hdbscan_cluster_epsilon'))
+    euc_epsilon = float(np.sqrt(2.0 * cos_epsilon))
+
     try:
         from sklearn.cluster import HDBSCAN  # sklearn >= 1.3
         clusterer = HDBSCAN(
             min_cluster_size=int(get_setting('hdbscan_min_cluster_size')),
             min_samples=int(get_setting('hdbscan_min_samples')),
-            metric="cosine",
+            metric="euclidean",
             cluster_selection_method="eom",
-            cluster_selection_epsilon=float(get_setting('hdbscan_cluster_epsilon')),
-            copy=True,  # prevents in-place mutation of the distance matrix which
-                        # corrupts the condensed tree and triggers a TypeError in
-                        # epsilon_search / traverse_upwards (sklearn < 1.10 bug)
+            cluster_selection_epsilon=euc_epsilon,
+            copy=True,
         )
     except ImportError:
         import hdbscan
         clusterer = hdbscan.HDBSCAN(
             min_cluster_size=int(get_setting('hdbscan_min_cluster_size')),
             min_samples=int(get_setting('hdbscan_min_samples')),
-            metric="cosine",
+            metric="euclidean",
             cluster_selection_method="eom",
-            cluster_selection_epsilon=float(get_setting('hdbscan_cluster_epsilon')),
+            cluster_selection_epsilon=euc_epsilon,
             copy=True,
         )
 
