@@ -64,6 +64,97 @@ def _ensure_models() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Reprocess entry point (no filesystem scan — works on existing DB photos)
+# ---------------------------------------------------------------------------
+async def run_reprocess() -> None:
+    """
+    Re-evaluate quality signals and auto-merge suggestions for every photo
+    already in the library.  Does NOT re-scan the filesystem, re-detect
+    faces, or disturb cluster / person assignments.
+
+    Steps:
+      1. Re-run blur + closed-eyes detection on each photo thumbnail
+      2. Re-run Phase 3b auto-merge (surface new merge suggestions)
+      3. Rebuild analysis documents so quality flags appear in the UI
+    """
+    logger.info("=== Reprocess start ===")
+    await broadcast("pipeline_start", folder="[library reprocess]")
+    await settings_store.load_cache()
+    _ensure_models()
+
+    # Step 1: quality re-check on stored photo thumbnails
+    await broadcast("phase_start", phase="quality_recheck")
+    async with get_db() as db:
+        media_rows = await db.execute_fetchall(
+            "SELECT id, exposure_time_s FROM media_files WHERE is_stub=0"
+        )
+
+    from backend.ml.quality_checker import score_blur, classify_blur
+
+    updated = 0
+    for row in media_rows:
+        media_id = row["id"]
+        exp_s    = row["exposure_time_s"]
+        thumb    = settings.photo_thumbs_dir / f"{media_id}.jpg"
+        if not thumb.exists():
+            continue
+        try:
+            thumb_arr = np.array(_PILImage.open(thumb).convert("L"))
+            blur_score = score_blur(thumb_arr)
+            is_blurry, long_exp = classify_blur(blur_score, exp_s)
+        except Exception as _e:
+            logger.debug("Quality recheck failed for media %d: %s", media_id, _e)
+            continue
+
+        # Derive has_closed_eyes from existing face_attributes
+        has_closed_eyes = 0
+        try:
+            async with get_db() as db:
+                face_rows = await db.execute_fetchall(
+                    "SELECT face_attributes FROM faces "
+                    "WHERE media_file_id=? AND face_attributes IS NOT NULL",
+                    (media_id,),
+                )
+            for fr in face_rows:
+                attrs = json.loads(fr["face_attributes"])
+                eyes  = attrs.get("EyesOpen")
+                if isinstance(eyes, dict) and eyes.get("Value") is False:
+                    has_closed_eyes = 1
+                    break
+        except Exception:
+            pass
+
+        async with get_db() as db:
+            await db.execute(
+                "UPDATE media_files "
+                "SET blur_score=?, is_blurry=?, long_exposure=?, has_closed_eyes=? "
+                "WHERE id=?",
+                (blur_score, is_blurry, long_exp, has_closed_eyes, media_id),
+            )
+        updated += 1
+
+    logger.info("Quality recheck: %d photos updated", updated)
+    await broadcast("phase_complete", phase="quality_recheck", processed=updated)
+
+    # Notify frontend if any quality issues exist in the library
+    async with get_db() as db:
+        _q = await (await db.execute(
+            "SELECT COUNT(*) AS cnt FROM media_files WHERE is_blurry=1 OR has_closed_eyes=1"
+        )).fetchone()
+    if _q and _q["cnt"] > 0:
+        await broadcast("quality_issues_found", count=_q["cnt"])
+
+    # Step 2: auto-merge check
+    await _phase_auto_merge()
+
+    # Step 3: rebuild analysis docs so new quality info appears
+    await _phase_analyse()
+
+    await broadcast("pipeline_complete", folder="[library reprocess]")
+    logger.info("=== Reprocess complete ===")
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline entry point
 # ---------------------------------------------------------------------------
 async def run_ingest(folder: str) -> None:
