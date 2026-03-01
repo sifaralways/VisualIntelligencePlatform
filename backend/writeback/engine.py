@@ -11,7 +11,6 @@ Flow:
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 
@@ -203,12 +202,9 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
         elif cat == "place":
             places.append(label)
 
-    # Derive EXIF payload from effective document (amendments included)
-    analysis_json: str | None = None
+    # Build hierarchical subjects from effective document labels
     hierarchical_subjects: list[str] | None = None
     if effective_doc:
-        # Compact JSON — minimise EXIF bloat without gzip
-        analysis_json         = json.dumps(effective_doc, ensure_ascii=False, separators=(',', ':'))
         hs = build_hierarchical_subjects(effective_doc.get("Labels", []))
         hierarchical_subjects = hs or None
 
@@ -222,7 +218,6 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
         gps_lat=gps_lat,
         gps_lon=gps_lon,
         vip_id=vip_id,
-        analysis_json=analysis_json,
         hierarchical_subjects=hierarchical_subjects,
     )
 

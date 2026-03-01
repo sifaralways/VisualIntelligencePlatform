@@ -48,7 +48,6 @@ def build_field_map(
     gps_lat: float | None = None,
     gps_lon: float | None = None,
     vip_id: str | None = None,
-    analysis_json: str | None = None,
     hierarchical_subjects: list[str] | None = None,
 ) -> dict[str, Any]:
     """
@@ -63,8 +62,6 @@ def build_field_map(
         places:                Landmark / place names (Taj Mahal, Harbour Bridge …).
         gps_lat/lon:           GPS coordinates to write if not already present.
         vip_id:                Stable app UUID — written to XMP:Identifier for file tracking.
-        analysis_json:         Effective (amendment-merged) analysis document JSON.
-                               Written to XMP-VIP:AnalysisJSON for round-tripping.
         hierarchical_subjects: "Category|Parent|Label" paths for XMP:HierarchicalSubject.
                                Standard Lightroom/Bridge hierarchical keyword format.
 
@@ -77,10 +74,6 @@ def build_field_map(
     # ── Stable app UUID ────────────────────────────────────────────────────
     if vip_id:
         fields["XMP:Identifier"] = vip_id
-
-    # ── Full analysis JSON (round-trippable) ──────────────────────────────
-    if analysis_json:
-        fields["XMP-VIP:AnalysisJSON"] = analysis_json
 
     # ── Person ──────────────────────────────────────────────────────────────
     if person_names:
