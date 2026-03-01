@@ -109,15 +109,46 @@ class FaceDetector:
             app.prepare(ctx_id=0, det_size=det_size)
             return app
 
+        def _log_providers(app: object, label: str) -> None:
+            """
+            Log the ORT execution providers that were *actually* activated for
+            each sub-model in this FaceAnalysis session.
+
+            InsightFace's FaceAnalysis stores its ONNX sub-models (detection,
+            recognition, GenderAge, …) in app.models as a dict of model objects,
+            each of which exposes a .session attribute (an ORT InferenceSession).
+            Calling session.get_providers() returns the providers ORT actually
+            loaded — if CoreML was requested but ORT wasn't built with that EP,
+            it silently falls back to CPU and this will show CPUExecutionProvider.
+            """
+            try:
+                models_dict = getattr(app, 'models', {})
+                for model_name, model_obj in models_dict.items():
+                    session = getattr(model_obj, 'session', None)
+                    if session is None:
+                        # Some model objects wrap the session one level deeper
+                        session = getattr(getattr(model_obj, 'model', None), 'session', None)
+                    if session is not None:
+                        active = session.get_providers()
+                        logger.info("    [%s] %s → ORT providers in use: %s",
+                                    label, model_name, active)
+                    else:
+                        logger.debug("    [%s] %s — could not find ORT session to introspect",
+                                     label, model_name)
+            except Exception as exc:
+                logger.warning("    [%s] provider introspection failed: %s", label, exc)
+
         if mode in (0, 2):      # Accuracy or Intelligent need the 1280 CPU session
             logger.info("  Loading accurate session (CPU, 1280×1280) …")
             self._app_accurate = _make(["CPUExecutionProvider"], (1280, 1280))
+            _log_providers(self._app_accurate, "accurate")
 
         if mode in (1, 2):      # Performance or Intelligent need the 640 CoreML session
             logger.info("  Loading fast session (CoreML ANE/GPU + CPU fallback, 640×640) …")
             self._app_fast = _make(
                 ["CoreMLExecutionProvider", "CPUExecutionProvider"], (640, 640)
             )
+            _log_providers(self._app_fast, "fast")
 
         self._loaded_mode = mode
         mode_names = {0: "Accuracy", 1: "Performance", 2: "Intelligent"}
