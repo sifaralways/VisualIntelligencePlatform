@@ -145,10 +145,21 @@ class FaceDetector:
 
         if mode in (1, 2):      # Performance or Intelligent need the 640 CoreML session
             logger.info("  Loading fast session (CoreML ANE/GPU + CPU fallback, 640×640) …")
-            self._app_fast = _make(
-                ["CoreMLExecutionProvider", "CPUExecutionProvider"], (640, 640)
-            )
-            _log_providers(self._app_fast, "fast")
+            try:
+                self._app_fast = _make(
+                    ["CoreMLExecutionProvider", "CPUExecutionProvider"], (640, 640)
+                )
+                _log_providers(self._app_fast, "fast")
+            except Exception as _fast_err:
+                # CoreML may not be available on this ORT build.  Log clearly and
+                # degrade: Performance mode will fall back to the accurate session;
+                # Intelligent mode will skip the fast oracle and always use accurate.
+                logger.warning(
+                    "  ⚠️  Fast (CoreML) session failed to load — will use accurate "
+                    "session only. Install onnxruntime-silicon for ANE/GPU support. "
+                    "Error: %s", _fast_err
+                )
+                self._app_fast = None
 
         self._loaded_mode = mode
         mode_names = {0: "Accuracy", 1: "Performance", 2: "Intelligent"}
@@ -164,12 +175,10 @@ class FaceDetector:
         """
         mode = int(get_setting('face_detection_mode'))
 
-        if mode == 1 and self._app_fast is None:
-            raise RuntimeError("Fast session not loaded. Call load() first.")
         if mode == 0 and self._app_accurate is None:
             raise RuntimeError("Accurate session not loaded. Call load() first.")
-        if mode == 2 and (self._app_fast is None or self._app_accurate is None):
-            raise RuntimeError("Intelligent mode requires both sessions. Call load() first.")
+        if mode == 1 and self._app_fast is None and self._app_accurate is None:
+            raise RuntimeError("No session loaded. Call load() first.")
 
         try:
             img = np.array(Image.open(image_path).convert("RGB"))
@@ -182,7 +191,9 @@ class FaceDetector:
         if mode == 2:
             return self._detect_intelligent(img, img_w, img_h, image_path)
         elif mode == 1:
-            return self._run_session(self._app_fast, img, img_w, img_h, image_path)
+            # If CoreML failed to load, fall back to accurate session
+            session = self._app_fast if self._app_fast is not None else self._app_accurate
+            return self._run_session(session, img, img_w, img_h, image_path)
         else:
             return self._run_session(self._app_accurate, img, img_w, img_h, image_path)
 
@@ -222,6 +233,11 @@ class FaceDetector:
             return self._run_session(self._app_accurate, img, img_w, img_h, image_path)
 
         # ── Signal 2: 640 oracle ─────────────────────────────────────────────
+        # If CoreML failed to load, skip the oracle and go straight to accurate
+        if self._app_fast is None:
+            logger.debug("Intelligent [%s]: no fast session — accurate pass only", image_path.name)
+            return self._run_session(self._app_accurate, img, img_w, img_h, image_path)
+
         fast_results = self._run_session(self._app_fast, img, img_w, img_h, image_path)
 
         min_face_w = min((f.bbox_w for f in fast_results), default=1.0)
