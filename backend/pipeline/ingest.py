@@ -357,6 +357,7 @@ async def _phase_embed() -> None:
         blur_score: float | None = None
         is_blurry: int | None = None
         long_exposure_flag: int | None = None
+        exp_s: float | None = None  # exposure time read here, reused for face-blur override
         try:
             from backend.ml.quality_checker import score_blur, classify_blur
             preview_arr = np.array(_PILImage.open(preview_path).convert("L"))  # greyscale
@@ -472,6 +473,20 @@ async def _phase_embed() -> None:
             pass
 
         # ── Write quality signals back to media_files ────────────────────────
+        # If any face was detected, use the MAXIMUM face-crop sharpness as the
+        # blur signal instead of the full-image Laplacian.  This avoids false
+        # positives on shallow depth-of-field shots where the subject is sharp
+        # but the background / foreground bokeh drives the global score down.
+        if faces:
+            face_sharpnesses = [
+                f.quality_sharpness for f in faces if f.quality_sharpness is not None
+            ]
+            if face_sharpnesses:
+                best_face_sharpness = max(face_sharpnesses)
+                from backend.ml.quality_checker import classify_blur
+                is_blurry, long_exposure_flag = classify_blur(best_face_sharpness, exp_s)
+                blur_score = round(best_face_sharpness, 2)
+
         async with get_db() as db:
             await db.execute("""
                 UPDATE media_files
@@ -593,9 +608,9 @@ async def _phase_auto_merge() -> None:
 
         clusters = await db.execute_fetchall("""
             SELECT c.id AS cluster_id, c.member_count,
-                   MIN(f.thumbnail_path) AS representative_thumbnail
+                   MIN(f.id) AS representative_face_id
             FROM clusters c
-            JOIN faces f ON f.cluster_id = c.id
+            JOIN faces f ON f.cluster_id = c.id AND f.thumbnail_path IS NOT NULL
             WHERE c.person_id IS NULL
             GROUP BY c.id
         """)
@@ -617,12 +632,24 @@ async def _phase_auto_merge() -> None:
             """, (p["person_id"],))
             if not emb_rows:
                 continue
+            # Representative face thumbnail for the person
+            rep_row = await (await db.execute("""
+                SELECT f.id FROM faces f
+                WHERE f.person_id = ? AND f.thumbnail_path IS NOT NULL
+                LIMIT 1
+            """, (p["person_id"],))).fetchone()
+            rep_face_id = rep_row["id"] if rep_row else None
             vecs = np.stack([np.frombuffer(r["vector"], dtype=np.float32) for r in emb_rows])
             centroid = vecs.mean(axis=0)
             norm = np.linalg.norm(centroid)
             if norm > 0:
                 centroid /= norm
-            person_data.append({"person_id": p["person_id"], "name": p["name"], "centroid": centroid})
+            person_data.append({
+                "person_id": p["person_id"],
+                "name": p["name"],
+                "centroid": centroid,
+                "face_id": rep_face_id,
+            })
 
         # Build cluster centroids
         cluster_data: list[dict] = []
@@ -640,10 +667,10 @@ async def _phase_auto_merge() -> None:
             if norm > 0:
                 centroid /= norm
             cluster_data.append({
-                "cluster_id": c["cluster_id"],
+                "cluster_id":   c["cluster_id"],
                 "member_count": c["member_count"],
-                "thumbnail": c["representative_thumbnail"],
-                "centroid": centroid,
+                "face_id":      c["representative_face_id"],
+                "centroid":     centroid,
             })
 
     auto_merged = 0
@@ -686,12 +713,13 @@ async def _phase_auto_merge() -> None:
                 logger.info("Auto-merged cluster %d → person '%s' (sim=%.3f)", cid, pname, sim)
             elif sim >= _NOTIFY_THRESHOLD:
                 suggestions.append({
-                    "person_id":   pid,
-                    "person_name": pname,
-                    "cluster_id":  cid,
-                    "similarity":  round(sim, 3),
-                    "member_count": c["member_count"],
-                    "thumbnail":   c["thumbnail"],
+                    "person_id":      pid,
+                    "person_name":    pname,
+                    "person_face_id": p["face_id"],
+                    "cluster_id":     cid,
+                    "cluster_face_id": c["face_id"],
+                    "similarity":     round(sim, 3),
+                    "member_count":   c["member_count"],
                 })
 
     if suggestions:

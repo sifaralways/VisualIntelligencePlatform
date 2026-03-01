@@ -220,10 +220,11 @@ export interface QualityIssue {
 export interface MergeSuggestionItem {
   person_id: number
   person_name: string
+  person_face_id: number | null
   cluster_id: number
+  cluster_face_id: number | null
   similarity: number
   member_count: number
-  thumbnail: string | null
 }
 
 export interface WsEvent {

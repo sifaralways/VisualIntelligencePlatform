@@ -252,14 +252,19 @@ export default function App() {
                 <span className="ml-1 text-gray-500">({Math.round(s.similarity * 100)}% match)</span>
               </p>
               <div className="flex items-center gap-3 mb-4">
-                {/* Person thumbnail placeholder */}
-                <div className="w-16 h-16 rounded-xl bg-gray-800 border border-gray-700 flex items-center justify-center overflow-hidden">
-                  <span className="text-gray-500 text-xs text-center leading-tight">{s.person_name}</span>
+                {/* Person face */}
+                <div className="w-16 h-16 rounded-xl bg-gray-800 border border-gray-700 overflow-hidden flex items-center justify-center">
+                  {s.person_face_id ? (
+                    <img src={`/api/faces/${s.person_face_id}/thumbnail`} alt={s.person_name} className="w-full h-full object-cover" onError={e => { (e.target as HTMLImageElement).style.display='none' }} />
+                  ) : (
+                    <span className="text-gray-500 text-xs text-center leading-tight px-1">{s.person_name}</span>
+                  )}
                 </div>
                 <span className="text-gray-500 text-xl">≈</span>
-                <div className="w-16 h-16 rounded-xl bg-gray-800 border border-gray-700 overflow-hidden">
-                  {s.thumbnail ? (
-                    <img src={`/api/faces/${s.cluster_id}/thumbnail`} alt="" className="w-full h-full object-cover" onError={e => { (e.target as HTMLImageElement).style.display='none' }} />
+                {/* Cluster face */}
+                <div className="w-16 h-16 rounded-xl bg-gray-800 border border-gray-700 overflow-hidden flex items-center justify-center">
+                  {s.cluster_face_id ? (
+                    <img src={`/api/faces/${s.cluster_face_id}/thumbnail`} alt="" className="w-full h-full object-cover" onError={e => { (e.target as HTMLImageElement).style.display='none' }} />
                   ) : (
                     <span className="w-full h-full flex items-center justify-center text-gray-600 text-xs">?</span>
                   )}
