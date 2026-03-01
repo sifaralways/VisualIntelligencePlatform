@@ -31,6 +31,18 @@ logger = logging.getLogger(__name__)
 # type is one of "float" | "int".
 
 DEFAULTS: dict[str, dict[str, Any]] = {
+    "face_detection_mode": {
+        "value": 0, "type": "bool", "min": 0, "max": 1, "step": 1,
+        "label": "Face detection mode",
+        "description": (
+            "Accuracy (default): CPU-only, 1280×1280 grid — reliably detects small and distant faces, "
+            "~1.2 s/photo. "
+            "Performance: CoreML ANE/GPU, 640×640 grid — up to 10× faster per photo, "
+            "may miss very small faces in wide group shots. "
+            "Change takes effect on the next scan."
+        ),
+        "group": "Face Detection",
+    },
     "face_detection_threshold": {
         "value": 0.6, "type": "float", "min": 0.3, "max": 0.99, "step": 0.05,
         "label": "Face detection confidence",
@@ -201,6 +213,8 @@ def _cast(key: str, raw: str) -> Any:
     """Cast a raw string value from the DB to the correct Python type."""
     t = DEFAULTS.get(key, {}).get("type", "float")
     try:
-        return int(raw) if t == "int" else float(raw)
+        if t in ("int", "bool"):
+            return int(raw)
+        return float(raw)
     except (ValueError, TypeError):
         return DEFAULTS[key]["value"]

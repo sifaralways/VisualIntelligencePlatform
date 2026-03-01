@@ -59,22 +59,50 @@ class FaceDetector:
 
     def __init__(self) -> None:
         self._app = None
+        self._loaded_mode: int | None = None  # tracks which mode the model was last prepared for
 
     def load(self) -> None:
-        """Load the model. Called once at pipeline start."""
-        import insightface
+        """
+        Load (or re-prepare) the model.
+
+        Called at the start of every pipeline run.  Checks the current
+        face_detection_mode setting:
+          0 = Accuracy   — CPUExecutionProvider, det_size=(1280, 1280)
+          1 = Performance — CoreMLExecutionProvider (ANE/GPU) with CPU fallback,
+                            det_size=(640, 640).
+
+        CoreML note: at det_size > 640 the CoreML EP mishandles the dynamic
+        spatial dims in det_10g.onnx — ORT shape inference yields 12800 anchors
+        but CoreML compiles for 3200, causing a rank mismatch at runtime.  At
+        det_size=(640, 640) the anchor count is 3200 on both sides, so the bug
+        does not occur.
+        """
+        import insightface  # noqa: F401 — registers providers
         from insightface.app import FaceAnalysis
 
-        logger.info("Loading InsightFace Buffalo_L...")
-        # CoreML EP mishandles the det_10g.onnx dynamic spatial dims at det_size >640:
-        # ORT shape inference yields 3200 but CoreML compiles for 1280→12800 → rank mismatch.
-        # CPU provider uses Apple Silicon NEON SIMD and is reliable with any det_size.
+        mode = int(get_setting('face_detection_mode'))  # 0=accuracy, 1=performance
+
+        # Skip re-prepare if already loaded in the same mode
+        if self._app is not None and self._loaded_mode == mode:
+            return
+
+        if mode == 1:
+            providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+            det_size  = (640, 640)
+            mode_label = "Performance (CoreML ANE/GPU, 640×640)"
+        else:
+            providers = ["CPUExecutionProvider"]
+            det_size  = (1280, 1280)
+            mode_label = "Accuracy (CPU, 1280×1280)"
+
+        logger.info("Loading InsightFace Buffalo_L — mode: %s …", mode_label)
         self._app = FaceAnalysis(
             name=settings.insightface_model,
-            providers=["CPUExecutionProvider"],
+            providers=providers,
         )
-        self._app.prepare(ctx_id=0, det_size=(1280, 1280))
-        logger.info("✅  Face detector ready")
+        self._app.prepare(ctx_id=0, det_size=det_size)
+        self._loaded_mode = mode
+        logger.info("✅  Face detector ready (%s)", mode_label)
 
     def detect(self, image_path: Path) -> list[DetectedFace]:
         """

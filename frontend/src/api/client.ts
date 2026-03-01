@@ -484,7 +484,7 @@ export interface AppSetting {
   key: string
   value: number
   default: number
-  type: 'float' | 'int'
+  type: 'float' | 'int' | 'bool'
   min: number
   max: number
   step: number

@@ -352,32 +352,56 @@ export default function AdminPage() {
                           <p className="text-sm font-medium text-gray-200">{s.label}</p>
                           <p className="text-xs text-gray-500 mt-0.5">{s.description}</p>
                         </div>
-                        <div className="shrink-0 flex items-center gap-2">
+                        {s.type === 'bool' ? (
+                          /* ── Toggle for boolean settings ── */
+                          <div className="shrink-0 flex items-center gap-1 bg-gray-800 rounded-lg p-1">
+                            {['Accuracy', 'Performance'].map((opt, i) => (
+                              <button
+                                key={opt}
+                                onClick={() => editSetting(s.key, String(i))}
+                                className={`px-3 py-1 rounded-md text-xs font-medium transition-colors ${
+                                  val(s) === i
+                                    ? 'bg-indigo-600 text-white shadow'
+                                    : 'text-gray-400 hover:text-gray-200'
+                                }`}
+                              >
+                                {opt}
+                              </button>
+                            ))}
+                          </div>
+                        ) : (
+                          /* ── Number input for float/int settings ── */
+                          <div className="shrink-0 flex items-center gap-2">
+                            <input
+                              type="number"
+                              min={s.min}
+                              max={s.max}
+                              step={s.step}
+                              value={val(s)}
+                              onChange={e => editSetting(s.key, e.target.value)}
+                              className="w-24 bg-gray-800 border border-gray-700 text-white text-right text-sm rounded-lg px-2 py-1 focus:outline-none focus:border-indigo-500"
+                            />
+                          </div>
+                        )}
+                      </div>
+                      {s.type !== 'bool' && (
+                        <>
                           <input
-                            type="number"
+                            type="range"
                             min={s.min}
                             max={s.max}
                             step={s.step}
                             value={val(s)}
                             onChange={e => editSetting(s.key, e.target.value)}
-                            className="w-24 bg-gray-800 border border-gray-700 text-white text-right text-sm rounded-lg px-2 py-1 focus:outline-none focus:border-indigo-500"
+                            className="w-full accent-indigo-500"
                           />
-                        </div>
-                      </div>
-                      <input
-                        type="range"
-                        min={s.min}
-                        max={s.max}
-                        step={s.step}
-                        value={val(s)}
-                        onChange={e => editSetting(s.key, e.target.value)}
-                        className="w-full accent-indigo-500"
-                      />
-                      <div className="flex justify-between text-xs text-gray-600 mt-0.5">
-                        <span>{s.min}</span>
-                        <span className="text-gray-500">default: {s.default}</span>
-                        <span>{s.max}</span>
-                      </div>
+                          <div className="flex justify-between text-xs text-gray-600 mt-0.5">
+                            <span>{s.min}</span>
+                            <span className="text-gray-500">default: {s.default}</span>
+                            <span>{s.max}</span>
+                          </div>
+                        </>
+                      )}
                     </div>
                   ))}
                 </div>
