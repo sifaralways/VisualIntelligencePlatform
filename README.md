@@ -29,6 +29,80 @@ A free, local-first, Apple Silicon-only photo intelligence tool for large RAW ph
 
 ---
 
+## End-to-End Flow
+
+```mermaid
+flowchart TD
+    USER([👤 User])
+
+    subgraph FE["Frontend (React + Vite)"]
+        UI_ADMIN["Admin Page\n(set folder path, mode, settings)"]
+        UI_GALLERY["Gallery / People / Map views"]
+        WS["WebSocket listener\n(/ws/progress)"]
+    end
+
+    subgraph API["FastAPI Backend"]
+        RT_SCAN["POST /api/admin/scan"]
+        RT_MEDIA["GET /api/media/*"]
+        RT_PEOPLE["GET /api/people/*"]
+        WS_SRV["WebSocket /ws/progress\n(broadcast phase progress)"]
+    end
+
+    subgraph PIPELINE["Ingest Pipeline (ingest.py)"]
+        P1["Phase 1 — Scan\nWalk folder, hash, extract EXIF\nWrite media rows to DB"]
+        P2["Phase 2 — Face Detection + Embedding\nExtract JPEG preview\nDetect faces (Intelligent mode)\nEmbed via ArcFace Buffalo_L\nStore face crops + 512-D vectors"]
+        P3["Phase 3 — Cluster\nHDBSCAN on all embeddings\nCoherence filter (intra_sim ≥ 0.85)\nBuild person clusters in DB"]
+        P3B["Phase 3b — Auto-name\nHigh-conf merge (≥ 0.98 sim)\nBorderline suggestions (≥ 0.63)"]
+        P3C["Phase 3c — VIP History restore\nRe-attach named persons across scans"]
+        P4["Phase 4 — Tag\nYOLO (objects/animals) · MPS\nPlaces365 ResNet (scene) · MPS\nOpenCLIP (landmarks) · MPS\nBioCLIP (species) · MPS\nGPS → Nominatim geocode"]
+        P5["Phase 5 — Analysis documents\nBuild Rekognition-format JSON\nper photo (faces + tags + geo)"]
+    end
+
+    subgraph ML["ML Layer"]
+        FD["FaceDetector\nAccuracy: CPU 1280×1280\nPerformance: CoreML 640×640\nIntelligent: focal-length signal\n+ oracle escalation"]
+        CL["Clusterer\nHDBSCAN euclidean + coherence filter"]
+        FAISS["FAISS index\n(512-D ArcFace vectors)"]
+        TAG["Tagger\nYOLO · Places365 · OpenCLIP · BioCLIP · GeoResolver"]
+    end
+
+    subgraph DB["Storage"]
+        SQLITE[("SQLite · vip.db")]
+        THUMBS[("Thumbnails & face crops")]
+    end
+
+    USER -->|"configure & trigger scan"| UI_ADMIN
+    UI_ADMIN -->|"POST"| RT_SCAN
+    RT_SCAN -->|"spawn background task"| P1
+
+    P1 -->|"media rows"| SQLITE
+    P1 --> P2
+    P2 --> FD
+    FD -->|"embeddings"| SQLITE
+    FD --> THUMBS
+    P2 --> P3
+    P3 --> CL
+    CL --> FAISS
+    CL -->|"person clusters"| SQLITE
+    P3 --> P3B --> P3C --> P4
+    P4 --> TAG
+    TAG -->|"tags, labels, GPS"| SQLITE
+    P4 --> P5
+    P5 -->|"analysis JSON"| SQLITE
+
+    PIPELINE -->|"phase events"| WS_SRV
+    WS_SRV -->|"live progress"| WS
+    WS --> UI_GALLERY
+
+    USER -->|"browse photos / people / map"| UI_GALLERY
+    UI_GALLERY -->|"REST queries"| RT_MEDIA
+    UI_GALLERY -->|"REST queries"| RT_PEOPLE
+    RT_MEDIA --> SQLITE
+    RT_PEOPLE --> SQLITE
+    RT_PEOPLE --> FAISS
+```
+
+---
+
 ## ML Models Used
 
 | Model | Purpose | Backend |
