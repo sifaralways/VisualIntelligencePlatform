@@ -61,7 +61,11 @@ def cluster_embeddings(
         logger.info("No embeddings to cluster")
         return []
 
-    matrix = np.stack(vectors).astype(np.float32)
+    # C-contiguous float64 is what sklearn HDBSCAN's Cython extension expects
+    # internally.  Passing float32 causes sklearn to produce a non-contiguous
+    # view during internal conversion, which corrupts the condensed tree and
+    # triggers TypeError in traverse_upwards even when copy=True is set.
+    matrix = np.ascontiguousarray(np.stack(vectors), dtype=np.float64)
     logger.info("Clustering %d face embeddings...", len(matrix))
 
     # Embeddings are already L2-normalised (unit sphere).  On unit vectors
