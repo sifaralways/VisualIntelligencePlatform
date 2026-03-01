@@ -251,11 +251,16 @@ class FaceDetector:
         )
 
         if should_escalate:
+            crowd   = len(fast_results) >= self._ESCALATE_MIN_FACES
+            small   = min_face_w < self._ESCALATE_MIN_FACE_W
+            reasons = []
+            if crowd:
+                reasons.append(f"crowd: {len(fast_results)} faces ≥ {self._ESCALATE_MIN_FACES}")
+            if small:
+                reasons.append(f"small faces: min_bbox_w={min_face_w:.3f} < {self._ESCALATE_MIN_FACE_W:.2f}")
             logger.info(
-                "Intelligent [%s]: escalating → accurate (1280)  "
-                "[faces=%d ≥ %d OR min_bbox_w=%.3f < %.2f]",
-                image_path.name, len(fast_results), self._ESCALATE_MIN_FACES,
-                min_face_w, self._ESCALATE_MIN_FACE_W,
+                "Intelligent [%s]: escalating → accurate (1280)  [%s]",
+                image_path.name, ", ".join(reasons),
             )
             return self._run_session(self._app_accurate, img, img_w, img_h, image_path)
 
