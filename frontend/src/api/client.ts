@@ -296,6 +296,8 @@ export interface Person {
   merge_sources_count: number
   is_merged: boolean
   representative_thumbnail: string | null
+  /** 1 if the person's name has been written to at least one photo file via ExifTool; 0 otherwise. */
+  name_written: number
 }
 
 export interface MergeSuggestion {

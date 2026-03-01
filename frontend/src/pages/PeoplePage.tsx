@@ -346,7 +346,14 @@ export default function PeoplePage({ onSelectPerson }: Props) {
                       ⋯
                     </button>
                   </div>
-                  <span className="text-xs text-center text-gray-200 truncate max-w-full px-1">{p.name}</span>
+                  <span className="text-xs text-center truncate max-w-full px-1 flex items-center gap-1 justify-center">
+                    {/* Green = name written to file; Red = DB only, not yet written */}
+                    <span
+                      title={p.name_written ? 'Name written to photo file' : 'Name saved in database only (not yet written to file)'}
+                      className={`inline-block w-1.5 h-1.5 rounded-full flex-shrink-0 ${p.name_written ? 'bg-green-400' : 'bg-red-400'}`}
+                    />
+                    <span className="text-gray-200">{p.name}</span>
+                  </span>
                   <span className="text-xs text-gray-500">{p.photo_count} photo{p.photo_count !== 1 ? 's' : ''}</span>
                   {p.merge_sources_count > 0 && (
                     <span className="text-xs text-indigo-500">⇐ {p.merge_sources_count} merged</span>

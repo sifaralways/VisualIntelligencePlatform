@@ -357,6 +357,29 @@ async def _phase_embed() -> None:
                 )
             continue
 
+        # ── Skip re-embedding if face embeddings already exist (re-scan case) ──
+        # When a file is removed then re-added, its ingest_state is reset to
+        # 'scanned' (see hasher.py / ingest.py UPDATE path), but the old face
+        # rows — with their cluster_id / person_id intact — still exist in the
+        # DB.  Re-running detection would INSERT duplicate face rows and then
+        # the cluster phase would create duplicate persons.  Instead, just
+        # advance ingest_state and leave the existing faces untouched.
+        async with get_db() as db:
+            _emb_check = await db.execute_fetchall(
+                """SELECT 1 FROM faces f
+                   JOIN embeddings e ON e.face_id = f.id
+                   WHERE f.media_file_id = ?
+                   LIMIT 1""",
+                (media_id,),
+            )
+        if _emb_check:
+            async with get_db() as db:
+                await db.execute(
+                    "UPDATE media_files SET ingest_state='embedded' WHERE id=?", (media_id,)
+                )
+            processed += 1
+            continue
+
         # ── Blur detection on full preview (must happen before thumbnail resize) ──
         blur_score: float | None = None
         is_blurry: int | None = None

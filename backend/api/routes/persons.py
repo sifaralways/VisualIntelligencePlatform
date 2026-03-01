@@ -38,7 +38,12 @@ async def list_persons():
                    (SELECT COUNT(*) FROM persons p2
                     WHERE p2.merged_into_id = p.id
                       AND p2.is_merged = 1)                   AS merge_sources_count,
-                   MIN(f.thumbnail_path)                      AS representative_thumbnail
+                   MIN(f.thumbnail_path)                      AS representative_thumbnail,
+                   CASE WHEN p.name IS NOT NULL AND EXISTS (
+                       SELECT 1 FROM writeback_queue wq
+                       JOIN faces f2 ON f2.media_file_id = wq.media_file_id
+                       WHERE f2.person_id = p.id AND wq.status = 'done'
+                   ) THEN 1 ELSE 0 END                        AS name_written
             FROM persons p
             LEFT JOIN faces f ON f.person_id = p.id
             WHERE p.is_merged = 0
