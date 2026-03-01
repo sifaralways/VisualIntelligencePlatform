@@ -61,6 +61,10 @@ class ExifToolWriter:
         else:
             cmd.append("-overwrite_original")
 
+        # Preserve filesystem modification timestamp — do not let ExifTool
+        # change the file's mtime when writing metadata.
+        cmd.append("-preserve")
+
         # Build tag arguments.
         # IMPORTANT: clear each tag first (e.g. -TAG=) before setting new values
         # so that repeated writeback runs never accumulate duplicates.
