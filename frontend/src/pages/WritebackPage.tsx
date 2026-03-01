@@ -83,7 +83,9 @@ export default function WritebackPage() {
                 {Object.entries(item.fields).map(([tag, values]) => (
                   <div key={tag} className="text-xs">
                     <span className="text-indigo-400">{tag}</span>
-                    <span className="text-gray-300 ml-2">{values.join(', ')}</span>
+                    <span className="text-gray-300 ml-2">
+                      {Array.isArray(values) ? values.join(', ') : String(values)}
+                    </span>
                   </div>
                 ))}
               </div>

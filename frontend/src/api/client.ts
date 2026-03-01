@@ -327,7 +327,7 @@ export interface WritebackItem {
   queue_id: number
   media_file_id: number
   file_path: string
-  fields: Record<string, string[]>
+  fields: Record<string, string | number | string[]>
 }
 
 export type TagCategory = 'object' | 'animal' | 'geography' | 'place'
