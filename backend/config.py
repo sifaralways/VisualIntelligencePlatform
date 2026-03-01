@@ -128,8 +128,8 @@ class Settings(BaseSettings):
     # ExifTool
     # -------------------------------------------------------------------------
     exiftool_timeout_sec: int = 30
-    # Generate _original backup on first write to a file. User can purge later.
-    exiftool_write_backup: bool = True
+    # Write metadata in-place. Set to True to keep _original backup files.
+    exiftool_write_backup: bool = False
 
     # -------------------------------------------------------------------------
     # Thermal management — sleep between batches if Mac is running hot

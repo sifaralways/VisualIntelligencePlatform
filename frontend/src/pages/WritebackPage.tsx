@@ -101,7 +101,7 @@ export default function WritebackPage() {
           </button>
 
           <p className="mt-3 text-xs text-gray-500">
-            ExifTool will create .CR3_original backups automatically (first write only).
+            Metadata is written directly into the original files in-place.
           </p>
         </>
       )}
