@@ -126,6 +126,19 @@ class ExifToolReader:
         return results
 
 
+def _parse_float(value: Any) -> float | None:
+    """
+    Safely coerce a value from ExifTool to a Python float.
+    Returns None if the value cannot be parsed.
+    """
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return None
+
+
 def _parse_exposure_time(value: Any) -> float | None:
     """
     Convert ExifTool's ExposureTime to a float (seconds).
@@ -168,8 +181,8 @@ def _normalise(raw: dict[str, Any]) -> dict[str, Any]:
         "camera_make":     _get("Make"),
         "camera_model":    _get("Model"),
         "date_taken":      _get("DateTimeOriginal", "CreateDate", "ModifyDate"),
-        "gps_lat":         _get("GPSLatitude"),
-        "gps_lon":         _get("GPSLongitude"),
+        "gps_lat":         _parse_float(_get("GPSLatitude")),
+        "gps_lon":         _parse_float(_get("GPSLongitude")),
         "width":           _get("ImageWidth", "ExifImageWidth"),
         "height":          _get("ImageHeight", "ExifImageHeight"),
         # Shutter speed in seconds (e.g. 0.005 for 1/200 s, 2.0 for 2 s).

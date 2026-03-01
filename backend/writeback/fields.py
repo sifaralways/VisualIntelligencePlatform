@@ -109,6 +109,12 @@ def build_field_map(
 
     # ── GPS ─────────────────────────────────────────────────────────────────
     if gps_lat is not None and gps_lon is not None:
+        try:
+            gps_lat = float(gps_lat)
+            gps_lon = float(gps_lon)
+        except (ValueError, TypeError):
+            gps_lat = gps_lon = None
+    if gps_lat is not None and gps_lon is not None:
         fields["EXIF:GPSLatitude"] = abs(gps_lat)
         fields["EXIF:GPSLatitudeRef"] = "N" if gps_lat >= 0 else "S"
         fields["EXIF:GPSLongitude"] = abs(gps_lon)
