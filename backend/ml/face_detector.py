@@ -181,7 +181,9 @@ class FaceDetector:
             raise RuntimeError("No session loaded. Call load() first.")
 
         try:
-            img = np.array(Image.open(image_path).convert("RGB"))
+            pil_img = Image.open(image_path)
+            exif_data = pil_img._getexif() if hasattr(pil_img, '_getexif') else None  # type: ignore[attr-defined]
+            img = np.array(pil_img.convert("RGB"))
         except Exception as e:
             logger.warning("Cannot open image %s: %s", image_path, e)
             return []
@@ -189,13 +191,14 @@ class FaceDetector:
         img_h, img_w = img.shape[:2]
 
         if mode == 2:
-            return self._detect_intelligent(img, img_w, img_h, image_path)
+            return self._detect_intelligent(img, img_w, img_h, image_path, exif_data)
         elif mode == 1:
             # If CoreML failed to load, fall back to accurate session
             session = self._app_fast if self._app_fast is not None else self._app_accurate
             return self._run_session(session, img, img_w, img_h, image_path)
         else:
             return self._run_session(self._app_accurate, img, img_w, img_h, image_path)
+
 
     # ── Intelligent mode ────────────────────────────────────────────────────
 
@@ -205,6 +208,7 @@ class FaceDetector:
         img_w: int,
         img_h: int,
         image_path: Path,
+        exif_data: dict | None = None,
     ) -> list[DetectedFace]:
         """
         Two-signal adaptive detection.
@@ -224,10 +228,10 @@ class FaceDetector:
             640 result — no merging/deduplication needed).
         """
         # ── Signal 1: focal length ───────────────────────────────────────────
-        focal_mm = self._read_focal_length(image_path)
+        focal_mm = self._read_focal_length(image_path, exif_data)
         if focal_mm is not None and focal_mm <= self._WIDE_ANGLE_MM:
-            logger.debug(
-                "Intelligent [%s]: wide-angle (%.0f mm ≤ %d mm) — accurate pass",
+            logger.info(
+                "Intelligent [%s]: wide-angle (%.0f mm ≤ %d mm) → accurate (1280)",
                 image_path.name, focal_mm, self._WIDE_ANGLE_MM,
             )
             return self._run_session(self._app_accurate, img, img_w, img_h, image_path)
@@ -235,7 +239,7 @@ class FaceDetector:
         # ── Signal 2: 640 oracle ─────────────────────────────────────────────
         # If CoreML failed to load, skip the oracle and go straight to accurate
         if self._app_fast is None:
-            logger.debug("Intelligent [%s]: no fast session — accurate pass only", image_path.name)
+            logger.info("Intelligent [%s]: no fast session — accurate (1280) only", image_path.name)
             return self._run_session(self._app_accurate, img, img_w, img_h, image_path)
 
         fast_results = self._run_session(self._app_fast, img, img_w, img_h, image_path)
@@ -247,19 +251,26 @@ class FaceDetector:
         )
 
         if should_escalate:
-            logger.debug(
-                "Intelligent [%s]: escalating (faces=%d, min_bbox_w=%.3f) → accurate pass",
-                image_path.name, len(fast_results), min_face_w,
+            logger.info(
+                "Intelligent [%s]: escalating → accurate (1280)  "
+                "[faces=%d ≥ %d OR min_bbox_w=%.3f < %.2f]",
+                image_path.name, len(fast_results), self._ESCALATE_MIN_FACES,
+                min_face_w, self._ESCALATE_MIN_FACE_W,
             )
             return self._run_session(self._app_accurate, img, img_w, img_h, image_path)
 
-        logger.debug(
-            "Intelligent [%s]: fast pass sufficient (faces=%d, min_bbox_w=%.3f)",
+        logger.info(
+            "Intelligent [%s]: fast (640 CoreML) sufficient  "
+            "[faces=%d, min_bbox_w=%.3f]",
             image_path.name, len(fast_results), min_face_w,
         )
         return fast_results
 
-    def _read_focal_length(self, image_path: Path) -> float | None:
+    def _read_focal_length(
+        self,
+        image_path: Path,
+        exif_data: dict | None = None,
+    ) -> float | None:
         """
         Read the FocalLength EXIF tag (35mm-equivalent) from a JPEG.
 
@@ -268,21 +279,26 @@ class FaceDetector:
         normalises for crop factor, making wide-angle classification consistent
         across full-frame and APS-C cameras.
 
+        Accepts a pre-loaded ``exif_data`` dict (from the same PIL open used to
+        decode the image) to avoid opening the file a second time.  Falls back
+        to opening the file independently if no dict is supplied.
+
         Returns None on any failure (missing tag, non-JPEG, corrupt EXIF).
         """
         try:
-            with Image.open(image_path) as pil_img:
-                exif_data = pil_img._getexif()  # type: ignore[attr-defined]
-                if not exif_data:
-                    return None
-                # Prefer 35mm-equivalent (tag 41989) for crop-factor normalisation
-                fl_35 = exif_data.get(41989)
-                if fl_35 is not None:
-                    return float(fl_35)
-                # Fall back to actual focal length (tag 37386)
-                fl = exif_data.get(37386)
-                if fl is not None:
-                    return float(fl)
+            if exif_data is None:
+                with Image.open(image_path) as pil_img:
+                    exif_data = pil_img._getexif()  # type: ignore[attr-defined]
+            if not exif_data:
+                return None
+            # Prefer 35mm-equivalent (tag 41989) for crop-factor normalisation
+            fl_35 = exif_data.get(41989)
+            if fl_35 is not None:
+                return float(fl_35)
+            # Fall back to actual focal length (tag 37386)
+            fl = exif_data.get(37386)
+            if fl is not None:
+                return float(fl)
         except Exception:
             pass
         return None
