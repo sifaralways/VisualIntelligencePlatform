@@ -639,10 +639,14 @@ async def _phase_cluster() -> None:
                     "UPDATE faces SET cluster_id=? WHERE id=?", (cluster_id, face_id)
                 )
 
-            # Update media_files state
+            # Advance media_files state to 'clustered' — but never demote a
+            # file that has already been tagged.  Without this guard, re-clustering
+            # across all folders resets previously-tagged files back to 'clustered',
+            # causing Phase 4 to re-tag them on every subsequent scan.
             await db.execute("""
                 UPDATE media_files SET ingest_state='clustered'
                 WHERE id IN (SELECT media_file_id FROM faces WHERE cluster_id=?)
+                  AND ingest_state NOT IN ('tagged')
             """, (cluster_id,))
 
     # Rebuild FAISS index
