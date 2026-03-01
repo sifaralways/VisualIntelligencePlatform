@@ -21,6 +21,8 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ folder, force_reprocess: forceReprocess }),
       }),
+    rescan: () =>
+      request<{ status: string; folder: string }>('/pipeline/rescan', { method: 'POST' }),
     status: () => request<{ status: string; folder: string | null; error: string | null }>('/pipeline/status'),
   },
 
@@ -211,6 +213,36 @@ export interface QualityIssue {
   width: number | null
   height: number | null
   thumbnail_url: string | null
+}
+
+// ─── WebSocket notification payloads (emitted by backend pipeline events) ─────
+
+export interface MergeSuggestionItem {
+  person_id: number
+  person_name: string
+  cluster_id: number
+  similarity: number
+  member_count: number
+  thumbnail: string | null
+}
+
+export interface WsEvent {
+  event: string
+  // merge_suggestions
+  suggestions?: MergeSuggestionItem[]
+  // quality_issues_found
+  count?: number
+  // generic progress fields
+  phase?: string
+  done?: number
+  total?: number
+  processed?: number
+  clusters?: number
+  scanned?: number
+  skipped?: number
+  merged?: number
+  message?: string
+  folder?: string
 }
 
 export interface Cluster {

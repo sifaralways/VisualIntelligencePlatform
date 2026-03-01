@@ -4,23 +4,12 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api/client'
-
-interface ProgressEvent {
-  event: string
-  done?: number
-  total?: number
-  phase?: string
-  scanned?: number
-  skipped?: number
-  processed?: number
-  clusters?: number
-  message?: string
-}
+import type { WsEvent } from '../api/client'
 
 export default function PipelinePage() {
   const [folder, setFolder] = useState('')
   const [status, setStatus] = useState<string>('idle')
-  const [events, setEvents] = useState<ProgressEvent[]>([])
+  const [events, setEvents] = useState<WsEvent[]>([])
   const wsRef = useRef<WebSocket | null>(null)
   const logRef = useRef<HTMLDivElement>(null)
 
@@ -30,11 +19,13 @@ export default function PipelinePage() {
     wsRef.current = ws
     ws.onmessage = (msg) => {
       try {
-        const ev: ProgressEvent = JSON.parse(msg.data)
+        const ev: WsEvent = JSON.parse(msg.data)
         if (ev.event !== 'ping') {
           setEvents(prev => [...prev.slice(-200), ev])
           if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight
         }
+        if (ev.event === 'pipeline_complete') setStatus('idle')
+        if (ev.event === 'pipeline_start')    setStatus('running')
       } catch {}
     }
     return () => ws.close()
@@ -48,6 +39,17 @@ export default function PipelinePage() {
       await api.pipeline.scan(folder.trim())
     } catch (e) {
       setStatus('error')
+    }
+  }
+
+  async function rescanAll() {
+    setEvents([])
+    setStatus('running')
+    try {
+      await api.pipeline.rescan()
+    } catch (e: any) {
+      setStatus('error')
+      setEvents([{ event: 'error', message: e.message ?? 'Rescan failed' }])
     }
   }
 
@@ -86,6 +88,21 @@ export default function PipelinePage() {
         </div>
       </div>
 
+      {/* Rescan all existing library photos */}
+      <div className="mb-4 p-3 bg-gray-900 border border-gray-800 rounded-lg flex items-center justify-between gap-4">
+        <div>
+          <p className="text-sm text-gray-200 font-medium">Rescan Entire Library</p>
+          <p className="text-xs text-gray-500">Re-runs all pipeline phases on every photo already in the library (quality, faces, tags).</p>
+        </div>
+        <button
+          onClick={rescanAll}
+          disabled={status === 'running'}
+          className="shrink-0 bg-yellow-700 hover:bg-yellow-600 disabled:opacity-40 text-white rounded-lg px-4 py-2 text-sm font-medium"
+        >
+          Rescan All
+        </button>
+      </div>
+
       {/* Status badge */}
       <div className="mb-4 flex items-center gap-2">
         <span className="text-sm text-gray-400">Status:</span>
@@ -110,14 +127,16 @@ export default function PipelinePage() {
         {events.map((ev, i) => (
           <div key={i} className="leading-relaxed">
             <span className="text-indigo-400 mr-2">[{ev.event}]</span>
-            {ev.phase && <span className="mr-2">phase={ev.phase}</span>}
+            {ev.phase    && <span className="mr-2">phase={ev.phase}</span>}
             {ev.done != null && ev.total != null && (
               <span className="mr-2">{ev.done}/{ev.total}</span>
             )}
-            {ev.scanned != null && <span className="mr-2">scanned={ev.scanned}</span>}
-            {ev.skipped != null && <span className="mr-2">skipped={ev.skipped}</span>}
+            {ev.scanned  != null && <span className="mr-2">scanned={ev.scanned}</span>}
+            {ev.skipped  != null && <span className="mr-2">skipped={ev.skipped}</span>}
             {ev.clusters != null && <span className="mr-2">clusters={ev.clusters}</span>}
-            {ev.message && <span className="text-yellow-400">{ev.message}</span>}
+            {ev.merged   != null && <span className="mr-2 text-green-400">auto-merged={ev.merged}</span>}
+            {ev.count    != null && <span className="mr-2 text-orange-400">quality-issues={ev.count}</span>}
+            {ev.message  && <span className="text-yellow-400">{ev.message}</span>}
           </div>
         ))}
       </div>

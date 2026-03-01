@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import LibraryPage from './pages/LibraryPage'
 import PeoplePage from './pages/PeoplePage'
 import DiscoverPage from './pages/DiscoverPage'
@@ -8,7 +8,8 @@ import PipelinePage from './pages/PipelinePage'
 import AdminPage from './pages/AdminPage'
 import QualityPage from './pages/QualityPage'
 import PhotoGrid from './components/PhotoGrid'
-import type { MediaFilter } from './api/client'
+import { api } from './api/client'
+import type { MediaFilter, WsEvent, MergeSuggestionItem } from './api/client'
 import './index.css'
 
 // ---------------------------------------------------------------------------
@@ -30,6 +31,57 @@ interface FilteredView {
 export default function App() {
   const [section, setSection]       = useState<SidebarSection>('library')
   const [filtered, setFiltered]     = useState<FilteredView | null>(null)
+
+  // ── Global pipeline notifications ─────────────────────────────────────────
+  const wsRef = useRef<WebSocket | null>(null)
+  const [qualityCount,     setQualityCount]     = useState<number | null>(null)
+  const [mergeSuggestions, setMergeSuggestions] = useState<MergeSuggestionItem[]>([])
+  const [mergeWorking,     setMergeWorking]     = useState(false)
+
+  useEffect(() => {
+    function connect() {
+      const ws = new WebSocket('ws://localhost:7474/ws/progress')
+      wsRef.current = ws
+      ws.onmessage = (msg) => {
+        try {
+          const ev: WsEvent = JSON.parse(msg.data)
+          if (ev.event === 'merge_suggestions' && ev.suggestions?.length) {
+            setMergeSuggestions(prev => {
+              // Append only new ones (by cluster_id)
+              const existingIds = new Set(prev.map(s => s.cluster_id))
+              const fresh = ev.suggestions!.filter(s => !existingIds.has(s.cluster_id))
+              return [...prev, ...fresh]
+            })
+          }
+          if (ev.event === 'quality_issues_found' && ev.count) {
+            setQualityCount(ev.count)
+          }
+        } catch {}
+      }
+      ws.onclose = () => {
+        // Auto-reconnect after 3 s
+        setTimeout(connect, 3000)
+      }
+    }
+    connect()
+    return () => wsRef.current?.close()
+  }, [])
+
+  // Handle merge suggestion: accept (merge) or skip
+  const handleMergeAction = useCallback(async (action: 'merge' | 'skip') => {
+    const top = mergeSuggestions[0]
+    if (!top) return
+    setMergeWorking(true)
+    try {
+      if (action === 'merge') {
+        await api.persons.addCluster(top.person_id, top.cluster_id)
+      } else {
+        await api.persons.rejectSuggestion(top.person_id, top.cluster_id)
+      }
+    } catch { /* ignore */ }
+    setMergeWorking(false)
+    setMergeSuggestions(prev => prev.slice(1))
+  }, [mergeSuggestions])
 
   /** Navigate to a filtered photo grid (e.g. photos of Alice, photos of dogs) */
   function openFiltered(filter: MediaFilter, title: string, backTo: SidebarSection) {
@@ -160,6 +212,81 @@ export default function App() {
         <main className="flex-1 overflow-y-auto p-6">
           {mainContent}
         </main>
+      </div>
+
+      {/* ── Global notification stack (bottom-right) ── */}
+      <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-3 max-w-sm w-full pointer-events-none">
+
+        {/* Quality issues banner */}
+        {qualityCount !== null && qualityCount > 0 && (
+          <div className="pointer-events-auto bg-orange-950 border border-orange-700 rounded-xl px-4 py-3 shadow-2xl flex items-center gap-3">
+            <span className="text-orange-400 text-lg">🔍</span>
+            <div className="flex-1 min-w-0">
+              <p className="text-white text-sm font-medium">Quality issues found</p>
+              <p className="text-orange-300 text-xs">{qualityCount} photo{qualityCount > 1 ? 's' : ''} may be blurry or have closed eyes</p>
+            </div>
+            <button
+              onClick={() => { navigate('quality'); setQualityCount(null) }}
+              className="text-xs bg-orange-700 hover:bg-orange-600 text-white rounded-lg px-3 py-1.5 font-medium whitespace-nowrap"
+            >
+              Review
+            </button>
+            <button
+              onClick={() => setQualityCount(null)}
+              className="text-gray-400 hover:text-white text-lg leading-none px-1"
+            >
+              ×
+            </button>
+          </div>
+        )}
+
+        {/* Merge suggestion card */}
+        {mergeSuggestions.length > 0 && (() => {
+          const s = mergeSuggestions[0]
+          return (
+            <div className="pointer-events-auto bg-gray-900 border border-indigo-700 rounded-xl p-4 shadow-2xl">
+              <p className="text-white text-sm font-semibold mb-1">Same person?</p>
+              <p className="text-gray-400 text-xs mb-3">
+                This cluster ({s.member_count} photo{s.member_count > 1 ? 's' : ''}) looks like{' '}
+                <span className="text-indigo-300 font-medium">{s.person_name}</span>
+                <span className="ml-1 text-gray-500">({Math.round(s.similarity * 100)}% match)</span>
+              </p>
+              <div className="flex items-center gap-3 mb-4">
+                {/* Person thumbnail placeholder */}
+                <div className="w-16 h-16 rounded-xl bg-gray-800 border border-gray-700 flex items-center justify-center overflow-hidden">
+                  <span className="text-gray-500 text-xs text-center leading-tight">{s.person_name}</span>
+                </div>
+                <span className="text-gray-500 text-xl">≈</span>
+                <div className="w-16 h-16 rounded-xl bg-gray-800 border border-gray-700 overflow-hidden">
+                  {s.thumbnail ? (
+                    <img src={`/api/faces/${s.cluster_id}/thumbnail`} alt="" className="w-full h-full object-cover" onError={e => { (e.target as HTMLImageElement).style.display='none' }} />
+                  ) : (
+                    <span className="w-full h-full flex items-center justify-center text-gray-600 text-xs">?</span>
+                  )}
+                </div>
+              </div>
+              {mergeSuggestions.length > 1 && (
+                <p className="text-gray-600 text-[10px] mb-2">+{mergeSuggestions.length - 1} more suggestion{mergeSuggestions.length > 2 ? 's' : ''}</p>
+              )}
+              <div className="flex gap-2">
+                <button
+                  onClick={() => handleMergeAction('merge')}
+                  disabled={mergeWorking}
+                  className="flex-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white text-sm font-medium rounded-lg py-2"
+                >
+                  Merge
+                </button>
+                <button
+                  onClick={() => handleMergeAction('skip')}
+                  disabled={mergeWorking}
+                  className="flex-1 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-gray-200 text-sm font-medium rounded-lg py-2"
+                >
+                  Different person
+                </button>
+              </div>
+            </div>
+          )
+        })()}
       </div>
     </div>
   )

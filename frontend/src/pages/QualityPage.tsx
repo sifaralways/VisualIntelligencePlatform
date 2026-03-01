@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
-import { api, QualityIssue } from '../api/client'
+import { api } from '../api/client'
+import type { QualityIssue } from '../api/client'
 
 type IssueFilter = 'all' | 'blurry' | 'closed_eyes'
 

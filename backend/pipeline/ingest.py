@@ -88,8 +88,21 @@ async def run_ingest(folder: str) -> None:
     # -- Phase 2: Extract previews + detect + embed -------------------------
     await _phase_embed()
 
+    # Notify the frontend if quality issues were found during embed
+    async with get_db() as db:
+        _q = await (await db.execute("""
+            SELECT COUNT(*) AS cnt FROM media_files
+            WHERE is_blurry = 1 OR has_closed_eyes = 1
+        """)).fetchone()
+    _quality_count = _q["cnt"] if _q else 0
+    if _quality_count > 0:
+        await broadcast("quality_issues_found", count=_quality_count)
+
     # -- Phase 3: Cluster ---------------------------------------------------
     await _phase_cluster()
+
+    # -- Phase 3b: Auto-merge high-conf + surface borderline suggestions ----
+    await _phase_auto_merge()
 
     # -- Phase 4: Tag (objects, animals, geography, places) -----------------
     await _phase_tag()
@@ -462,6 +475,144 @@ async def _phase_cluster() -> None:
 
     await broadcast("phase_complete", phase="cluster", clusters=len(results))
     logger.info("Phase 3 complete: %d clusters", len(results))
+
+
+# ---------------------------------------------------------------------------
+# Phase 3b: Auto-merge (high confidence) + notify borderline suggestions
+# ---------------------------------------------------------------------------
+
+_AUTO_MERGE_THRESHOLD = 0.82   # cosine sim → merge automatically (very confident)
+_NOTIFY_THRESHOLD     = 0.63   # cosine sim → notify user for manual review
+
+async def _phase_auto_merge() -> None:
+    """Compare named-person centroids to unnamed clusters.
+    - sim ≥ AUTO_MERGE_THRESHOLD: merge cluster into person silently.
+    - sim ≥ NOTIFY_THRESHOLD:     broadcast WS event for the user to confirm.
+    """
+    logger.info("Phase 3b: Auto-merge check")
+
+    async with get_db() as db:
+        persons = await db.execute_fetchall("""
+            SELECT p.id AS person_id, p.name
+            FROM persons p
+            WHERE p.is_merged = 0 AND p.name IS NOT NULL
+        """)
+        if not persons:
+            return
+
+        clusters = await db.execute_fetchall("""
+            SELECT c.id AS cluster_id, c.member_count,
+                   MIN(f.thumbnail_path) AS representative_thumbnail
+            FROM clusters c
+            JOIN faces f ON f.cluster_id = c.id
+            WHERE c.person_id IS NULL
+            GROUP BY c.id
+        """)
+        if not clusters:
+            return
+
+        rejected_rows = await db.execute_fetchall(
+            "SELECT person_id, cluster_id FROM rejected_suggestions"
+        )
+        rejected = {(r["person_id"], r["cluster_id"]) for r in rejected_rows}
+
+        # Build person centroids
+        person_data: list[dict] = []
+        for p in persons:
+            emb_rows = await db.execute_fetchall("""
+                SELECT e.vector FROM embeddings e
+                JOIN faces f ON f.id = e.face_id
+                WHERE f.person_id = ?
+            """, (p["person_id"],))
+            if not emb_rows:
+                continue
+            vecs = np.stack([np.frombuffer(r["vector"], dtype=np.float32) for r in emb_rows])
+            centroid = vecs.mean(axis=0)
+            norm = np.linalg.norm(centroid)
+            if norm > 0:
+                centroid /= norm
+            person_data.append({"person_id": p["person_id"], "name": p["name"], "centroid": centroid})
+
+        # Build cluster centroids
+        cluster_data: list[dict] = []
+        for c in clusters:
+            emb_rows = await db.execute_fetchall("""
+                SELECT e.vector FROM embeddings e
+                JOIN faces f ON f.id = e.face_id
+                WHERE f.cluster_id = ?
+            """, (c["cluster_id"],))
+            if not emb_rows:
+                continue
+            vecs = np.stack([np.frombuffer(r["vector"], dtype=np.float32) for r in emb_rows])
+            centroid = vecs.mean(axis=0)
+            norm = np.linalg.norm(centroid)
+            if norm > 0:
+                centroid /= norm
+            cluster_data.append({
+                "cluster_id": c["cluster_id"],
+                "member_count": c["member_count"],
+                "thumbnail": c["representative_thumbnail"],
+                "centroid": centroid,
+            })
+
+    auto_merged = 0
+    suggestions: list[dict] = []
+
+    # Already-merged cluster IDs (can happen if multiple persons match same cluster)
+    merged_cluster_ids: set[int] = set()
+
+    for p in person_data:
+        pid   = p["person_id"]
+        pname = p["name"]
+        pc    = p["centroid"]
+        for c in cluster_data:
+            cid = c["cluster_id"]
+            if cid in merged_cluster_ids:
+                continue
+            if (pid, cid) in rejected:
+                continue
+            sim = float(np.dot(pc, c["centroid"]))
+            if sim >= _AUTO_MERGE_THRESHOLD:
+                async with get_db() as db:
+                    await db.execute(
+                        "UPDATE clusters SET person_id=? WHERE id=?", (pid, cid)
+                    )
+                    await db.execute(
+                        "UPDATE faces SET person_id=? WHERE cluster_id=?", (pid, cid)
+                    )
+                    await db.execute("""
+                        UPDATE persons
+                        SET photo_count = (
+                            SELECT COUNT(DISTINCT media_file_id) FROM faces WHERE person_id = ?
+                        ) WHERE id = ?
+                    """, (pid, pid))
+                    await db.execute("""
+                        INSERT OR IGNORE INTO writeback_queue (media_file_id)
+                        SELECT DISTINCT media_file_id FROM faces WHERE cluster_id=?
+                    """, (cid,))
+                merged_cluster_ids.add(cid)
+                auto_merged += 1
+                logger.info("Auto-merged cluster %d → person '%s' (sim=%.3f)", cid, pname, sim)
+            elif sim >= _NOTIFY_THRESHOLD:
+                suggestions.append({
+                    "person_id":   pid,
+                    "person_name": pname,
+                    "cluster_id":  cid,
+                    "similarity":  round(sim, 3),
+                    "member_count": c["member_count"],
+                    "thumbnail":   c["thumbnail"],
+                })
+
+    if suggestions:
+        # Deduplicate: keep highest-sim suggestion per cluster
+        seen: dict[int, dict] = {}
+        for s in suggestions:
+            cid = s["cluster_id"]
+            if cid not in seen or s["similarity"] > seen[cid]["similarity"]:
+                seen[cid] = s
+        await broadcast("merge_suggestions", suggestions=list(seen.values())[:10])
+
+    logger.info("Phase 3b: %d auto-merged, %d suggestions surfaced", auto_merged, len(suggestions))
 
 
 # ---------------------------------------------------------------------------

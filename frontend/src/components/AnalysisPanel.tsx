@@ -35,9 +35,6 @@ function sourceColour(src: string): string {
   return SOURCE_COLOUR[src] ?? DEFAULT_SOURCE_COLOUR
 }
 
-const CONFIDENCE_COLOUR = (c: number) =>
-  c >= 90 ? 'text-green-400' : c >= 70 ? 'text-yellow-400' : 'text-red-400'
-
 // ─── Main component ───────────────────────────────────────────────────────────
 
 export default function AnalysisPanel({ mediaId }: Props) {
@@ -140,7 +137,7 @@ export default function AnalysisPanel({ mediaId }: Props) {
       {doc.Faces.length > 0 && (
         <Section title={`People (${doc.Faces.length})`} icon="👤">
           <div className="space-y-3">
-            {doc.Faces.map(f => <FaceCard key={f.face_id} face={f} mediaId={mediaId} />)}
+            {doc.Faces.map(f => <FaceCard key={f.face_id} face={f} />)}
           </div>
         </Section>
       )}
@@ -251,7 +248,7 @@ export default function AnalysisPanel({ mediaId }: Props) {
 
 // ─── FaceCard ─────────────────────────────────────────────────────────────────
 
-function FaceCard({ face, mediaId }: { face: AnalysisFace; mediaId: number }) {
+function FaceCard({ face }: { face: AnalysisFace }) {
   const { AgeRange, Gender, Pose, Quality, Emotions } = face
   const dominantEmotion = Emotions
     ? [...Emotions].sort((a, b) => b.Confidence - a.Confidence)[0]
