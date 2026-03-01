@@ -446,18 +446,36 @@ async def merge_analysis_document(media_id: int, db: aiosqlite.Connection) -> di
     doc["updated_at"]    = pa_row["updated_at"]
 
     # ── 1. Resolve person_id → person_name ───────────────────────────────────
-    person_ids = [f["person_id"] for f in doc.get("Faces", []) if f.get("person_id")]
-    person_name_map: dict[int, str] = {}
-    if person_ids:
-        ph = ",".join("?" * len(person_ids))
-        rows = await db.execute_fetchall(
-            f"SELECT id, name FROM persons WHERE id IN ({ph}) AND is_merged=0",
-            person_ids,
+    # We always re-read person_id from the LIVE faces table using face_id.
+    # The stored JSON may have person_id=null (document built before the user
+    # named anyone) or a stale id (person was merged since the doc was written).
+    face_ids = [f["face_id"] for f in doc.get("Faces", []) if f.get("face_id")]
+    face_person_map: dict[int, int] = {}   # face_id → person_id
+    person_name_map: dict[int, str]  = {}  # person_id → name
+    if face_ids:
+        ph = ",".join("?" * len(face_ids))
+        face_rows = await db.execute_fetchall(
+            f"SELECT id, person_id FROM faces WHERE id IN ({ph}) AND person_id IS NOT NULL",
+            face_ids,
         )
-        person_name_map = {r["id"]: r["name"] for r in rows if r["name"]}
+        face_person_map = {r["id"]: r["person_id"] for r in face_rows}
+        person_ids = list(set(face_person_map.values()))
+        if person_ids:
+            ph2 = ",".join("?" * len(person_ids))
+            # Follow merge chain: if person was merged, look up the target's name
+            p_rows = await db.execute_fetchall(
+                f"""SELECT p.id, COALESCE(p2.name, p.name) AS name
+                    FROM persons p
+                    LEFT JOIN persons p2 ON p2.id = p.merged_into_id
+                    WHERE p.id IN ({ph2})""",
+                person_ids,
+            )
+            person_name_map = {r["id"]: r["name"] for r in p_rows if r["name"]}
 
     for face in doc.get("Faces", []):
-        pid = face.get("person_id")
+        fid = face.get("face_id")
+        pid = face_person_map.get(fid) if fid else None
+        face["person_id"]   = pid   # keep in sync with live DB
         face["person_name"] = person_name_map.get(pid) if pid else None
 
     # ── 2. Load amendments ────────────────────────────────────────────────────
