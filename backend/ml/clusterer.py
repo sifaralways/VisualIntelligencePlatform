@@ -72,6 +72,9 @@ def cluster_embeddings(
             metric="cosine",
             cluster_selection_method="eom",
             cluster_selection_epsilon=float(get_setting('hdbscan_cluster_epsilon')),
+            copy=True,  # prevents in-place mutation of the distance matrix which
+                        # corrupts the condensed tree and triggers a TypeError in
+                        # epsilon_search / traverse_upwards (sklearn < 1.10 bug)
         )
     except ImportError:
         import hdbscan
@@ -81,6 +84,7 @@ def cluster_embeddings(
             metric="cosine",
             cluster_selection_method="eom",
             cluster_selection_epsilon=float(get_setting('hdbscan_cluster_epsilon')),
+            copy=True,
         )
 
     labels = clusterer.fit_predict(matrix)
