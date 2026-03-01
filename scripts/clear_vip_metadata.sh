@@ -130,6 +130,7 @@ else
     exiftool -r \
         "${CLEAR_ARGS[@]}" \
         -overwrite_original \
+        -preserve \
         "$FOLDER"
 
     echo ""
