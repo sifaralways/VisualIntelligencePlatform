@@ -595,19 +595,32 @@ async def _phase_cluster() -> None:
 # Phase 3b: Auto-merge (high confidence) + notify borderline suggestions
 # ---------------------------------------------------------------------------
 
-_AUTO_MERGE_THRESHOLD = 0.82   # cosine sim → merge automatically (very confident)
-_NOTIFY_THRESHOLD     = 0.63   # cosine sim → notify user for manual review
-
 async def _phase_auto_merge() -> None:
     """Compare named-person centroids to unnamed clusters.
-    - sim ≥ AUTO_MERGE_THRESHOLD: merge cluster into person silently.
-    - sim ≥ NOTIFY_THRESHOLD:     broadcast WS event for the user to confirm.
+
+    Thresholds (all configurable in settings):
+    - sim >= auto_name_threshold (default 0.98): auto-assign name silently —
+      very high confidence, near-identical centroid.
+    - sim >= merge_suggest_threshold (default 0.63): pop a "Same person?"
+      suggestion card for the user to confirm.
+
+    Person centroids are stored in persons.centroid (persisted across photo
+    deletions). On first run / after adding new faces to a person the centroid
+    is recomputed from embeddings and stored so it survives future removals.
     """
-    logger.info("Phase 3b: Auto-merge check")
+    from backend.pipeline.centroid import update_person_centroid, load_centroid
+
+    auto_name_threshold   = settings.auto_name_threshold
+    suggest_threshold     = settings.merge_suggest_threshold
+
+    logger.info(
+        "Phase 3b: Auto-name check (name≥%.2f, suggest≥%.2f)",
+        auto_name_threshold, suggest_threshold,
+    )
 
     async with get_db() as db:
         persons = await db.execute_fetchall("""
-            SELECT p.id AS person_id, p.name
+            SELECT p.id AS person_id, p.name, p.centroid, p.centroid_n
             FROM persons p
             WHERE p.is_merged = 0 AND p.name IS NOT NULL
         """)
@@ -630,36 +643,51 @@ async def _phase_auto_merge() -> None:
         )
         rejected = {(r["person_id"], r["cluster_id"]) for r in rejected_rows}
 
-        # Build person centroids
+        # Build person centroids — use stored centroid when available, otherwise
+        # derive from embeddings (first run / legacy rows) and persist it.
         person_data: list[dict] = []
         for p in persons:
-            emb_rows = await db.execute_fetchall("""
-                SELECT e.vector FROM embeddings e
-                JOIN faces f ON f.id = e.face_id
-                WHERE f.person_id = ?
-            """, (p["person_id"],))
-            if not emb_rows:
-                continue
-            # Representative face thumbnail for the person
+            pid = p["person_id"]
+
+            if p["centroid"]:
+                # Use stored centroid (centroid_n=0 means all live photos were
+                # removed but the vector is preserved for re-identification)
+                centroid = load_centroid(p["centroid"])
+            else:
+                # Derive from embeddings and persist for future runs
+                emb_rows = await db.execute_fetchall("""
+                    SELECT e.vector FROM embeddings e
+                    JOIN faces f ON f.id = e.face_id
+                    WHERE f.person_id = ?
+                """, (pid,))
+                if not emb_rows:
+                    continue
+                vecs = np.stack([np.frombuffer(r["vector"], dtype=np.float32) for r in emb_rows])
+                centroid = vecs.mean(axis=0)
+                norm = np.linalg.norm(centroid)
+                if norm > 0:
+                    centroid /= norm
+                await db.execute(
+                    "UPDATE persons SET centroid=?, centroid_n=? WHERE id=?",
+                    (centroid.tobytes(), len(emb_rows), pid),
+                )
+
+            # Representative face thumbnail for the suggestion card
             rep_row = await (await db.execute("""
                 SELECT f.id FROM faces f
                 WHERE f.person_id = ? AND f.thumbnail_path IS NOT NULL
                 LIMIT 1
-            """, (p["person_id"],))).fetchone()
+            """, (pid,))).fetchone()
             rep_face_id = rep_row["id"] if rep_row else None
-            vecs = np.stack([np.frombuffer(r["vector"], dtype=np.float32) for r in emb_rows])
-            centroid = vecs.mean(axis=0)
-            norm = np.linalg.norm(centroid)
-            if norm > 0:
-                centroid /= norm
+
             person_data.append({
-                "person_id": p["person_id"],
-                "name": p["name"],
-                "centroid": centroid,
-                "face_id": rep_face_id,
+                "person_id": pid,
+                "name":      p["name"],
+                "centroid":  centroid,
+                "face_id":   rep_face_id,
             })
 
-        # Build cluster centroids
+        # Build cluster centroids (clusters are transient; no need to persist)
         cluster_data: list[dict] = []
         for c in clusters:
             emb_rows = await db.execute_fetchall("""
@@ -681,11 +709,11 @@ async def _phase_auto_merge() -> None:
                 "centroid":     centroid,
             })
 
-    auto_merged = 0
+    auto_named = 0
     suggestions: list[dict] = []
 
-    # Already-merged cluster IDs (can happen if multiple persons match same cluster)
-    merged_cluster_ids: set[int] = set()
+    # Already-named cluster IDs (prevent double-assignment)
+    named_cluster_ids: set[int] = set()
 
     for p in person_data:
         pid   = p["person_id"]
@@ -693,12 +721,12 @@ async def _phase_auto_merge() -> None:
         pc    = p["centroid"]
         for c in cluster_data:
             cid = c["cluster_id"]
-            if cid in merged_cluster_ids:
+            if cid in named_cluster_ids:
                 continue
             if (pid, cid) in rejected:
                 continue
             sim = float(np.dot(pc, c["centroid"]))
-            if sim >= _AUTO_MERGE_THRESHOLD:
+            if sim >= auto_name_threshold:
                 async with get_db() as db:
                     await db.execute(
                         "UPDATE clusters SET person_id=? WHERE id=?", (pid, cid)
@@ -716,18 +744,22 @@ async def _phase_auto_merge() -> None:
                         INSERT OR IGNORE INTO writeback_queue (media_file_id)
                         SELECT DISTINCT media_file_id FROM faces WHERE cluster_id=?
                     """, (cid,))
-                merged_cluster_ids.add(cid)
-                auto_merged += 1
-                logger.info("Auto-merged cluster %d → person '%s' (sim=%.3f)", cid, pname, sim)
-            elif sim >= _NOTIFY_THRESHOLD:
+                    # Refresh stored centroid to include the newly-assigned faces
+                    await update_person_centroid(db, pid)
+                named_cluster_ids.add(cid)
+                auto_named += 1
+                logger.info(
+                    "Auto-named cluster %d → '%s' (sim=%.3f)", cid, pname, sim
+                )
+            elif sim >= suggest_threshold:
                 suggestions.append({
-                    "person_id":      pid,
-                    "person_name":    pname,
-                    "person_face_id": p["face_id"],
-                    "cluster_id":     cid,
+                    "person_id":       pid,
+                    "person_name":     pname,
+                    "person_face_id":  p["face_id"],
+                    "cluster_id":      cid,
                     "cluster_face_id": c["face_id"],
-                    "similarity":     round(sim, 3),
-                    "member_count":   c["member_count"],
+                    "similarity":      round(sim, 3),
+                    "member_count":    c["member_count"],
                 })
 
     if suggestions:
@@ -739,7 +771,9 @@ async def _phase_auto_merge() -> None:
                 seen[cid] = s
         await broadcast("merge_suggestions", suggestions=list(seen.values())[:10])
 
-    logger.info("Phase 3b: %d auto-merged, %d suggestions surfaced", auto_merged, len(suggestions))
+    logger.info(
+        "Phase 3b: %d auto-named, %d suggestions surfaced", auto_named, len(suggestions)
+    )
 
 
 # ---------------------------------------------------------------------------

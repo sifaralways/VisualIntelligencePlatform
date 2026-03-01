@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from backend.config import settings
 from backend.database.db import get_db
 from backend.database.models import MediaFile
+from backend.pipeline.centroid import update_person_centroid
 
 router = APIRouter()
 
@@ -189,8 +190,18 @@ async def bulk_delete(body: BulkDeleteRequest):
         return {"deleted": 0}
 
     deleted = 0
+    affected_person_ids: set[int] = set()
+
     async with get_db() as db:
         for media_id in body.media_ids:
+            # Collect person_ids before deletion so we can refresh their centroids
+            person_rows = await db.execute_fetchall(
+                "SELECT DISTINCT person_id FROM faces WHERE media_file_id=? AND person_id IS NOT NULL",
+                (media_id,),
+            )
+            for pr in person_rows:
+                affected_person_ids.add(pr["person_id"])
+
             # Fetch face ids so we can remove their thumbnails
             face_rows = await db.execute_fetchall(
                 "SELECT id, thumbnail_path FROM faces WHERE media_file_id=?", (media_id,)
@@ -213,6 +224,13 @@ async def bulk_delete(body: BulkDeleteRequest):
             )
             if result.rowcount:
                 deleted += 1
+
+        # Refresh centroids for every person who lost faces — if all their photos
+        # were deleted the centroid is set to NULL but the person record survives,
+        # so their identity is retained and can be matched in future scans once
+        # new photos with stored centroid vectors are available.
+        for person_id in affected_person_ids:
+            await update_person_centroid(db, person_id)
 
     return {"deleted": deleted}
 

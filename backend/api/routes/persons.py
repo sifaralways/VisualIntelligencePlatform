@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from backend.database.db import get_db
 from backend.database.models import Person
+from backend.pipeline.centroid import update_person_centroid
 
 # Minimum cosine similarity to surface a merge suggestion
 _SUGGEST_THRESHOLD = 0.55
@@ -85,6 +86,9 @@ async def name_person(person_id: int, req: NamePersonRequest):
             WHERE f.person_id = ?
         """, (person_id,))
 
+        # Persist centroid so this person is recognisable in future scans
+        await update_person_centroid(db, person_id)
+
     return {"status": "ok", "name": req.name}
 
 
@@ -103,6 +107,8 @@ async def merge_persons(req: MergeRequest, source_id: int):
         """, (req.into_person_id, source_id))
         # Sync stored photo_count on target
         await _sync_photo_count(db, req.into_person_id)
+        # Refresh centroid to include faces from the merged source
+        await update_person_centroid(db, req.into_person_id)
 
     return {"status": "merged", "into": req.into_person_id}
 
@@ -134,6 +140,9 @@ async def create_person_from_cluster(cluster_id: int, req: NameClusterRequest):
             INSERT OR IGNORE INTO writeback_queue (media_file_id)
             SELECT DISTINCT media_file_id FROM faces WHERE cluster_id=?
         """, (cluster_id,))
+
+        # Persist centroid — this person now has embeddings to match against
+        await update_person_centroid(db, person_id)
 
     return {"status": "created", "person_id": person_id, "uuid": person_uuid}
 
@@ -167,6 +176,9 @@ async def add_cluster_to_person(person_id: int, cluster_id: int):
             INSERT OR IGNORE INTO writeback_queue (media_file_id)
             SELECT DISTINCT media_file_id FROM faces WHERE cluster_id=?
         """, (cluster_id,))
+
+        # Refresh centroid with the newly-added cluster's embeddings
+        await update_person_centroid(db, person_id)
 
     return {"status": "merged", "person_id": person_id}
 

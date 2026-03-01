@@ -111,6 +111,16 @@ class Settings(BaseSettings):
     cluster_inertia_threshold: float = 0.85
 
     # -------------------------------------------------------------------------
+    # Person re-identification thresholds (used in Phase 3b auto-name)
+    # -------------------------------------------------------------------------
+    # Cosine similarity >= this → auto-assign person name silently (very high
+    # confidence). Default 0.98 means near-identical embedding centroid.
+    auto_name_threshold: float = 0.98
+    # Cosine similarity >= this (but below auto_name_threshold) → pop up a
+    # "Same person?" suggestion card for the user to confirm or reject.
+    merge_suggest_threshold: float = 0.63
+
+    # -------------------------------------------------------------------------
     # FAISS
     # -------------------------------------------------------------------------
     # Use flat (exact) index up to ~300K vectors. Switch to IVF beyond that.
