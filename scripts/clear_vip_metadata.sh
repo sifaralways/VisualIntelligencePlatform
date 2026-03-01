@@ -120,7 +120,8 @@ else
     echo "       as <filename>_original unless you pass --overwrite."
     echo ""
     read -r -p "  Continue? [y/N] " confirm
-    if [[ "${confirm,,}" != "y" ]]; then
+    confirm_lower=$(echo "$confirm" | tr '[:upper:]' '[:lower:]')
+    if [[ "$confirm_lower" != "y" ]]; then
         echo "  Aborted."
         exit 0
     fi
