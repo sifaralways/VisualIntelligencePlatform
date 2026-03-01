@@ -272,13 +272,34 @@ async def _phase_scan(folder: Path) -> None:
                         meta.get("exposure_time_s"), existing_id,
                     ))
                 else:
-                    # New file — generate a stable UUID for XMP:Identifier
-                    new_vip_id = str(uuid.uuid4())
+                    # New file — use file's existing XMP:Identifier if present
+                    # (preserves continuity when re-importing a file previously
+                    # processed by VIP on another machine / after DB reset).
+                    # Fall back to a fresh UUID4 for files VIP hasn't seen before.
+                    new_vip_id = meta.get("xmp_identifier") or str(uuid.uuid4())
+
+                    # Build a one-time snapshot of whatever rich XMP/IPTC data
+                    # existed in the file *before* VIP touches it.  This snapshot
+                    # drives the "VIP History" / "External History" display.
+                    _ext: dict = {}
+                    if meta.get("xmp_identifier"):
+                        _ext["identifier"] = meta["xmp_identifier"]
+                    if meta.get("xmp_persons"):
+                        _ext["persons"] = meta["xmp_persons"]
+                    if meta.get("xmp_keywords"):
+                        _ext["keywords"] = meta["xmp_keywords"]
+                    if meta.get("xmp_location"):
+                        _ext["location"] = meta["xmp_location"]
+                    if meta.get("xmp_region_info"):
+                        _ext["region_info"] = meta["xmp_region_info"]
+                    external_exif_json = json.dumps(_ext) if _ext else None
+
                     await db.execute("""
                         INSERT INTO media_files
                             (vip_id, file_path, file_hash, file_size, file_format, camera_make, camera_model,
-                             date_taken, gps_lat, gps_lon, width, height, is_stub, exposure_time_s, ingest_state)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'scanned')
+                             date_taken, gps_lat, gps_lon, width, height, is_stub, exposure_time_s,
+                             ingest_state, external_exif)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'scanned',?)
                     """, (
                         new_vip_id,
                         str(file_path), file_hash, stat.st_size, meta.get("file_format"),
@@ -286,6 +307,7 @@ async def _phase_scan(folder: Path) -> None:
                         meta.get("date_taken"), meta.get("gps_lat"), meta.get("gps_lon"),
                         meta.get("width"), meta.get("height"), int(is_stub),
                         meta.get("exposure_time_s"),
+                        external_exif_json,
                     ))
 
                 scanned += 1

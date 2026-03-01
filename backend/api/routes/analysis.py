@@ -58,21 +58,95 @@ async def get_analysis(media_id: int):
     Return the merged analysis document for a photo.
     person_id references in Faces[] are resolved to current person_name.
     User amendments are applied on top of the model document.
+    Includes vip_history, external_history, and vip_pending sections.
     """
     async with get_db() as db:
         # Confirm the media file exists so we can surface a clear 404
-        exists = await (await db.execute(
-            "SELECT 1 FROM media_files WHERE id=?", (media_id,)
+        file_row = await (await db.execute(
+            "SELECT external_exif FROM media_files WHERE id=?", (media_id,)
         )).fetchone()
-        if exists is None:
+        if file_row is None:
             raise HTTPException(status_code=404, detail="Media file not found")
 
         doc = await merge_analysis_document(media_id, db)
 
+        # Check for pending writeback
+        wq_row = await (await db.execute(
+            "SELECT status FROM writeback_queue WHERE media_file_id=? LIMIT 1",
+            (media_id,)
+        )).fetchone()
+
     if not doc:
         raise HTTPException(status_code=404, detail="No analysis document yet. Run the pipeline.")
 
+    # ── History sections ────────────────────────────────────────────────────
+    # external_exif is a one-time snapshot of whatever XMP/IPTC data existed
+    # in the file when VIP first imported it (see ingest.py Phase 1).
+    #
+    #  "VIP History"      → snapshot has "identifier" key (our vip_id UUID)
+    #                        meaning VIP previously wrote to this file.
+    #  "External History" → snapshot has data but no "identifier"
+    #                        meaning another app (Lightroom, Apple Photos, …)
+    #                        had already tagged the file.
+    #  "VIP Pending"      → writeback_queue has a 'pending' row for this file
+    #                        meaning VIP analysis not yet written to disk.
+    ext_raw = file_row["external_exif"]
+    ext: dict = json.loads(ext_raw) if ext_raw else {}
+
+    if ext.get("identifier"):
+        # File was previously processed by VIP — all snapshot data is VIP History
+        doc["vip_history"]      = _clean_history(ext)
+        doc["external_history"] = None
+    elif ext:
+        # Pre-existing tags from an external application
+        doc["vip_history"]      = None
+        doc["external_history"] = _clean_history(ext)
+    else:
+        doc["vip_history"]      = None
+        doc["external_history"] = None
+
+    doc["vip_pending"] = wq_row is not None and wq_row["status"] == "pending"
+
     return doc
+
+
+def _clean_history(ext: dict) -> dict:
+    """
+    Normalise the external_exif snapshot for API output.
+    Renames internal keys to friendly names and strips nulls.
+    """
+    out: dict = {}
+    if ext.get("identifier"):
+        out["identifier"] = ext["identifier"]
+    if ext.get("persons"):
+        out["persons"] = ext["persons"]
+    if ext.get("keywords"):
+        # Split keywords into VIP-namespaced (obj:/geo:/etc.) and plain
+        kws: list[str] = ext["keywords"]
+        vip_kws   = [k for k in kws if ":" in k]
+        plain_kws = [k for k in kws if ":" not in k]
+        if vip_kws:
+            out["vip_keywords"] = vip_kws
+        if plain_kws:
+            out["plain_keywords"] = plain_kws
+    if ext.get("location"):
+        out["location"] = ext["location"]
+    if ext.get("region_info"):
+        # Extract simple name list from MWG region structs
+        region_info = ext["region_info"]
+        region_list = region_info.get("RegionList", []) if isinstance(region_info, dict) else []
+        named_regions = [
+            {
+                "name": r.get("Name"),
+                "type": r.get("Type"),
+                "area": r.get("Area"),
+            }
+            for r in region_list
+            if r.get("Name")
+        ]
+        if named_regions:
+            out["face_regions"] = named_regions
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────

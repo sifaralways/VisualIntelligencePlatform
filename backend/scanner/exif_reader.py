@@ -175,6 +175,34 @@ def _normalise(raw: dict[str, Any]) -> dict[str, Any]:
                 return v
         return None
 
+    # ---------------------------------------------------------------------------
+    # Pre-existing rich XMP/IPTC fields — captured as a snapshot so we can
+    # show them in the Analysis UI as "VIP History" or "External History".
+    # ---------------------------------------------------------------------------
+    # XMP:Identifier — if present, VIP previously wrote this file (we always
+    # write our vip_id UUID here).  Used to distinguish VIP History from
+    # External History in the analysis panel.
+    xmp_identifier = _get("Identifier", "XMP:Identifier")
+
+    # XMP:PersonInImage — named people (VIP writes here; Apple Photos / LR too)
+    _raw_persons = _get("PersonInImage", "XMP:PersonInImage")
+    xmp_persons: list[str] | None = None
+    if _raw_persons is not None:
+        xmp_persons = [_raw_persons] if isinstance(_raw_persons, str) else list(_raw_persons)
+
+    # XMP:Subject / IPTC:Keywords — flat keyword list
+    _raw_kw = _get("Subject", "XMP:Subject", "Keywords", "IPTC:Keywords")
+    xmp_keywords: list[str] | None = None
+    if _raw_kw is not None:
+        xmp_keywords = [_raw_kw] if isinstance(_raw_kw, str) else list(_raw_kw)
+
+    # XMP:Location — free-text location (IPTC Core)
+    xmp_location = _get("Location", "XMP:Location")
+
+    # XMP-mwg-rs:RegionInfo — MWG face region structs (Name + bbox per face)
+    # ExifTool returns this as a dict: {"AppliedToDimensions": {...}, "RegionList": [...]}
+    xmp_region_info = raw.get("RegionInfo") or raw.get("XMP-mwg-rs:RegionInfo")
+
     return {
         "file_path":       raw.get("SourceFile"),
         "file_format":     _get("FileType"),
@@ -188,4 +216,10 @@ def _normalise(raw: dict[str, Any]) -> dict[str, Any]:
         # Shutter speed in seconds (e.g. 0.005 for 1/200 s, 2.0 for 2 s).
         # ExifTool may return a fraction string ("1/500") — parse to float.
         "exposure_time_s": _parse_exposure_time(_get("ExposureTime")),
+        # ── Pre-existing rich metadata (for VIP/External History display) ──
+        "xmp_identifier":  xmp_identifier,   # our UUID if previously VIP-processed
+        "xmp_persons":     xmp_persons,       # named persons already in file
+        "xmp_keywords":    xmp_keywords,      # flat keyword list already in file
+        "xmp_location":    xmp_location,      # free-text location already in file
+        "xmp_region_info": xmp_region_info,   # MWG face regions already in file
     }

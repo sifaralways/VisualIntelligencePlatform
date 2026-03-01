@@ -425,6 +425,21 @@ export interface AnalysisFace {
   FaceOccluded: AnalysisFaceAttribute | null
 }
 
+export interface ExifHistory {
+  /** XMP:Identifier written by VIP — present only in vip_history */
+  identifier?: string
+  /** Named persons from XMP:PersonInImage */
+  persons?: string[]
+  /** VIP-namespaced keywords (obj:/geo:/place:/animal:) */
+  vip_keywords?: string[]
+  /** Plain keywords from XMP:Subject / IPTC:Keywords */
+  plain_keywords?: string[]
+  /** XMP:Location free-text */
+  location?: string
+  /** MWG face regions with names */
+  face_regions?: { name: string; type: string | null; area: { X: number; Y: number; W: number; H: number; Unit: string } | null }[]
+}
+
 export interface AnalysisDocument {
   schema_version: string
   vip_id: string | null
@@ -440,6 +455,12 @@ export interface AnalysisDocument {
   model_version: string
   generated_at: string
   updated_at?: string
+  /** Data previously written to this file by VIP (XMP:Identifier matched) */
+  vip_history: ExifHistory | null
+  /** Data found in file that was written by an external app, not VIP */
+  external_history: ExifHistory | null
+  /** True when VIP analysis exists but has not been written to the file yet */
+  vip_pending: boolean
 }
 
 export interface AnalysisAmendment {

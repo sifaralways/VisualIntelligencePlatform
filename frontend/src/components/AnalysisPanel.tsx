@@ -14,6 +14,7 @@ import {
   type AnalysisDocument,
   type AnalysisLabel,
   type AnalysisFace,
+  type ExifHistory,
 } from '../api/client'
 
 interface Props {
@@ -119,6 +120,42 @@ export default function AnalysisPanel({ mediaId }: Props) {
 
   return (
     <div className="space-y-5 text-sm">
+
+      {/* ── VIP History ─────────────────────────────────────────────────
+           Data that VIP previously wrote to this file (XMP:Identifier
+           in the file matched our vip_id → we wrote it). */}
+      {doc.vip_history && (
+        <HistorySection
+          title="VIP History"
+          subtitle="Previously written to file by VIP"
+          badgeClass="bg-indigo-800/50 text-indigo-300 border-indigo-700"
+          data={doc.vip_history}
+        />
+      )}
+
+      {/* ── External History ────────────────────────────────────────────
+           Data found in the file that was NOT written by VIP — came from
+           another app (Lightroom, Apple Photos, camera, etc.). */}
+      {doc.external_history && (
+        <HistorySection
+          title="External History"
+          subtitle="Existing metadata not written by VIP"
+          badgeClass="bg-gray-700/60 text-gray-300 border-gray-600"
+          data={doc.external_history}
+        />
+      )}
+
+      {/* ── VIP Pending ─────────────────────────────────────────────────
+           VIP has analysis data (persons, tags) not yet written to the
+           file. Prompt user to write it out. */}
+      {doc.vip_pending && (
+        <div className="rounded-lg border border-amber-800/50 bg-amber-900/20 px-3 py-2.5">
+          <p className="text-xs font-semibold text-amber-300">⏳ VIP Pending</p>
+          <p className="mt-0.5 text-[11px] text-amber-400/80">
+            VIP analysis not yet written to this file. Use "Write to EXIF" below.
+          </p>
+        </div>
+      )}
 
       {/* ── Document meta ──────────────────────────────────────────────── */}
       <Section title="File Info" icon="📄">
@@ -450,5 +487,109 @@ function IconBtn({
     >
       {children}
     </button>
+  )
+}
+
+// ─── HistorySection ────────────────────────────────────────────────────────────
+// Renders a collapsible card showing VIP History or External History data
+// that was captured from the file's EXIF at import time.
+
+function HistorySection({
+  title, subtitle, badgeClass, data,
+}: { title: string; subtitle: string; badgeClass: string; data: ExifHistory }) {
+  const [open, setOpen] = useState(true)
+
+  const hasContent =
+    (data.persons && data.persons.length > 0) ||
+    (data.vip_keywords && data.vip_keywords.length > 0) ||
+    (data.plain_keywords && data.plain_keywords.length > 0) ||
+    data.location ||
+    (data.face_regions && data.face_regions.length > 0)
+
+  if (!hasContent) return null
+
+  return (
+    <div className={`rounded-lg border px-3 py-2.5 ${badgeClass}`}>
+      <button
+        className="w-full flex items-center justify-between text-left"
+        onClick={() => setOpen(o => !o)}
+      >
+        <div>
+          <span className="text-xs font-semibold">{title}</span>
+          <span className="ml-2 text-[11px] opacity-60">{subtitle}</span>
+        </div>
+        <span className="text-[10px] opacity-50">{open ? '▲' : '▼'}</span>
+      </button>
+
+      {open && (
+        <div className="mt-2 space-y-2">
+          {/* Named persons (XMP:PersonInImage) */}
+          {data.persons && data.persons.length > 0 && (
+            <div>
+              <p className="text-[10px] opacity-60 mb-1">People</p>
+              <div className="flex flex-wrap gap-1">
+                {data.persons.map(name => (
+                  <span key={name} className="text-xs bg-black/20 rounded-full px-2 py-0.5">
+                    👤 {name}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* MWG face regions */}
+          {data.face_regions && data.face_regions.length > 0 && (
+            <div>
+              <p className="text-[10px] opacity-60 mb-1">Face Regions</p>
+              <div className="flex flex-wrap gap-1">
+                {data.face_regions.map((r, i) => (
+                  <span key={i} className="text-xs bg-black/20 rounded-full px-2 py-0.5">
+                    🔲 {r.name}
+                    {r.area && (
+                      <span className="opacity-50 ml-1 text-[10px]">
+                        {(r.area.X * 100).toFixed(0)},{(r.area.Y * 100).toFixed(0)}
+                      </span>
+                    )}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* VIP-namespaced keywords (obj:/geo:/place:/animal:) */}
+          {data.vip_keywords && data.vip_keywords.length > 0 && (
+            <div>
+              <p className="text-[10px] opacity-60 mb-1">VIP Keywords</p>
+              <div className="flex flex-wrap gap-1">
+                {data.vip_keywords.map(kw => (
+                  <span key={kw} className="text-xs bg-black/20 rounded-full px-2 py-0.5 font-mono">
+                    {kw}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Plain keywords */}
+          {data.plain_keywords && data.plain_keywords.length > 0 && (
+            <div>
+              <p className="text-[10px] opacity-60 mb-1">Keywords</p>
+              <div className="flex flex-wrap gap-1">
+                {data.plain_keywords.map(kw => (
+                  <span key={kw} className="text-xs bg-black/20 rounded-full px-2 py-0.5">
+                    🏷 {kw}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Location */}
+          {data.location && (
+            <p className="text-[11px] opacity-80">📍 {data.location}</p>
+          )}
+        </div>
+      )}
+    </div>
   )
 }
