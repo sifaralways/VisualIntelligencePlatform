@@ -96,12 +96,23 @@ echo "  Clear GPS: $CLEAR_GPS"
 echo ""
 
 if [[ "$DRY_RUN" == true ]]; then
-    echo "  [DRY RUN] Fields that would be cleared:"
-    exiftool -r \
-        "${CLEAR_ARGS[@]}" \
-        -if 'defined $PersonInImage or defined $Subject or defined $Keywords or defined $Identifier' \
-        -p '$Directory/$FileName' \
-        "$FOLDER" 2>/dev/null || true
+    echo "  [DRY RUN] Image files found (fields would be cleared on each):"
+    echo ""
+    # List every image file exiftool can read, with its current values for VIP fields
+    exiftool -r -q \
+        -ext cr3 -ext arw -ext nef -ext dng -ext rw2 -ext orf -ext raf -ext cr2 \
+        -ext jpg -ext jpeg \
+        -p '  $Directory/$FileName' \
+        "$FOLDER" 2>/dev/null | sort || true
+    echo ""
+    # Show a sample of current VIP field values from the first matching file
+    echo "  [DRY RUN] VIP field values in sample file (empty = not yet written):"
+    exiftool -r -q \
+        -ext cr3 -ext arw -ext nef -ext dng -ext rw2 -ext orf -ext raf -ext cr2 \
+        -ext jpg -ext jpeg \
+        -PersonInImage -Subject -Keywords -Location -HierarchicalSubject -Identifier \
+        -fileOrder FileName \
+        "$FOLDER" 2>/dev/null | head -40 || true
     echo ""
     echo "  Run without --dry-run to apply changes."
 else
