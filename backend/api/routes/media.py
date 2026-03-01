@@ -44,10 +44,19 @@ def _build_filter_clauses(
     tag_category: str | None,
     tag_label: str | None,
     state: str | None,
+    folder_id: int | None = None,
 ) -> tuple[list[str], list[str], list]:
     joins: list[str] = []
-    conditions: list[str] = []
+    # Always hide soft-removed photos from every query
+    conditions: list[str] = ["mf.removed_from_app = 0"]
     params: list = []
+
+    if folder_id is not None:
+        # Use a subquery — avoids a cross-product JOIN and handles nested paths cleanly
+        conditions.append(
+            "mf.file_path LIKE (SELECT folder_path || '/%' FROM scan_state WHERE id=?)"
+        )
+        params.append(folder_id)
 
     if person_id is not None:
         joins.append("JOIN faces _f ON _f.media_file_id = mf.id")
@@ -80,6 +89,7 @@ async def count_media(
     tag_category: str | None = None,
     tag_label: str | None = None,
     state: str | None = None,
+    folder_id: int | None = None,
 ):
     """Return total count of media files matching the given filters."""
     joins, conditions, params = _build_filter_clauses(
@@ -87,6 +97,7 @@ async def count_media(
         tag_category=tag_category,
         tag_label=tag_label,
         state=state,
+        folder_id=folder_id,
     )
     sql = f"""
         SELECT COUNT(DISTINCT mf.id) AS n
@@ -111,18 +122,21 @@ async def list_media(
     person_id: int | None = None,
     tag_category: str | None = None,
     tag_label: str | None = None,
+    folder_id: int | None = None,
 ):
     """
     List media files. All filters are combinable:
-      - state       — ingest state (scanned / embedded / clustered / tagged)
-      - person_id   — photos that contain this person (via faces table)
+      - state        — ingest state (scanned / embedded / clustered / tagged)
+      - person_id    — photos that contain this person (via faces table)
       - tag_category + tag_label — photos with a specific ML tag
+      - folder_id    — photos from a specific scanned folder
     """
     joins, conditions, params = _build_filter_clauses(
         person_id=person_id,
         tag_category=tag_category,
         tag_label=tag_label,
         state=state,
+        folder_id=folder_id,
     )
     params.extend([limit, offset])
     sql = f"""
@@ -162,6 +176,7 @@ async def quality_issues(issue: str = Query("all", regex="^(blurry|closed_eyes|a
             mf.has_closed_eyes, mf.width, mf.height
         FROM media_files mf
         WHERE {condition}
+          AND mf.removed_from_app = 0
         ORDER BY mf.date_taken DESC, mf.id DESC
     """
     async with get_db() as db:
@@ -173,6 +188,57 @@ async def quality_issues(issue: str = Query("all", regex="^(blurry|closed_eyes|a
         item["thumbnail_url"] = f"/api/media/{item['id']}/thumbnail" if thumb.exists() else None
         results.append(item)
     return results
+
+
+# ---------------------------------------------------------------------------
+# Soft-remove from app (preserves DB row + UUID for future re-scan)
+# ---------------------------------------------------------------------------
+
+class RemoveFromAppRequest(BaseModel):
+    media_ids: List[int]
+    force: bool = False  # True = skip writeback warning
+
+
+@router.post("/remove-from-app")
+async def remove_from_app(body: RemoveFromAppRequest):
+    """
+    Soft-remove photos: sets removed_from_app=1 so they disappear from the UI
+    but the DB row (including file_hash and vip_id) is preserved.
+
+    If any of the selected photos have metadata assigned but not yet written to
+    file (pending writeback), and force=False, returns a warning payload instead
+    of removing. The client should prompt the user and re-call with force=True.
+    """
+    if not body.media_ids:
+        return {"removed": 0}
+
+    async with get_db() as db:
+        if not body.force:
+            placeholders = ",".join("?" * len(body.media_ids))
+            unwritten = await db.execute_fetchall(
+                f"""
+                SELECT mf.id, mf.file_path
+                FROM media_files mf
+                JOIN writeback_queue wq ON wq.media_file_id = mf.id
+                WHERE mf.id IN ({placeholders})
+                  AND mf.removed_from_app = 0
+                  AND wq.status = 'pending'
+                """,
+                body.media_ids,
+            )
+            if unwritten:
+                return {
+                    "status": "warning",
+                    "unwritten_count": len(unwritten),
+                    "unwritten_paths": [r["file_path"] for r in unwritten[:5]],
+                }
+
+        placeholders = ",".join("?" * len(body.media_ids))
+        result = await db.execute(
+            f"UPDATE media_files SET removed_from_app=1 WHERE id IN ({placeholders})",
+            body.media_ids,
+        )
+    return {"status": "ok", "removed": result.rowcount}
 
 
 # ---------------------------------------------------------------------------

@@ -113,6 +113,7 @@ export default function LibraryPage({ onScanStarted }: Props) {
     <PhotoGrid
       title="Library"
       headerSlot={FolderBar}
+      selectable
     />
   )
 }

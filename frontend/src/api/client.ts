@@ -30,20 +30,22 @@ export const api = {
   media: {
     list: (params: MediaFilter = {}) => {
       const q = new URLSearchParams()
-      if (params.limit)        q.set('limit',        String(params.limit))
-      if (params.offset)       q.set('offset',       String(params.offset))
-      if (params.state)        q.set('state',        params.state)
-      if (params.person_id != null) q.set('person_id', String(params.person_id))
-      if (params.tag_category) q.set('tag_category', params.tag_category)
-      if (params.tag_label)    q.set('tag_label',    params.tag_label)
+      if (params.limit)             q.set('limit',        String(params.limit))
+      if (params.offset)            q.set('offset',       String(params.offset))
+      if (params.state)             q.set('state',        params.state)
+      if (params.person_id != null) q.set('person_id',    String(params.person_id))
+      if (params.tag_category)      q.set('tag_category', params.tag_category)
+      if (params.tag_label)         q.set('tag_label',    params.tag_label)
+      if (params.folder_id != null) q.set('folder_id',    String(params.folder_id))
       return request<MediaFile[]>(`/media?${q}`)
     },
     count: (params: Omit<MediaFilter, 'limit' | 'offset'> = {}) => {
       const q = new URLSearchParams()
-      if (params.state)        q.set('state',        params.state)
-      if (params.person_id != null) q.set('person_id', String(params.person_id))
-      if (params.tag_category) q.set('tag_category', params.tag_category)
-      if (params.tag_label)    q.set('tag_label',    params.tag_label)
+      if (params.state)             q.set('state',        params.state)
+      if (params.person_id != null) q.set('person_id',    String(params.person_id))
+      if (params.tag_category)      q.set('tag_category', params.tag_category)
+      if (params.tag_label)         q.set('tag_label',    params.tag_label)
+      if (params.folder_id != null) q.set('folder_id',    String(params.folder_id))
       return request<{ count: number }>(`/media/count?${q}`)
     },
     get: (id: number) => request<MediaFile>(`/media/${id}`),
@@ -56,6 +58,20 @@ export const api = {
       request<{ deleted: number }>('/media/bulk', {
         method: 'DELETE',
         body: JSON.stringify({ media_ids: mediaIds }),
+      }),
+    removeFromApp: (mediaIds: number[], force = false) =>
+      request<RemoveResult>('/media/remove-from-app', {
+        method: 'POST',
+        body: JSON.stringify({ media_ids: mediaIds, force }),
+      }),
+  },
+
+  // ─── Folders ──────────────────────────────────────────────────────────────
+  folders: {
+    list: () => request<FolderItem[]>('/folders'),
+    removeFromApp: (folderId: number, force = false) =>
+      request<RemoveResult>(`/folders/${folderId}/remove-from-app?force=${force}`, {
+        method: 'POST',
       }),
   },
 
@@ -182,6 +198,24 @@ export interface MediaFilter {
   person_id?: number
   tag_category?: string
   tag_label?: string
+  folder_id?: number
+}
+
+export interface FolderItem {
+  id: number
+  folder_path: string
+  last_scan_at: string | null
+  file_count: number
+  status: string
+  active_count: number
+  pending_writeback_count: number
+}
+
+export interface RemoveResult {
+  status: 'ok' | 'warning'
+  removed?: number
+  unwritten_count?: number
+  unwritten_paths?: string[]
 }
 
 export interface MediaFile {
