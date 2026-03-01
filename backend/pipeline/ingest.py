@@ -199,6 +199,15 @@ async def run_ingest(folder: str) -> None:
     # -- Phase 3b: Auto-merge high-conf + surface borderline suggestions ----
     await _phase_auto_merge()
 
+    # -- Phase 3c: Restore person names from VIP History -------------------
+    # When ExifTool has previously written named face regions to a photo,
+    # the file hash changes.  On re-import the file is treated as new, so
+    # faces are re-detected with no person assignments.  This phase reads
+    # the external_exif snapshot (captured at first INSERT) and matches
+    # the stored MWG face regions back to the freshly-detected face clusters
+    # by bounding-box centre proximity, then re-assigns person names.
+    await _phase_restore_vip_names()
+
     # -- Phase 4: Tag (objects, animals, geography, places) -----------------
     await _phase_tag()
 
@@ -827,6 +836,212 @@ async def _phase_auto_merge() -> None:
     logger.info(
         "Phase 3b: %d auto-named, %d suggestions surfaced", auto_named, len(suggestions)
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3c: Restore VIP person names from pre-import history
+# ---------------------------------------------------------------------------
+async def _phase_restore_vip_names() -> None:
+    """
+    Re-assign person names that VIP previously wrote to photo files.
+
+    When ExifTool writes metadata to a file the SHA-256 hash changes, so the
+    next import treats it as a new file.  Faces are re-detected with no
+    person assignments even though the history is captured in external_exif.
+
+    This phase:
+      1. Finds newly-ingested files whose external_exif snapshot has an
+         "identifier" key (= VIP previously wrote to this file) and named
+         face regions (XMP-mwg-rs:Regions with Name+bbox).
+      2. Matches each named region to the closest newly-detected face using
+         normalised bounding-box centre Euclidean distance.
+      3. Finds or creates the named person record and assigns the face's
+         cluster to that person.
+
+    Only faces in the current pipeline run are affected (ingest_state IN
+    ('embedded','clustered')).  Already-named faces are left alone.
+    """
+    import math
+
+    logger.info("Phase 3c: Restoring VIP person names from history")
+    from backend.pipeline.centroid import update_person_centroid
+
+    async with get_db() as db:
+        # Files ingested this run that have a VIP History snapshot
+        rows = await db.execute_fetchall("""
+            SELECT mf.id AS media_id, mf.external_exif
+            FROM media_files mf
+            WHERE mf.external_exif IS NOT NULL
+              AND mf.external_exif LIKE '%"identifier"%'
+              AND mf.ingest_state IN ('embedded', 'clustered')
+        """)
+
+    restored = 0
+
+    for row in rows:
+        media_id = row["media_id"]
+        ext: dict = {}
+        try:
+            ext = json.loads(row["external_exif"])
+        except Exception:
+            continue
+
+        # Must be a genuine VIP History file (identifier present)
+        if not ext.get("identifier"):
+            continue
+
+        # --- Extract named regions from MWG RegionInfo ----------------------
+        # Stored as raw ExifTool output: {RegionList: [{Name, Type, Area:{X,Y,W,H}}]}
+        region_info = ext.get("region_info")
+        named_regions: list[dict] = []   # {name, cx, cy}
+        if isinstance(region_info, dict):
+            for r in region_info.get("RegionList", []):
+                name = r.get("Name", "").strip()
+                area = r.get("Area", {})
+                if name and isinstance(area, dict) and area.get("Unit") == "normalized":
+                    # MWG Area.X / Area.Y are the CENTRE of the region
+                    named_regions.append({
+                        "name": name,
+                        "cx":   float(area.get("X", 0)),
+                        "cy":   float(area.get("Y", 0)),
+                    })
+
+        # Fallback: if no bbox regions but persons list has exactly one name
+        # and the photo has exactly one detected face → safe to auto-assign.
+        if not named_regions:
+            persons_list: list[str] = ext.get("persons") or []
+            if len(persons_list) == 1:
+                async with get_db() as db:
+                    face_count = await (await db.execute(
+                        "SELECT COUNT(*) AS c FROM faces WHERE media_file_id=?",
+                        (media_id,)
+                    )).fetchone()
+                if face_count and face_count["c"] == 1:
+                    named_regions = [{"name": persons_list[0], "cx": None, "cy": None}]
+
+        if not named_regions:
+            continue
+
+        # --- Get detected faces for this file --------------------------------
+        async with get_db() as db:
+            face_rows = await db.execute_fetchall("""
+                SELECT f.id AS face_id, f.cluster_id,
+                       f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h,
+                       f.person_id
+                FROM faces f
+                WHERE f.media_file_id = ?
+            """, (media_id,))
+
+        if not face_rows:
+            continue
+
+        # --- Match each named region to the closest face by centre distance --
+        # bbox_x/y/w/h in DB are normalised top-left + width/height.
+        # MWG regions use normalised centre X/Y.
+        matched: list[tuple[str, int, int | None]] = []   # (name, face_id, cluster_id)
+
+        unmatched_faces = list(face_rows)   # faces not yet claimed
+
+        for region in named_regions:
+            if region["cx"] is None:
+                # Single-face single-name fallback — take the only face
+                f = unmatched_faces[0]
+                if f["person_id"] is None:  # don't overwrite existing name
+                    matched.append((region["name"], f["face_id"], f["cluster_id"]))
+                continue
+
+            best_face = None
+            best_dist = float("inf")
+            for f in unmatched_faces:
+                if f["person_id"] is not None:  # already named — skip
+                    continue
+                if f["bbox_x"] is None:
+                    continue
+                # Convert stored top-left bbox to centre
+                fcx = f["bbox_x"] + f["bbox_w"] / 2
+                fcy = f["bbox_y"] + f["bbox_h"] / 2
+                dist = math.sqrt(
+                    (fcx - region["cx"]) ** 2 +
+                    (fcy - region["cy"]) ** 2
+                )
+                if dist < best_dist:
+                    best_dist = dist
+                    best_face = f
+
+            # Accept match if the centres are within 15% of image dimensions
+            if best_face is not None and best_dist <= 0.15:
+                matched.append((region["name"], best_face["face_id"], best_face["cluster_id"]))
+                unmatched_faces = [f for f in unmatched_faces if f["face_id"] != best_face["face_id"]]
+
+        if not matched:
+            continue
+
+        # --- Assign person records -------------------------------------------
+        async with get_db() as db:
+            for person_name, face_id, cluster_id in matched:
+                # Find existing named person or create one
+                existing_person = await (await db.execute(
+                    "SELECT id FROM persons WHERE name=? AND is_merged=0 LIMIT 1",
+                    (person_name,)
+                )).fetchone()
+
+                if existing_person:
+                    person_id = existing_person["id"]
+                else:
+                    import uuid as _uuid
+                    cursor = await db.execute("""
+                        INSERT INTO persons (uuid, name, named_at)
+                        VALUES (?, ?, datetime('now'))
+                    """, (str(_uuid.uuid4()), person_name))
+                    person_id = cursor.lastrowid
+                    logger.info(
+                        "Phase 3c: Created person '%s' (id=%d) from VIP History",
+                        person_name, person_id
+                    )
+
+                # Assign face → person
+                await db.execute(
+                    "UPDATE faces SET person_id=? WHERE id=?",
+                    (person_id, face_id)
+                )
+
+                # Assign cluster → person (if face belongs to a cluster)
+                if cluster_id is not None:
+                    await db.execute(
+                        "UPDATE clusters SET person_id=? WHERE id=?",
+                        (person_id, cluster_id)
+                    )
+                    # Assign all other faces in the same cluster too
+                    await db.execute(
+                        "UPDATE faces SET person_id=? WHERE cluster_id=? AND person_id IS NULL",
+                        (person_id, cluster_id)
+                    )
+
+                # Queue for writeback so names stay written after this run
+                await db.execute("""
+                    INSERT OR REPLACE INTO writeback_queue (media_file_id)
+                    VALUES (?)
+                """, (media_id,))
+
+                logger.info(
+                    "Phase 3c: Restored '%s' → face_id=%d, cluster_id=%s (media_id=%d)",
+                    person_name, face_id, cluster_id, media_id
+                )
+                restored += 1
+
+            # Persist centroid for all persons touched in this file
+            touched_person_ids: set[int] = set()
+            for _, _, cluster_id in matched:
+                if cluster_id is not None:
+                    pid_row = await (await db.execute(
+                        "SELECT person_id FROM clusters WHERE id=?", (cluster_id,)
+                    )).fetchone()
+                    if pid_row and pid_row["person_id"]:
+                        touched_person_ids.add(pid_row["person_id"])
+            for pid in touched_person_ids:
+                await update_person_centroid(db, pid)
+
+    logger.info("Phase 3c complete: %d face name(s) restored from VIP History", restored)
 
 
 # ---------------------------------------------------------------------------
