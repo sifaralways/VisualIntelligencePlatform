@@ -764,7 +764,7 @@ async def _phase_auto_merge() -> None:
                         ) WHERE id = ?
                     """, (pid, pid))
                     await db.execute("""
-                        INSERT OR IGNORE INTO writeback_queue (media_file_id)
+                        INSERT OR REPLACE INTO writeback_queue (media_file_id)
                         SELECT DISTINCT media_file_id FROM faces WHERE cluster_id=?
                     """, (cid,))
                     # Refresh stored centroid to include the newly-assigned faces

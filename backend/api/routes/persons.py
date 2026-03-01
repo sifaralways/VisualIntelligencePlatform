@@ -42,7 +42,7 @@ async def list_persons():
                    CASE WHEN p.name IS NOT NULL AND EXISTS (
                        SELECT 1 FROM writeback_queue wq
                        JOIN faces f2 ON f2.media_file_id = wq.media_file_id
-                       WHERE f2.person_id = p.id AND wq.status = 'done'
+                       WHERE f2.person_id = p.id AND wq.status = 'written'
                    ) THEN 1 ELSE 0 END                        AS name_written
             FROM persons p
             LEFT JOIN faces f ON f.person_id = p.id
@@ -83,9 +83,11 @@ async def name_person(person_id: int, req: NamePersonRequest):
             UPDATE persons SET name=?, named_at=datetime('now') WHERE id=?
         """, (req.name, person_id))
 
-        # Queue all this person's photos for writeback
+        # Queue all this person's photos for writeback.
+        # INSERT OR REPLACE resets any existing row back to 'pending' so that
+        # renaming a person after writeback causes their files to be re-written.
         await db.execute("""
-            INSERT OR IGNORE INTO writeback_queue (media_file_id)
+            INSERT OR REPLACE INTO writeback_queue (media_file_id)
             SELECT DISTINCT f.media_file_id
             FROM faces f
             WHERE f.person_id = ?
@@ -142,7 +144,7 @@ async def create_person_from_cluster(cluster_id: int, req: NameClusterRequest):
 
         # Queue photos for writeback
         await db.execute("""
-            INSERT OR IGNORE INTO writeback_queue (media_file_id)
+            INSERT OR REPLACE INTO writeback_queue (media_file_id)
             SELECT DISTINCT media_file_id FROM faces WHERE cluster_id=?
         """, (cluster_id,))
 
@@ -178,7 +180,7 @@ async def add_cluster_to_person(person_id: int, cluster_id: int):
 
         # Queue photos for writeback
         await db.execute("""
-            INSERT OR IGNORE INTO writeback_queue (media_file_id)
+            INSERT OR REPLACE INTO writeback_queue (media_file_id)
             SELECT DISTINCT media_file_id FROM faces WHERE cluster_id=?
         """, (cluster_id,))
 
