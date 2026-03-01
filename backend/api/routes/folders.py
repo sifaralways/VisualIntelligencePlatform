@@ -100,5 +100,7 @@ async def remove_folder_from_app(folder_id: int, force: bool = False):
             "UPDATE media_files SET removed_from_app=1 WHERE file_path LIKE ? AND removed_from_app=0",
             (path_prefix,),
         )
+        # Remove the scan_state row so the folder disappears from the sidebar
+        await db.execute("DELETE FROM scan_state WHERE id=?", (folder_id,))
 
     return {"status": "ok", "removed": result.rowcount}

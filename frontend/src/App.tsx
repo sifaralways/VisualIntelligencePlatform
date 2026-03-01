@@ -411,17 +411,17 @@ function FolderNavItem({
       className={`group w-full flex items-center gap-1 pl-3 pr-1 py-1.5 rounded-lg text-sm transition-colors
         ${active ? 'bg-indigo-600/80 text-white' : 'text-gray-400 hover:text-white hover:bg-gray-800'}`}
     >
-      <button onClick={onClick} className="flex-1 flex items-center gap-2 text-left truncate">
-        <span className="text-base leading-none">📁</span>
+      <button onClick={onClick} className="flex-1 flex items-center gap-2 text-left truncate min-w-0">
+        <span className="text-base leading-none shrink-0">📁</span>
         <span className="truncate">{name}</span>
         {folder.active_count > 0 && (
-          <span className="text-[10px] text-gray-500 ml-auto pr-1">{folder.active_count}</span>
+          <span className="text-[10px] text-gray-500 ml-auto pl-1 shrink-0">{folder.active_count}</span>
         )}
       </button>
       <button
         onClick={e => { e.stopPropagation(); onRemove() }}
         title="Remove folder from app"
-        className="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-red-400 transition-all px-1 text-xs leading-none"
+        className="shrink-0 w-6 h-6 flex items-center justify-center rounded text-gray-500 hover:text-white hover:bg-red-600 transition-colors ml-1"
       >
         ✕
       </button>
