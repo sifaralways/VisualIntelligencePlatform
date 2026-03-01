@@ -126,6 +126,30 @@ class ExifToolReader:
         return results
 
 
+def _parse_exposure_time(value: Any) -> float | None:
+    """
+    Convert ExifTool's ExposureTime to a float (seconds).
+
+    ExifTool JSON mode usually returns a float, but occasionally emits a
+    fraction string such as "1/500" or "1/8000".  We evaluate it safely
+    by splitting on '/' rather than using eval().
+    """
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        pass
+    try:
+        s = str(value).strip()
+        if '/' in s:
+            num, den = s.split('/', 1)
+            return float(num) / float(den)
+    except Exception:
+        pass
+    return None
+
+
 def _normalise(raw: dict[str, Any]) -> dict[str, Any]:
     """
     Map ExifTool's verbose field names to our internal schema field names.
@@ -149,6 +173,6 @@ def _normalise(raw: dict[str, Any]) -> dict[str, Any]:
         "width":           _get("ImageWidth", "ExifImageWidth"),
         "height":          _get("ImageHeight", "ExifImageHeight"),
         # Shutter speed in seconds (e.g. 0.005 for 1/200 s, 2.0 for 2 s).
-        # ExifTool returns this as a float in JSON output.
-        "exposure_time_s": _get("ExposureTime"),
+        # ExifTool may return a fraction string ("1/500") — parse to float.
+        "exposure_time_s": _parse_exposure_time(_get("ExposureTime")),
     }

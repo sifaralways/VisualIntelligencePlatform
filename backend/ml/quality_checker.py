@@ -77,6 +77,10 @@ def classify_blur(
     is_blurry:    1 = photo is out of focus (defocus blur)
     long_exposure: 1 = shutter was slow enough to be intentional
     """
+    try:
+        exposure_time_s = float(exposure_time_s) if exposure_time_s is not None else None
+    except (ValueError, TypeError):
+        exposure_time_s = None
     if exposure_time_s is not None and exposure_time_s >= LONG_EXPOSURE_CUTOFF_S:
         # Intentional long exposure — never flag as blurry
         return 0, 1

@@ -94,7 +94,11 @@ async def run_reprocess() -> None:
     updated = 0
     for row in media_rows:
         media_id = row["id"]
-        exp_s    = row["exposure_time_s"]
+        _raw_exp = row["exposure_time_s"]
+        try:
+            exp_s = float(_raw_exp) if _raw_exp is not None else None
+        except (ValueError, TypeError):
+            exp_s = None
         thumb    = settings.photo_thumbs_dir / f"{media_id}.jpg"
         if not thumb.exists():
             continue
@@ -366,7 +370,11 @@ async def _phase_embed() -> None:
                 exp_row = await (await db.execute(
                     "SELECT exposure_time_s FROM media_files WHERE id=?", (media_id,)
                 )).fetchone()
-            exp_s = exp_row["exposure_time_s"] if exp_row else None
+            _raw_exp = exp_row["exposure_time_s"] if exp_row else None
+            try:
+                exp_s = float(_raw_exp) if _raw_exp is not None else None
+            except (ValueError, TypeError):
+                exp_s = None
             blur_score = score_blur(preview_arr)
             is_blurry, long_exposure_flag = classify_blur(blur_score, exp_s)
         except Exception as _blur_exc:
