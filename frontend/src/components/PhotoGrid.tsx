@@ -6,7 +6,7 @@
  */
 
 import { useEffect, useState, useCallback, useRef } from 'react'
-import { api, type MediaFile, type MediaFilter } from '../api/client'
+import { api, type MediaFile, type MediaFilter, type RemoveResult } from '../api/client'
 import PhotoDetail from './PhotoDetail'
 
 const PAGE_SIZE = 100
@@ -16,15 +16,32 @@ interface Props {
   title?: string
   /** Optional header slot rendered above the grid */
   headerSlot?: React.ReactNode
+  /** Enable multi-select checkboxes + action bar */
+  selectable?: boolean
+  /** Override the remove handler (ids, force) => RemoveResult; defaults to api.media.removeFromApp */
+  onRemoveFromApp?: (ids: number[], force: boolean) => Promise<RemoveResult>
 }
 
-export default function PhotoGrid({ filter = {}, title, headerSlot }: Props) {
-  const [photos,  setPhotos]  = useState<MediaFile[]>([])
-  const [total,   setTotal]   = useState(0)
-  const [offset,  setOffset]  = useState(0)
-  const [loading, setLoading] = useState(false)
-  const [error,   setError]   = useState<string | null>(null)
+export default function PhotoGrid({
+  filter = {},
+  title,
+  headerSlot,
+  selectable = false,
+  onRemoveFromApp,
+}: Props) {
+  const [photos,   setPhotos]   = useState<MediaFile[]>([])
+  const [total,    setTotal]    = useState(0)
+  const [offset,   setOffset]   = useState(0)
+  const [loading,  setLoading]  = useState(false)
+  const [error,    setError]    = useState<string | null>(null)
   const [selected, setSelected] = useState<MediaFile | null>(null)
+
+  // Multi-select
+  const [selectMode,   setSelectMode]   = useState(false)
+  const [selectedIds,  setSelectedIds]  = useState<Set<number>>(new Set())
+  const [removing,     setRemoving]     = useState(false)
+  const [warning,      setWarning]      = useState<RemoveResult | null>(null)
+  const [pendingForce, setPendingForce] = useState<number[]>([])
 
   // Reset to page 0 when filter changes
   const filterKey = JSON.stringify(filter)
@@ -34,6 +51,8 @@ export default function PhotoGrid({ filter = {}, title, headerSlot }: Props) {
       prevFilterKey.current = filterKey
       setOffset(0)
       setPhotos([])
+      setSelectedIds(new Set())
+      setSelectMode(false)
     }
   }, [filterKey])
 
@@ -56,6 +75,51 @@ export default function PhotoGrid({ filter = {}, title, headerSlot }: Props) {
 
   useEffect(() => { load() }, [load])
 
+  // ── Multi-select helpers ────────────────────────────────────────────────
+
+  function toggleSelect(id: number) {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  function clearSelection() {
+    setSelectedIds(new Set())
+    setSelectMode(false)
+  }
+
+  async function handleRemove(force: boolean) {
+    const ids = force ? pendingForce : Array.from(selectedIds)
+    if (ids.length === 0) return
+    setRemoving(true)
+    try {
+      const doRemove = onRemoveFromApp
+        ? (i: number[], f: boolean) => onRemoveFromApp(i, f)
+        : (i: number[], f: boolean) => api.media.removeFromApp(i, f)
+      const result = await doRemove(ids, force)
+      if (result.status === 'warning') {
+        setPendingForce(ids)
+        setWarning(result)
+        setRemoving(false)
+        return
+      }
+      setWarning(null)
+      setPendingForce([])
+      clearSelection()
+      load()
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Remove failed')
+    } finally {
+      setRemoving(false)
+    }
+  }
+
+  const anySelected = selectedIds.size > 0
+  // Show checkboxes when selectMode is active or any item is already selected
+  const showCheckboxes = selectMode || anySelected
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const currentPage = Math.floor(offset / PAGE_SIZE) + 1
 
@@ -69,7 +133,24 @@ export default function PhotoGrid({ filter = {}, title, headerSlot }: Props) {
             <p className="text-xs text-gray-500 mt-0.5">{total.toLocaleString()} photo{total !== 1 ? 's' : ''}</p>
           )}
         </div>
-        {headerSlot}
+        <div className="flex items-center gap-2">
+          {selectable && photos.length > 0 && (
+            <button
+              onClick={() => {
+                if (selectMode) { clearSelection() }
+                else setSelectMode(true)
+              }}
+              className={`text-xs px-3 py-1.5 rounded-lg font-medium transition-colors ${
+                selectMode
+                  ? 'bg-indigo-600 text-white'
+                  : 'bg-gray-800 text-gray-300 hover:text-white hover:bg-gray-700'
+              }`}
+            >
+              {selectMode ? (anySelected ? `${selectedIds.size} selected` : 'Cancel') : '☑ Select'}
+            </button>
+          )}
+          {headerSlot}
+        </div>
       </div>
 
       {/* Error */}
@@ -101,7 +182,14 @@ export default function PhotoGrid({ filter = {}, title, headerSlot }: Props) {
             <PhotoTile
               key={photo.id}
               photo={photo}
-              onClick={() => setSelected(photo)}
+              selectable={selectable}
+              isSelected={selectedIds.has(photo.id)}
+              showCheckboxes={showCheckboxes}
+              onSelect={() => toggleSelect(photo.id)}
+              onClick={() => {
+                if (showCheckboxes && selectable) toggleSelect(photo.id)
+                else setSelected(photo)
+              }}
             />
           ))}
         </div>
@@ -138,6 +226,65 @@ export default function PhotoGrid({ filter = {}, title, headerSlot }: Props) {
           onClose={() => setSelected(null)}
         />
       )}
+
+      {/* ── Multi-select action bar ── */}
+      {selectable && anySelected && (
+        <div className="fixed bottom-0 left-0 right-0 z-40 flex items-center justify-between gap-4 px-6 py-3 bg-gray-900 border-t border-gray-700 shadow-2xl">
+          <span className="text-sm text-gray-300">
+            <span className="font-semibold text-white">{selectedIds.size}</span> selected
+          </span>
+          <div className="flex items-center gap-3">
+            <button onClick={clearSelection} className="text-xs text-gray-400 hover:text-white transition-colors">
+              Clear
+            </button>
+            <button
+              onClick={() => handleRemove(false)}
+              disabled={removing}
+              className="text-sm bg-red-700 hover:bg-red-600 disabled:opacity-40 text-white font-medium rounded-lg px-4 py-2 transition-colors"
+            >
+              {removing ? 'Removing…' : '🗑 Remove from app'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Writeback warning modal ── */}
+      {warning && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="bg-gray-900 border border-amber-700 rounded-2xl p-6 max-w-sm w-full mx-4 shadow-2xl">
+            <h3 className="text-white font-semibold text-base mb-2">⚠️ Pending metadata</h3>
+            <p className="text-gray-300 text-sm mb-3">
+              {warning.unwritten_count} photo{warning.unwritten_count !== 1 ? 's' : ''} have metadata that hasn't been
+              written to file yet. If you remove them now, those changes will be lost.
+            </p>
+            {warning.unwritten_paths && warning.unwritten_paths.length > 0 && (
+              <ul className="text-amber-300 text-xs mb-4 space-y-0.5 max-h-24 overflow-y-auto">
+                {warning.unwritten_paths.map((p, i) => (
+                  <li key={i} className="truncate">{p.split('/').pop()}</li>
+                ))}
+                {(warning.unwritten_count ?? 0) > warning.unwritten_paths.length && (
+                  <li className="text-gray-500">…and {(warning.unwritten_count ?? 0) - warning.unwritten_paths.length} more</li>
+                )}
+              </ul>
+            )}
+            <div className="flex gap-3">
+              <button
+                onClick={() => { setWarning(null); setPendingForce([]) }}
+                className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-200 text-sm font-medium rounded-lg py-2"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => handleRemove(true)}
+                disabled={removing}
+                className="flex-1 bg-red-700 hover:bg-red-600 disabled:opacity-40 text-white text-sm font-medium rounded-lg py-2"
+              >
+                {removing ? 'Removing…' : 'Remove anyway'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -147,10 +294,23 @@ export default function PhotoGrid({ filter = {}, title, headerSlot }: Props) {
 // Single tile
 // ---------------------------------------------------------------------------
 
-function PhotoTile({ photo, onClick }: { photo: MediaFile; onClick: () => void }) {
+function PhotoTile({
+  photo,
+  selectable,
+  isSelected,
+  showCheckboxes,
+  onSelect,
+  onClick,
+}: {
+  photo: MediaFile
+  selectable: boolean
+  isSelected: boolean
+  showCheckboxes: boolean
+  onSelect: () => void
+  onClick: () => void
+}) {
   const [errored, setErrored] = useState(false)
   const src = api.media.thumbnailUrl(photo.id)
-
   const filename = photo.file_path.split('/').pop() ?? ''
   const date = photo.date_taken ? photo.date_taken.slice(0, 10) : null
 
@@ -158,7 +318,10 @@ function PhotoTile({ photo, onClick }: { photo: MediaFile; onClick: () => void }
     <button
       onClick={onClick}
       title={`${filename}${date ? `  •  ${date}` : ''}`}
-      className="relative aspect-square bg-gray-900 rounded overflow-hidden group hover:ring-2 hover:ring-indigo-400 transition-all focus:outline-none focus:ring-2 focus:ring-indigo-400"
+      className={`relative aspect-square bg-gray-900 rounded overflow-hidden group transition-all focus:outline-none
+        ${isSelected
+          ? 'ring-2 ring-indigo-400'
+          : 'hover:ring-2 hover:ring-indigo-400 focus:ring-2 focus:ring-indigo-400'}`}
     >
       {errored ? (
         <div className="absolute inset-0 flex flex-col items-center justify-center text-gray-600 gap-1">
@@ -179,6 +342,21 @@ function PhotoTile({ photo, onClick }: { photo: MediaFile; onClick: () => void }
         <p className="text-white text-[10px] truncate">{filename}</p>
         {date && <p className="text-gray-300 text-[9px]">{date}</p>}
       </div>
+      {selectable && (showCheckboxes || isSelected) && (
+        <div
+          className="absolute top-1.5 left-1.5"
+          onClick={e => { e.stopPropagation(); onSelect() }}
+        >
+          <div className={`w-5 h-5 rounded-full border-2 flex items-center justify-center transition-colors
+            ${isSelected
+              ? 'bg-indigo-500 border-indigo-400'
+              : 'bg-black/60 border-gray-300 hover:border-white'}`}>
+            {isSelected && <span className="text-white text-[10px] leading-none">✓</span>}
+          </div>
+        </div>
+      )}
+      {/* Selected tint */}
+      {isSelected && <div className="absolute inset-0 bg-indigo-500/20 pointer-events-none" />}
     </button>
   )
 }

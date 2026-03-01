@@ -9,7 +9,7 @@ import AdminPage from './pages/AdminPage'
 import QualityPage from './pages/QualityPage'
 import PhotoGrid from './components/PhotoGrid'
 import { api } from './api/client'
-import type { MediaFilter, WsEvent, MergeSuggestionItem } from './api/client'
+import type { MediaFilter, WsEvent, MergeSuggestionItem, FolderItem, RemoveResult } from './api/client'
 import './index.css'
 
 // ---------------------------------------------------------------------------
@@ -22,6 +22,8 @@ interface FilteredView {
   title: string
   filter: MediaFilter
   backTo: SidebarSection
+  /** Track which folder (if any) this view is showing — for sidebar active state */
+  folderId?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -32,6 +34,23 @@ export default function App() {
   const [section, setSection]       = useState<SidebarSection>('library')
   const [filtered, setFiltered]     = useState<FilteredView | null>(null)
 
+  // Scanned folders displayed in sidebar
+  const [folders, setFolders] = useState<FolderItem[]>([])
+  const [folderLoadError, setFolderLoadError] = useState(false)
+  const [folderWarning, setFolderWarning] = useState<{
+    folder: FolderItem
+    result: RemoveResult
+  } | null>(null)
+
+  const loadFolders = useCallback(async () => {
+    try {
+      setFolderLoadError(false)
+      setFolders(await api.folders.list())
+    } catch {
+      setFolderLoadError(true)
+    }
+  }, [])
+
   // ── Global pipeline notifications ─────────────────────────────────────────
   const wsRef = useRef<WebSocket | null>(null)
   const [qualityCount,     setQualityCount]     = useState<number | null>(null)
@@ -39,6 +58,7 @@ export default function App() {
   const [mergeWorking,     setMergeWorking]     = useState(false)
 
   useEffect(() => {
+    loadFolders()
     function connect() {
       const ws = new WebSocket('ws://localhost:7474/ws/progress')
       wsRef.current = ws
@@ -55,6 +75,9 @@ export default function App() {
           }
           if (ev.event === 'quality_issues_found' && ev.count) {
             setQualityCount(ev.count)
+          }
+          if (ev.event === 'pipeline_complete') {
+            loadFolders()
           }
         } catch {}
       }
@@ -84,8 +107,8 @@ export default function App() {
   }, [mergeSuggestions])
 
   /** Navigate to a filtered photo grid (e.g. photos of Alice, photos of dogs) */
-  function openFiltered(filter: MediaFilter, title: string, backTo: SidebarSection) {
-    setFiltered({ filter, title, backTo })
+  function openFiltered(filter: MediaFilter, title: string, backTo: SidebarSection, folderId?: number) {
+    setFiltered({ filter, title, backTo, folderId })
   }
 
   /** Go back from filtered view to the discover/people section */
@@ -97,6 +120,23 @@ export default function App() {
   function navigate(s: SidebarSection) {
     setSection(s)
     setFiltered(null)
+  }
+
+  /** Start folder remove — check for pending writeback first */
+  async function handleFolderRemove(folder: FolderItem, force = false) {
+    try {
+      const result = await api.folders.removeFromApp(folder.id, force)
+      if (result.status === 'warning') {
+        setFolderWarning({ folder, result })
+        return
+      }
+      // On success: close warning, refresh folders, go back to library if viewing that folder
+      setFolderWarning(null)
+      loadFolders()
+      if (filtered?.folderId === folder.id) {
+        navigate('library')
+      }
+    } catch { /* ignore */ }
   }
 
   // ── Main content ──────────────────────────────────────────────────────────
@@ -112,7 +152,7 @@ export default function App() {
         >
           ← Back
         </button>
-        <PhotoGrid filter={filtered.filter} title={filtered.title} />
+        <PhotoGrid filter={filtered.filter} title={filtered.title} selectable />
       </div>
     )
   } else {
@@ -189,7 +229,25 @@ export default function App() {
         {/* ── Sidebar ── */}
         <aside className="w-48 shrink-0 border-r border-gray-800 py-3 flex flex-col gap-1 overflow-y-auto bg-gray-950">
           <NavGroup label="Library">
-            <NavItem id="library"   icon="📚" label="All Photos"   active={section === 'library'   && !filtered} onClick={() => navigate('library')} />
+            <NavItem id="library" icon="📚" label="All Photos" active={section === 'library' && !filtered} onClick={() => navigate('library')} />
+            {folderLoadError && (
+              <p className="text-[10px] text-red-400 px-3 py-1">Could not load folders — is the server running?</p>
+            )}
+            {!folderLoadError && folders.length === 0 && (
+              <p className="text-[10px] text-gray-600 px-3 py-1 italic">No folders scanned yet</p>
+            )}
+            {folders.map(f => {
+              const name = f.folder_path.split('/').pop() || f.folder_path
+              return (
+                <FolderNavItem
+                  key={f.id}
+                  folder={f}
+                  active={filtered?.folderId === f.id}
+                  onClick={() => openFiltered({ folder_id: f.id }, `📁 ${name}`, 'library', f.id)}
+                  onRemove={() => handleFolderRemove(f)}
+                />
+              )
+            })}
           </NavGroup>
 
           <NavGroup label="People & Places">
@@ -213,6 +271,41 @@ export default function App() {
           {mainContent}
         </main>
       </div>
+
+      {/* ── Folder remove warning modal ── */}
+      {folderWarning && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="bg-gray-900 border border-amber-700 rounded-2xl p-6 max-w-sm w-full mx-4 shadow-2xl">
+            <h3 className="text-white font-semibold text-base mb-2">⚠️ Pending metadata</h3>
+            <p className="text-gray-300 text-sm mb-3">
+              {folderWarning.result.unwritten_count} photo
+              {folderWarning.result.unwritten_count !== 1 ? 's' : ''} in this folder have metadata
+              that hasn't been written to file yet. Removing will discard those changes.
+            </p>
+            {folderWarning.result.unwritten_paths && folderWarning.result.unwritten_paths.length > 0 && (
+              <ul className="text-amber-300 text-xs mb-4 space-y-0.5 max-h-24 overflow-y-auto">
+                {folderWarning.result.unwritten_paths.map((p, i) => (
+                  <li key={i} className="truncate">{p.split('/').pop()}</li>
+                ))}
+              </ul>
+            )}
+            <div className="flex gap-3">
+              <button
+                onClick={() => setFolderWarning(null)}
+                className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-200 text-sm font-medium rounded-lg py-2"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => handleFolderRemove(folderWarning.folder, true)}
+                className="flex-1 bg-red-700 hover:bg-red-600 text-white text-sm font-medium rounded-lg py-2"
+              >
+                Remove anyway
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Global notification stack (bottom-right) ── */}
       <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-3 max-w-sm w-full pointer-events-none">
@@ -300,6 +393,42 @@ export default function App() {
 // ---------------------------------------------------------------------------
 // Sidebar sub-components
 // ---------------------------------------------------------------------------
+
+function FolderNavItem({
+  folder,
+  active,
+  onClick,
+  onRemove,
+}: {
+  folder: FolderItem
+  active: boolean
+  onClick: () => void
+  onRemove: () => void
+}) {
+  const name = folder.folder_path.split('/').pop() || folder.folder_path
+  return (
+    <div
+      className={`group w-full flex items-center gap-1 pl-3 pr-1 py-1.5 rounded-lg text-sm transition-colors
+        ${active ? 'bg-indigo-600/80 text-white' : 'text-gray-400 hover:text-white hover:bg-gray-800'}`}
+    >
+      <button onClick={onClick} className="flex-1 flex items-center gap-2 text-left truncate">
+        <span className="text-base leading-none">📁</span>
+        <span className="truncate">{name}</span>
+        {folder.active_count > 0 && (
+          <span className="text-[10px] text-gray-500 ml-auto pr-1">{folder.active_count}</span>
+        )}
+      </button>
+      <button
+        onClick={e => { e.stopPropagation(); onRemove() }}
+        title="Remove folder from app"
+        className="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-red-400 transition-all px-1 text-xs leading-none"
+      >
+        ✕
+      </button>
+    </div>
+  )
+}
+
 
 function NavGroup({ label, children }: { label: string; children: React.ReactNode }) {
   return (
