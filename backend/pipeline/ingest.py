@@ -272,11 +272,19 @@ async def _phase_scan(folder: Path) -> None:
                         meta.get("exposure_time_s"), existing_id,
                     ))
                 else:
-                    # New file — use file's existing XMP:Identifier if present
-                    # (preserves continuity when re-importing a file previously
-                    # processed by VIP on another machine / after DB reset).
-                    # Fall back to a fresh UUID4 for files VIP hasn't seen before.
-                    new_vip_id = meta.get("xmp_identifier") or str(uuid.uuid4())
+                    # New file — reuse the file's own XMP:Identifier as vip_id
+                    # only if it hasn't already been claimed by a different row
+                    # (RAW+JPEG pairs, camera firmware duplication, or files
+                    # shared across folders can all carry the same identifier).
+                    # In those cases fall back to a fresh UUID.
+                    _candidate_id = meta.get("xmp_identifier")
+                    if _candidate_id:
+                        _taken = await (await db.execute(
+                            "SELECT 1 FROM media_files WHERE vip_id=?", (_candidate_id,)
+                        )).fetchone()
+                        new_vip_id = _candidate_id if _taken is None else str(uuid.uuid4())
+                    else:
+                        new_vip_id = str(uuid.uuid4())
 
                     # Build a one-time snapshot of whatever rich XMP/IPTC data
                     # existed in the file *before* VIP touches it.  This snapshot
