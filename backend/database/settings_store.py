@@ -96,6 +96,25 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "description": "Clusters above this intra-similarity score show a green tick in the People tab.",
         "group": "Clustering",
     },
+    "auto_name_threshold": {
+        "value": 0.98, "type": "float", "min": 0.70, "max": 0.99, "step": 0.01,
+        "label": "Auto-merge threshold",
+        "description": (
+            "Cosine similarity at or above which an unnamed cluster is automatically merged into a named person "
+            "without asking. 0.98 = near-identical (very safe). Lower to ~0.80–0.85 to auto-accept most "
+            "merge suggestions; lower still risks merging different people. Must be ≥ Merge-suggest threshold."
+        ),
+        "group": "Clustering",
+    },
+    "merge_suggest_threshold": {
+        "value": 0.63, "type": "float", "min": 0.40, "max": 0.97, "step": 0.01,
+        "label": "Merge-suggest threshold",
+        "description": (
+            "Cosine similarity at or above which a \"Same person?\" suggestion card is shown. "
+            "Matches below this are ignored. Must be ≤ Auto-merge threshold."
+        ),
+        "group": "Clustering",
+    },
     "yolo_conf_threshold": {
         "value": 0.50, "type": "float", "min": 0.1, "max": 0.95, "step": 0.05,
         "label": "Object detection confidence",

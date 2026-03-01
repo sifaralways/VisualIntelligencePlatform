@@ -675,9 +675,10 @@ async def _phase_auto_merge() -> None:
     is recomputed from embeddings and stored so it survives future removals.
     """
     from backend.pipeline.centroid import update_person_centroid, load_centroid
+    from backend.database.settings_store import get as get_setting
 
-    auto_name_threshold   = settings.auto_name_threshold
-    suggest_threshold     = settings.merge_suggest_threshold
+    auto_name_threshold   = get_setting("auto_name_threshold")
+    suggest_threshold     = get_setting("merge_suggest_threshold")
 
     logger.info(
         "Phase 3b: Auto-name check (name≥%.2f, suggest≥%.2f)",
