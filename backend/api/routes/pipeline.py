@@ -41,6 +41,16 @@ async def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
                 WHERE file_path LIKE ?
             """, (f"{folder}%",))
 
+    # Upsert scan_state immediately so the sidebar shows the folder right away
+    async with get_db() as db:
+        await db.execute("""
+            INSERT INTO scan_state (folder_path, status, last_scan_at, file_count)
+            VALUES (?, 'scanning', datetime('now'), 0)
+            ON CONFLICT(folder_path) DO UPDATE SET
+                status       = 'scanning',
+                last_scan_at = datetime('now')
+        """, (str(folder),))
+
     _pipeline_state.update({"status": "running", "folder": str(folder), "error": None})
     background_tasks.add_task(_run_pipeline, str(folder))
 
@@ -81,9 +91,27 @@ async def _run_pipeline(folder: str) -> None:
     from backend.pipeline.ingest import run_ingest
     try:
         await run_ingest(folder)
+        # Update scan_state with final file count and idle status
+        async with get_db() as db:
+            await db.execute("""
+                UPDATE scan_state
+                SET status       = 'idle',
+                    last_scan_at = datetime('now'),
+                    file_count   = (
+                        SELECT COUNT(*) FROM media_files
+                        WHERE file_path LIKE ? || '/%'
+                          AND removed_from_app = 0
+                    )
+                WHERE folder_path = ?
+            """, (folder, folder))
         _pipeline_state["status"] = "idle"
     except Exception as e:
         logger.exception("Pipeline error")
+        async with get_db() as db:
+            await db.execute(
+                "UPDATE scan_state SET status='error' WHERE folder_path=?",
+                (folder,)
+            )
         _pipeline_state["status"] = "error"
         _pipeline_state["error"] = str(e)
 

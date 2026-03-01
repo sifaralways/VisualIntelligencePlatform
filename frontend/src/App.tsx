@@ -158,7 +158,7 @@ export default function App() {
   } else {
     switch (section) {
       case 'library':
-        mainContent = <LibraryPage onScanStarted={() => navigate('pipeline')} />
+        mainContent = <LibraryPage onScanStarted={() => { loadFolders(); navigate('pipeline') }} />
         break
       case 'people':
         mainContent = (
