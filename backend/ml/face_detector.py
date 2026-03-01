@@ -48,6 +48,7 @@ class DetectedFace:
     landmarks: Optional[list] = None      # list of {Type, X, Y} following Rekognition naming
     quality_brightness: Optional[float] = None   # mean pixel brightness 0–100
     quality_sharpness: Optional[float] = None    # Laplacian variance → sharpness 0–100
+    eyes_open: Optional[bool] = None             # True = eyes appear open (gradient check)
 
 
 class FaceDetector:
@@ -157,6 +158,16 @@ class FaceDetector:
                     for name, kp in zip(kps_names, raw_kps)
                 ]
 
+            # ── Eye-open state (vertical gradient of eye-region patch) ────────
+            eyes_open: Optional[bool] = None
+            if raw_kps is not None and len(raw_kps) >= 2:
+                from backend.ml.quality_checker import check_eyes_open
+                eyes_open = check_eyes_open(
+                    img,
+                    eye_kps_px=[raw_kps[0].tolist(), raw_kps[1].tolist()],
+                    face_w_px=w,
+                )
+
             # ── Quality: brightness + sharpness from face crop ────────────────
             quality_brightness = quality_sharpness = None
             if crop.size > 0:
@@ -186,6 +197,7 @@ class FaceDetector:
                 landmarks=landmarks,
                 quality_brightness=quality_brightness,
                 quality_sharpness=quality_sharpness,
+                eyes_open=eyes_open,
             ))
 
         return results

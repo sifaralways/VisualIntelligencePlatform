@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 import aiosqlite
+import numpy as np
 
 from backend.config import settings
 from backend.database.db import get_db
@@ -151,14 +152,16 @@ async def _phase_scan(folder: Path) -> None:
                         UPDATE media_files SET
                             file_path=?, file_size=?, file_format=?, camera_make=?, camera_model=?,
                             date_taken=?, gps_lat=?, gps_lon=?, width=?, height=?,
-                            is_stub=?, ingest_state='scanned', needs_reprocess=0,
+                            is_stub=?, exposure_time_s=?,
+                            ingest_state='scanned', needs_reprocess=0,
                             last_seen_at=datetime('now')
                         WHERE id=?
                     """, (
                         str(file_path), stat.st_size, meta.get("file_format"),
                         meta.get("camera_make"), meta.get("camera_model"),
                         meta.get("date_taken"), meta.get("gps_lat"), meta.get("gps_lon"),
-                        meta.get("width"), meta.get("height"), int(is_stub), existing_id,
+                        meta.get("width"), meta.get("height"), int(is_stub),
+                        meta.get("exposure_time_s"), existing_id,
                     ))
                 else:
                     # New file — generate a stable UUID for XMP:Identifier
@@ -166,14 +169,15 @@ async def _phase_scan(folder: Path) -> None:
                     await db.execute("""
                         INSERT INTO media_files
                             (vip_id, file_path, file_hash, file_size, file_format, camera_make, camera_model,
-                             date_taken, gps_lat, gps_lon, width, height, is_stub, ingest_state)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'scanned')
+                             date_taken, gps_lat, gps_lon, width, height, is_stub, exposure_time_s, ingest_state)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'scanned')
                     """, (
                         new_vip_id,
                         str(file_path), file_hash, stat.st_size, meta.get("file_format"),
                         meta.get("camera_make"), meta.get("camera_model"),
                         meta.get("date_taken"), meta.get("gps_lat"), meta.get("gps_lon"),
                         meta.get("width"), meta.get("height"), int(is_stub),
+                        meta.get("exposure_time_s"),
                     ))
 
                 scanned += 1
@@ -245,6 +249,24 @@ async def _phase_embed() -> None:
                 )
             continue
 
+        # ── Blur detection on full preview (must happen before thumbnail resize) ──
+        blur_score: float | None = None
+        is_blurry: int | None = None
+        long_exposure_flag: int | None = None
+        try:
+            from backend.ml.quality_checker import score_blur, classify_blur
+            preview_arr = np.array(_PILImage.open(preview_path).convert("L"))  # greyscale
+            # Read exposure_time_s from DB (set during Phase 1 scan)
+            async with get_db() as db:
+                exp_row = await (await db.execute(
+                    "SELECT exposure_time_s FROM media_files WHERE id=?", (media_id,)
+                )).fetchone()
+            exp_s = exp_row["exposure_time_s"] if exp_row else None
+            blur_score = score_blur(preview_arr)
+            is_blurry, long_exposure_flag = classify_blur(blur_score, exp_s)
+        except Exception as _blur_exc:
+            logger.debug("Blur check failed for %s: %s", file_path, _blur_exc)
+
         # Generate permanent photo thumbnail for the UI grid
         await asyncio.get_event_loop().run_in_executor(
             None, _make_photo_thumb, preview_path, media_id
@@ -286,7 +308,14 @@ async def _phase_embed() -> None:
                 face_attrs.setdefault("Smile",       None)
                 face_attrs.setdefault("Eyeglasses",  None)
                 face_attrs.setdefault("Sunglasses",  None)
-                face_attrs.setdefault("EyesOpen",    None)
+                # EyesOpen: now computed from vertical gradient of eye-region patch
+                if face.eyes_open is not None:
+                    face_attrs["EyesOpen"] = {
+                        "Value": face.eyes_open,
+                        "Confidence": 80.0,  # heuristic, not a calibrated model
+                    }
+                else:
+                    face_attrs.setdefault("EyesOpen",    None)
                 face_attrs.setdefault("MouthOpen",   None)
                 face_attrs.setdefault("Beard",       None)
                 face_attrs.setdefault("Emotions",    None)
@@ -321,7 +350,30 @@ async def _phase_embed() -> None:
                 "UPDATE media_files SET ingest_state='embedded' WHERE id=?", (media_id,)
             )
 
-        # Previews are kept alive for Phase 4 tagging — deleted there.
+        # ── Derive has_closed_eyes from the faces we just inserted ─────────────
+        has_closed_eyes = 0
+        try:
+            async with get_db() as db:
+                face_attr_rows = await db.execute_fetchall(
+                    "SELECT face_attributes FROM faces WHERE media_file_id=? AND face_attributes IS NOT NULL",
+                    (media_id,)
+                )
+            for far in face_attr_rows:
+                attrs = json.loads(far["face_attributes"])
+                eyes = attrs.get("EyesOpen")
+                if isinstance(eyes, dict) and eyes.get("Value") is False:
+                    has_closed_eyes = 1
+                    break
+        except Exception:
+            pass
+
+        # ── Write quality signals back to media_files ────────────────────────
+        async with get_db() as db:
+            await db.execute("""
+                UPDATE media_files
+                SET blur_score=?, is_blurry=?, long_exposure=?, has_closed_eyes=?
+                WHERE id=?
+            """, (blur_score, is_blurry, long_exposure_flag, has_closed_eyes, media_id))
 
         processed += 1
         if processed % 50 == 0:

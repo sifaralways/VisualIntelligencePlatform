@@ -48,6 +48,13 @@ export const api = {
     tags: (id: number) => request<TagsByCategory>(`/tags/${id}`),
     thumbnailUrl: (id: number) => `${BASE}/media/${id}/thumbnail`,
     previewUrl:   (id: number) => `${BASE}/media/${id}/preview`,
+    quality: (issue: 'blurry' | 'closed_eyes' | 'all' = 'all') =>
+      request<QualityIssue[]>(`/media/quality?issue=${issue}`),
+    bulkDelete: (mediaIds: number[]) =>
+      request<{ deleted: number }>('/media/bulk', {
+        method: 'DELETE',
+        body: JSON.stringify({ media_ids: mediaIds }),
+      }),
   },
 
   // ─── Clusters ─────────────────────────────────────────────────────────────
@@ -191,6 +198,19 @@ export interface MediaFile {
   is_stub: number
   ingest_state: string
   writeback_done: number
+}
+
+export interface QualityIssue {
+  id: number
+  file_path: string
+  date_taken: string | null
+  blur_score: number | null
+  is_blurry: number | null
+  long_exposure: number | null
+  has_closed_eyes: number | null
+  width: number | null
+  height: number | null
+  thumbnail_url: string | null
 }
 
 export interface Cluster {

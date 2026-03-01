@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import shutil
 from pathlib import Path
+from typing import List
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
 from backend.config import settings
 from backend.database.db import get_db
@@ -132,6 +135,86 @@ async def list_media(
     async with get_db() as db:
         rows = await db.execute_fetchall(sql, params)
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Quality issues
+# ---------------------------------------------------------------------------
+
+@router.get("/quality")
+async def quality_issues(issue: str = Query("all", regex="^(blurry|closed_eyes|all)$")):
+    """Return media files flagged with quality issues.
+
+    issue: 'blurry' | 'closed_eyes' | 'all'
+    """
+    if issue == "blurry":
+        condition = "mf.is_blurry = 1"
+    elif issue == "closed_eyes":
+        condition = "mf.has_closed_eyes = 1"
+    else:
+        condition = "(mf.is_blurry = 1 OR mf.has_closed_eyes = 1)"
+
+    sql = f"""
+        SELECT
+            mf.id, mf.file_path, mf.date_taken,
+            mf.blur_score, mf.is_blurry, mf.long_exposure,
+            mf.has_closed_eyes, mf.width, mf.height
+        FROM media_files mf
+        WHERE {condition}
+        ORDER BY mf.date_taken DESC, mf.id DESC
+    """
+    async with get_db() as db:
+        rows = await db.execute_fetchall(sql, [])
+    results = []
+    for r in rows:
+        item = dict(r)
+        thumb = _thumb_path(item["id"])
+        item["thumbnail_url"] = f"/api/media/{item['id']}/thumbnail" if thumb.exists() else None
+        results.append(item)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Bulk delete
+# ---------------------------------------------------------------------------
+
+class BulkDeleteRequest(BaseModel):
+    media_ids: List[int]
+
+
+@router.delete("/bulk")
+async def bulk_delete(body: BulkDeleteRequest):
+    """Permanently delete one or more media files (photo thumbs, face thumbs, DB rows)."""
+    if not body.media_ids:
+        return {"deleted": 0}
+
+    deleted = 0
+    async with get_db() as db:
+        for media_id in body.media_ids:
+            # Fetch face ids so we can remove their thumbnails
+            face_rows = await db.execute_fetchall(
+                "SELECT id, thumbnail_path FROM faces WHERE media_file_id=?", (media_id,)
+            )
+            # Remove face thumbnails
+            for fr in face_rows:
+                if fr["thumbnail_path"]:
+                    try:
+                        Path(fr["thumbnail_path"]).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            # Remove photo thumbnail
+            try:
+                _thumb_path(media_id).unlink(missing_ok=True)
+            except Exception:
+                pass
+            # Remove DB row (faces + embeddings cascade via FK)
+            result = await db.execute(
+                "DELETE FROM media_files WHERE id=?", (media_id,)
+            )
+            if result.rowcount:
+                deleted += 1
+
+    return {"deleted": deleted}
 
 
 # ---------------------------------------------------------------------------

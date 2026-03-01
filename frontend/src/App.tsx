@@ -6,6 +6,7 @@ import TagsPage from './pages/TagsPage'
 import WritebackPage from './pages/WritebackPage'
 import PipelinePage from './pages/PipelinePage'
 import AdminPage from './pages/AdminPage'
+import QualityPage from './pages/QualityPage'
 import PhotoGrid from './components/PhotoGrid'
 import type { MediaFilter } from './api/client'
 import './index.css'
@@ -14,7 +15,7 @@ import './index.css'
 // View state machine
 // ---------------------------------------------------------------------------
 
-type SidebarSection = 'library' | 'people' | 'animals' | 'places' | 'things' | 'tags' | 'pipeline' | 'writeback' | 'admin'
+type SidebarSection = 'library' | 'people' | 'animals' | 'places' | 'things' | 'tags' | 'pipeline' | 'writeback' | 'admin' | 'quality'
 
 interface FilteredView {
   title: string
@@ -115,6 +116,9 @@ export default function App() {
       case 'writeback':
         mainContent = <WritebackPage />
         break
+      case 'quality':
+        mainContent = <QualityPage />
+        break
       case 'admin':
         mainContent = <AdminPage />
         break
@@ -147,6 +151,7 @@ export default function App() {
           <NavGroup label="Tools">
             <NavItem id="pipeline"  icon="⚙️" label="Pipeline"     active={section === 'pipeline'  && !filtered} onClick={() => navigate('pipeline')} />
             <NavItem id="writeback" icon="💾" label="Write to Files" active={section === 'writeback' && !filtered} onClick={() => navigate('writeback')} />
+            <NavItem id="quality"   icon="🎯" label="Quality"       active={section === 'quality'   && !filtered} onClick={() => navigate('quality')} />
             <NavItem id="admin"     icon="🛠" label="Admin"         active={section === 'admin'     && !filtered} onClick={() => navigate('admin')} />
           </NavGroup>
         </aside>

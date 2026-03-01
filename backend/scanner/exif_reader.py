@@ -139,13 +139,16 @@ def _normalise(raw: dict[str, Any]) -> dict[str, Any]:
         return None
 
     return {
-        "file_path":     raw.get("SourceFile"),
-        "file_format":   _get("FileType"),
-        "camera_make":   _get("Make"),
-        "camera_model":  _get("Model"),
-        "date_taken":    _get("DateTimeOriginal", "CreateDate", "ModifyDate"),
-        "gps_lat":       _get("GPSLatitude"),
-        "gps_lon":       _get("GPSLongitude"),
-        "width":         _get("ImageWidth", "ExifImageWidth"),
-        "height":        _get("ImageHeight", "ExifImageHeight"),
+        "file_path":       raw.get("SourceFile"),
+        "file_format":     _get("FileType"),
+        "camera_make":     _get("Make"),
+        "camera_model":    _get("Model"),
+        "date_taken":      _get("DateTimeOriginal", "CreateDate", "ModifyDate"),
+        "gps_lat":         _get("GPSLatitude"),
+        "gps_lon":         _get("GPSLongitude"),
+        "width":           _get("ImageWidth", "ExifImageWidth"),
+        "height":          _get("ImageHeight", "ExifImageHeight"),
+        # Shutter speed in seconds (e.g. 0.005 for 1/200 s, 2.0 for 2 s).
+        # ExifTool returns this as a float in JSON output.
+        "exposure_time_s": _get("ExposureTime"),
     }
