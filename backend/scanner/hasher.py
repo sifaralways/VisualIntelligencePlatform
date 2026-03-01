@@ -49,7 +49,7 @@ async def check_idempotency(
     """
     row = await (
         await db.execute(
-            "SELECT id, file_path, needs_reprocess FROM media_files WHERE file_hash = ?",
+            "SELECT id, file_path, needs_reprocess, removed_from_app FROM media_files WHERE file_hash = ?",
             (file_hash,),
         )
     ).fetchone()
@@ -58,11 +58,17 @@ async def check_idempotency(
         # New file — not seen before
         return False, None
 
-    existing_id, existing_path, needs_reprocess = row["id"], row["file_path"], row["needs_reprocess"]
+    existing_id, existing_path, needs_reprocess, removed = (
+        row["id"], row["file_path"], row["needs_reprocess"], row["removed_from_app"]
+    )
 
-    if needs_reprocess:
-        # User explicitly requested re-evaluation of this folder
-        logger.debug("Reprocess requested: %s (id=%d)", file_path, existing_id)
+    if needs_reprocess or removed:
+        # Re-evaluate: either explicitly requested or the file was soft-removed
+        # and is being re-added by re-scanning the folder.
+        if removed:
+            logger.info("Re-adding previously removed file: %s (id=%d)", file_path, existing_id)
+        else:
+            logger.debug("Reprocess requested: %s (id=%d)", file_path, existing_id)
         return False, existing_id
 
     # Already processed — update path if it moved

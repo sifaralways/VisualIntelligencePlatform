@@ -255,13 +255,13 @@ async def _phase_scan(folder: Path) -> None:
                 is_stub = stat.st_size < settings.stub_max_size_bytes
 
                 if existing_id:
-                    # Re-evaluation: update existing record
+                    # Re-evaluation: update existing record (also clears removed_from_app)
                     await db.execute("""
                         UPDATE media_files SET
                             file_path=?, file_size=?, file_format=?, camera_make=?, camera_model=?,
                             date_taken=?, gps_lat=?, gps_lon=?, width=?, height=?,
                             is_stub=?, exposure_time_s=?,
-                            ingest_state='scanned', needs_reprocess=0,
+                            ingest_state='scanned', needs_reprocess=0, removed_from_app=0,
                             last_seen_at=datetime('now')
                         WHERE id=?
                     """, (
