@@ -491,4 +491,5 @@ export interface AppSetting {
   label: string
   description: string
   group: string
+  options?: { value: number; label: string }[]  // present → render segmented control
 }

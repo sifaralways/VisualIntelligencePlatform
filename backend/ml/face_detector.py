@@ -53,66 +53,92 @@ class DetectedFace:
 
 class FaceDetector:
     """
-    Thin wrapper around InsightFace FaceAnalysis.
-    Initialised once and reused across the pipeline.
+    Wrapper around InsightFace FaceAnalysis supporting three runtime modes:
+
+      0 — Accuracy    : CPUExecutionProvider, det_size=(1280, 1280)
+                        Reliable for every face size. ~1.2 s/photo on M-series.
+      1 — Performance : CoreMLExecutionProvider (ANE/GPU) + CPU fallback,
+                        det_size=(640, 640). Up to 10× faster; may miss faces
+                        smaller than ~50 px in the 640-grid.
+      2 — Intelligent : Loads both sessions. Uses Signal 1 (EXIF focal length)
+                        and Signal 2 (face-size oracle) to pick the cheapest
+                        correct path per image automatically.
+
+    CoreML constraint: the det_10g.onnx dynamic spatial dims produce a shape
+    mismatch under CoreML when det_size > 640 (ORT expects 12800 anchors;
+    CoreML compiles for 3200).  At det_size=(640, 640) both sides agree, so
+    CoreML works correctly.  Mode 0 therefore stays on CPU with 1280.
     """
 
+    # Escalation thresholds for Intelligent mode (Signal 2)
+    _ESCALATE_MIN_FACES   = 5      # ≥ N faces detected at 640 → escalate
+    _ESCALATE_MIN_FACE_W  = 0.04  # any face bbox_w < 4% of frame width → escalate
+    # Signal 1 focal-length threshold (mm, 35mm-equivalent)
+    _WIDE_ANGLE_MM        = 35
+
     def __init__(self) -> None:
-        self._app = None
-        self._loaded_mode: int | None = None  # tracks which mode the model was last prepared for
+        self._app_accurate: object | None = None   # CPU, 1280×1280
+        self._app_fast: object | None = None       # CoreML, 640×640
+        self._loaded_mode: int | None = None
+
+    # ── Model loading ────────────────────────────────────────────────────────
 
     def load(self) -> None:
         """
-        Load (or re-prepare) the model.
-
-        Called at the start of every pipeline run.  Checks the current
-        face_detection_mode setting:
-          0 = Accuracy   — CPUExecutionProvider, det_size=(1280, 1280)
-          1 = Performance — CoreMLExecutionProvider (ANE/GPU) with CPU fallback,
-                            det_size=(640, 640).
-
-        CoreML note: at det_size > 640 the CoreML EP mishandles the dynamic
-        spatial dims in det_10g.onnx — ORT shape inference yields 12800 anchors
-        but CoreML compiles for 3200, causing a rank mismatch at runtime.  At
-        det_size=(640, 640) the anchor count is 3200 on both sides, so the bug
-        does not occur.
+        Load or re-prepare model sessions based on the current
+        face_detection_mode setting.  Called at the start of every pipeline
+        run (after settings cache is refreshed), so a mode change in the
+        Admin UI takes effect on the next scan without a server restart.
         """
-        import insightface  # noqa: F401 — registers providers
+        import insightface  # noqa: F401 — ensures ORT EP registry is populated
         from insightface.app import FaceAnalysis
 
-        mode = int(get_setting('face_detection_mode'))  # 0=accuracy, 1=performance
+        mode = int(get_setting('face_detection_mode'))
 
-        # Skip re-prepare if already loaded in the same mode
-        if self._app is not None and self._loaded_mode == mode:
-            return
+        if self._loaded_mode == mode:
+            return  # nothing changed — both sessions already in the right state
 
-        if mode == 1:
-            providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
-            det_size  = (640, 640)
-            mode_label = "Performance (CoreML ANE/GPU, 640×640)"
-        else:
-            providers = ["CPUExecutionProvider"]
-            det_size  = (1280, 1280)
-            mode_label = "Accuracy (CPU, 1280×1280)"
+        logger.info("Preparing face detector for mode %d …", mode)
 
-        logger.info("Loading InsightFace Buffalo_L — mode: %s …", mode_label)
-        self._app = FaceAnalysis(
-            name=settings.insightface_model,
-            providers=providers,
-        )
-        self._app.prepare(ctx_id=0, det_size=det_size)
+        # Release stale sessions so memory is freed before allocating fresh ones
+        self._app_accurate = None
+        self._app_fast = None
+
+        def _make(providers: list[str], det_size: tuple[int, int]) -> object:
+            app = FaceAnalysis(name=settings.insightface_model, providers=providers)
+            app.prepare(ctx_id=0, det_size=det_size)
+            return app
+
+        if mode in (0, 2):      # Accuracy or Intelligent need the 1280 CPU session
+            logger.info("  Loading accurate session (CPU, 1280×1280) …")
+            self._app_accurate = _make(["CPUExecutionProvider"], (1280, 1280))
+
+        if mode in (1, 2):      # Performance or Intelligent need the 640 CoreML session
+            logger.info("  Loading fast session (CoreML ANE/GPU + CPU fallback, 640×640) …")
+            self._app_fast = _make(
+                ["CoreMLExecutionProvider", "CPUExecutionProvider"], (640, 640)
+            )
+
         self._loaded_mode = mode
-        logger.info("✅  Face detector ready (%s)", mode_label)
+        mode_names = {0: "Accuracy", 1: "Performance", 2: "Intelligent"}
+        logger.info("✅  Face detector ready — mode: %s", mode_names.get(mode, mode))
+
+    # ── Public entry point ──────────────────────────────────────────────────
 
     def detect(self, image_path: Path) -> list[DetectedFace]:
         """
-        Detect faces in a JPEG image file.
+        Detect faces in a JPEG image and return rich DetectedFace objects.
 
-        Returns:
-            List of DetectedFace (may be empty if no faces found or image unreadable).
+        Dispatches to the correct session(s) based on face_detection_mode.
         """
-        if self._app is None:
-            raise RuntimeError("FaceDetector not loaded. Call load() first.")
+        mode = int(get_setting('face_detection_mode'))
+
+        if mode == 1 and self._app_fast is None:
+            raise RuntimeError("Fast session not loaded. Call load() first.")
+        if mode == 0 and self._app_accurate is None:
+            raise RuntimeError("Accurate session not loaded. Call load() first.")
+        if mode == 2 and (self._app_fast is None or self._app_accurate is None):
+            raise RuntimeError("Intelligent mode requires both sessions. Call load() first.")
 
         try:
             img = np.array(Image.open(image_path).convert("RGB"))
@@ -122,14 +148,120 @@ class FaceDetector:
 
         img_h, img_w = img.shape[:2]
 
+        if mode == 2:
+            return self._detect_intelligent(img, img_w, img_h, image_path)
+        elif mode == 1:
+            return self._run_session(self._app_fast, img, img_w, img_h, image_path)
+        else:
+            return self._run_session(self._app_accurate, img, img_w, img_h, image_path)
+
+    # ── Intelligent mode ────────────────────────────────────────────────────
+
+    def _detect_intelligent(
+        self,
+        img: np.ndarray,
+        img_w: int,
+        img_h: int,
+        image_path: Path,
+    ) -> list[DetectedFace]:
+        """
+        Two-signal adaptive detection.
+
+        Signal 1 — EXIF focal length (free, pre-detection):
+            Wide-angle (≤ 35 mm) shots are likely to have many small faces
+            spread across the frame (events, crowds, landscapes with people).
+            Skip the 640 oracle and go straight to the accurate 1280 pass.
+
+        Signal 2 — 640 oracle pass (cheap, ~100–200 ms on ANE):
+            Run the fast session first.  If the results suggest the scene is
+            complex enough that 1280 would add value, escalate.
+            Escalation triggers when:
+              • ≥ 5 faces detected (group shot — more small faces likely exist)
+              • Any face bbox_w < 4 % of frame width (face near the 640 limit)
+            On escalation the 1280 result is returned in full (it subsumes the
+            640 result — no merging/deduplication needed).
+        """
+        # ── Signal 1: focal length ───────────────────────────────────────────
+        focal_mm = self._read_focal_length(image_path)
+        if focal_mm is not None and focal_mm <= self._WIDE_ANGLE_MM:
+            logger.debug(
+                "Intelligent [%s]: wide-angle (%.0f mm ≤ %d mm) — accurate pass",
+                image_path.name, focal_mm, self._WIDE_ANGLE_MM,
+            )
+            return self._run_session(self._app_accurate, img, img_w, img_h, image_path)
+
+        # ── Signal 2: 640 oracle ─────────────────────────────────────────────
+        fast_results = self._run_session(self._app_fast, img, img_w, img_h, image_path)
+
+        min_face_w = min((f.bbox_w for f in fast_results), default=1.0)
+        should_escalate = (
+            len(fast_results) >= self._ESCALATE_MIN_FACES
+            or min_face_w < self._ESCALATE_MIN_FACE_W
+        )
+
+        if should_escalate:
+            logger.debug(
+                "Intelligent [%s]: escalating (faces=%d, min_bbox_w=%.3f) → accurate pass",
+                image_path.name, len(fast_results), min_face_w,
+            )
+            return self._run_session(self._app_accurate, img, img_w, img_h, image_path)
+
+        logger.debug(
+            "Intelligent [%s]: fast pass sufficient (faces=%d, min_bbox_w=%.3f)",
+            image_path.name, len(fast_results), min_face_w,
+        )
+        return fast_results
+
+    def _read_focal_length(self, image_path: Path) -> float | None:
+        """
+        Read the FocalLength EXIF tag (35mm-equivalent) from a JPEG.
+
+        PIL EXIF tag 37386 = FocalLength (actual lens focal length in mm).
+        Tag 41989 = FocalLengthIn35mmFilm — preferred when available since it
+        normalises for crop factor, making wide-angle classification consistent
+        across full-frame and APS-C cameras.
+
+        Returns None on any failure (missing tag, non-JPEG, corrupt EXIF).
+        """
         try:
-            faces = self._app.get(img)
+            with Image.open(image_path) as pil_img:
+                exif_data = pil_img._getexif()  # type: ignore[attr-defined]
+                if not exif_data:
+                    return None
+                # Prefer 35mm-equivalent (tag 41989) for crop-factor normalisation
+                fl_35 = exif_data.get(41989)
+                if fl_35 is not None:
+                    return float(fl_35)
+                # Fall back to actual focal length (tag 37386)
+                fl = exif_data.get(37386)
+                if fl is not None:
+                    return float(fl)
+        except Exception:
+            pass
+        return None
+
+    # ── Core inference ──────────────────────────────────────────────────────
+
+    def _run_session(
+        self,
+        app: object,
+        img: np.ndarray,
+        img_w: int,
+        img_h: int,
+        image_path: Path,
+    ) -> list[DetectedFace]:
+        """
+        Run a single InsightFace FaceAnalysis session on a pre-loaded image
+        array and return filtered, richly-attributed DetectedFace objects.
+        """
+        try:
+            raw_faces = app.get(img)  # type: ignore[attr-defined]
         except Exception as e:
             logger.error("Detection error on %s: %s", image_path, e)
             return []
 
         results = []
-        for face in faces:
+        for face in raw_faces:
             conf = float(face.det_score)
             if conf < get_setting('face_detection_threshold'):
                 continue
@@ -155,8 +287,7 @@ class FaceDetector:
             cy2 = min(img_h, y2 + pad_y)
             crop = img[cy1:cy2, cx1:cx2]
 
-            # InsightFace already computed the ArcFace embedding during get().
-            # Carry it through so the pipeline doesn't need to re-run inference.
+            # InsightFace computes the ArcFace embedding inside get() — carry it through
             emb = getattr(face, 'normed_embedding', None)
             embedding = emb.astype(np.float32) if emb is not None else None
 
@@ -199,9 +330,8 @@ class FaceDetector:
             # ── Quality: brightness + sharpness from face crop ────────────────
             quality_brightness = quality_sharpness = None
             if crop.size > 0:
-                gray = np.mean(crop, axis=2)                       # luminance approx
+                gray = np.mean(crop, axis=2)
                 quality_brightness = float(np.clip(np.mean(gray) / 255 * 100, 0, 100))
-                # Laplacian variance as sharpness proxy (normalised to 0–100)
                 laplacian = np.array([
                     gray[:-2, 1:-1] + gray[2:, 1:-1] + gray[1:-1, :-2] + gray[1:-1, 2:]
                     - 4 * gray[1:-1, 1:-1]

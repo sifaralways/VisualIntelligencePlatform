@@ -32,16 +32,21 @@ logger = logging.getLogger(__name__)
 
 DEFAULTS: dict[str, dict[str, Any]] = {
     "face_detection_mode": {
-        "value": 0, "type": "bool", "min": 0, "max": 1, "step": 1,
+        "value": 0, "type": "int", "min": 0, "max": 2, "step": 1,
         "label": "Face detection mode",
         "description": (
-            "Accuracy (default): CPU-only, 1280×1280 grid — reliably detects small and distant faces, "
-            "~1.2 s/photo. "
-            "Performance: CoreML ANE/GPU, 640×640 grid — up to 10× faster per photo, "
-            "may miss very small faces in wide group shots. "
+            "Accuracy: CPU-only, 1280×1280 grid — finds every face including small/distant ones, ~1.2 s/photo. "
+            "Performance: CoreML ANE/GPU, 640×640 grid — up to 10× faster, may miss very small faces. "
+            "Intelligent: starts fast (640/ANE) and auto-escalates to 1280/CPU for wide-angle shots and "
+            "crowded scenes with small faces. Best for mixed photo libraries. "
             "Change takes effect on the next scan."
         ),
         "group": "Face Detection",
+        "options": [
+            {"value": 0, "label": "Accuracy"},
+            {"value": 1, "label": "Performance"},
+            {"value": 2, "label": "Intelligent"},
+        ],
     },
     "face_detection_threshold": {
         "value": 0.6, "type": "float", "min": 0.3, "max": 0.99, "step": 0.05,
@@ -169,6 +174,7 @@ async def get_all() -> list[dict]:
             "label": meta["label"],
             "description": meta["description"],
             "group": meta["group"],
+            "options": meta.get("options"),  # list[{value, label}] for segmented-control UI, or None
         })
     return result
 

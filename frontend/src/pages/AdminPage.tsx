@@ -352,25 +352,25 @@ export default function AdminPage() {
                           <p className="text-sm font-medium text-gray-200">{s.label}</p>
                           <p className="text-xs text-gray-500 mt-0.5">{s.description}</p>
                         </div>
-                        {s.type === 'bool' ? (
-                          /* ── Toggle for boolean settings ── */
+                        {s.options && s.options.length > 0 ? (
+                          /* ── Segmented control for any setting with an options list ── */
                           <div className="shrink-0 flex items-center gap-1 bg-gray-800 rounded-lg p-1">
-                            {['Accuracy', 'Performance'].map((opt, i) => (
+                            {s.options.map(opt => (
                               <button
-                                key={opt}
-                                onClick={() => editSetting(s.key, String(i))}
+                                key={opt.value}
+                                onClick={() => editSetting(s.key, String(opt.value))}
                                 className={`px-3 py-1 rounded-md text-xs font-medium transition-colors ${
-                                  val(s) === i
+                                  val(s) === opt.value
                                     ? 'bg-indigo-600 text-white shadow'
                                     : 'text-gray-400 hover:text-gray-200'
                                 }`}
                               >
-                                {opt}
+                                {opt.label}
                               </button>
                             ))}
                           </div>
                         ) : (
-                          /* ── Number input for float/int settings ── */
+                          /* ── Number input for float/int settings without explicit options ── */
                           <div className="shrink-0 flex items-center gap-2">
                             <input
                               type="number"
@@ -384,7 +384,8 @@ export default function AdminPage() {
                           </div>
                         )}
                       </div>
-                      {s.type !== 'bool' && (
+                      {/* Slider only for continuous numeric settings, not option lists */}
+                      {(!s.options || s.options.length === 0) && (
                         <>
                           <input
                             type="range"
