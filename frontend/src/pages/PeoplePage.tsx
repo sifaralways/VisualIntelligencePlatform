@@ -8,7 +8,7 @@
 
 import { useEffect, useState } from 'react'
 import { api } from '../api/client'
-import type { Cluster, Person, MergeSuggestion, FaceRow } from '../api/client'
+import type { Cluster, Person, MergeSuggestion, FaceRow, SimilarCluster } from '../api/client'
 
 interface Props {
   /** Called when user clicks a named person tile to view their photos. */
@@ -22,6 +22,11 @@ export default function PeoplePage({ onSelectPerson }: Props) {
   const [namingId, setNamingId] = useState<number | null>(null)  // cluster id being named
   const [nameInput, setNameInput] = useState('')
   const [saving, setSaving] = useState(false)
+
+  // ── Rename existing person ────────────────────────────────────────────────
+  const [renamingPersonId, setRenamingPersonId] = useState<number | null>(null)
+  const [renameInput, setRenameInput] = useState('')
+  const [renameSaving, setRenameSaving] = useState(false)
   const [mergeCandidate, setMergeCandidate] = useState<{ personId: number; name: string } | null>(null)
   const [reviewPerson, setReviewPerson] = useState<Person | null>(null)
   const [reviewFaces, setReviewFaces] = useState<FaceRow[]>([])
@@ -72,6 +77,47 @@ export default function PeoplePage({ onSelectPerson }: Props) {
     setSuggestionPersonId(null)
     setSuggestionPersonName(null)
   }
+  // ── Cluster dismiss (delete / always ignore) ──────────────────────────────
+  const [dismissTarget, setDismissTarget] = useState<Cluster | null>(null)
+  const [dismissWorking, setDismissWorking] = useState(false)
+  const [similarClusters, setSimilarClusters] = useState<SimilarCluster[]>([])
+  const [similarLoading, setSimilarLoading] = useState(false)
+
+  async function openDismiss(cluster: Cluster) {
+    setDismissTarget(cluster)
+    setSimilarClusters([])
+    setSimilarLoading(true)
+    try {
+      const results = await api.clusters.similar(cluster.id)
+      // Only show clusters above a basic similarity threshold to avoid noise
+      setSimilarClusters(results.filter(s => s.similarity >= 0.55))
+    } catch {
+      setSimilarClusters([])
+    } finally {
+      setSimilarLoading(false)
+    }
+  }
+
+  async function handleDeleteCluster(clusterId: number) {
+    setDismissWorking(true)
+    try {
+      await api.clusters.delete(clusterId)
+      setClusters(prev => prev.filter(c => c.id !== clusterId))
+      setDismissTarget(null)
+      setSimilarClusters([])
+    } finally { setDismissWorking(false) }
+  }
+
+  async function handleIgnoreCluster(clusterId: number) {
+    setDismissWorking(true)
+    try {
+      await api.clusters.ignore(clusterId)
+      setClusters(prev => prev.filter(c => c.id !== clusterId))
+      setDismissTarget(null)
+      setSimilarClusters([])
+    } finally { setDismissWorking(false) }
+  }
+
   async function load() {
     setLoading(true)
     try {
@@ -134,6 +180,22 @@ export default function PeoplePage({ onSelectPerson }: Props) {
       setNameInput('')
       load()
     } finally { setSaving(false) }
+  }
+
+  async function handleRenamePerson(personId: number) {
+    const name = renameInput.trim()
+    if (!name) return
+    setRenameSaving(true)
+    try {
+      await api.persons.namePerson(personId, name)
+      setRenamingPersonId(null)
+      setRenameInput('')
+      // Optimistically update the name; name_written resets to false since
+      // writeback hasn't run yet for the new name.
+      setPersons(prev => prev.map(p => p.id === personId ? { ...p, name, name_written: false } : p))
+    } finally {
+      setRenameSaving(false)
+    }
   }
 
   if (loading) return <div className="text-gray-400 text-sm">Loading people…</div>
@@ -262,6 +324,89 @@ export default function PeoplePage({ onSelectPerson }: Props) {
         </div>
       )}
 
+      {/* Dismiss confirm modal — delete or always-ignore a cluster */}
+      {dismissTarget && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 overflow-y-auto py-6">
+          <div className="bg-gray-800 rounded-xl p-6 max-w-lg w-full shadow-xl mx-4">
+
+            {/* Primary face + cluster info */}
+            <div className="flex items-center gap-4 mb-5">
+              <div className="flex-shrink-0">
+                {dismissTarget.representative_thumbnail
+                  ? <img src={'/thumbnails/' + dismissTarget.representative_thumbnail.split('/thumbnails/').pop()} alt="face" className="w-20 h-20 rounded-xl object-cover border border-gray-600" />
+                  : <div className="w-20 h-20 rounded-xl bg-gray-700 flex items-center justify-center text-2xl border border-gray-600">?</div>}
+              </div>
+              <div>
+                <p className="text-white font-medium">Remove this face?</p>
+                <p className="text-gray-400 text-xs mt-0.5">
+                  Cluster of {dismissTarget.member_count} face{dismissTarget.member_count !== 1 ? 's' : ''}
+                  {dismissTarget.is_high_conf === 1 && <span className="ml-1.5 text-green-400">✓ high confidence</span>}
+                </p>
+              </div>
+            </div>
+
+            {/* Similar faces */}
+            {(similarLoading || similarClusters.length > 0) && (
+              <div className="mb-5">
+                <p className="text-xs text-gray-500 uppercase tracking-wider mb-2">
+                  {similarLoading ? 'Looking for similar faces…' : `Similar unnamed faces (${similarClusters.length})`}
+                </p>
+                {similarLoading
+                  ? <div className="flex gap-2">{[...Array(4)].map((_, i) => <div key={i} className="w-14 h-14 rounded-lg bg-gray-700 animate-pulse" />)}</div>
+                  : (
+                    <div className="flex flex-wrap gap-2">
+                      {similarClusters.map(s => {
+                        const url = s.representative_thumbnail
+                          ? '/thumbnails/' + s.representative_thumbnail.split('/thumbnails/').pop()
+                          : null
+                        return (
+                          <div key={s.cluster_id} className="flex flex-col items-center gap-0.5">
+                            <div className="w-14 h-14 rounded-lg overflow-hidden bg-gray-700 border border-gray-600">
+                              {url
+                                ? <img src={url} alt="similar face" className="w-full h-full object-cover" />
+                                : <span className="flex items-center justify-center h-full text-gray-500 text-lg">?</span>}
+                            </div>
+                            <span className="text-gray-500 text-[10px]">{Math.round(s.similarity * 100)}%</span>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )
+                }
+                <p className="text-gray-600 text-[11px] mt-2">
+                  ‘Always ignore’ will also suppress these faces in future scans.
+                </p>
+              </div>
+            )}
+
+            {/* Actions */}
+            <div className="flex flex-col gap-2">
+              <button
+                onClick={() => handleDeleteCluster(dismissTarget.id)}
+                disabled={dismissWorking}
+                className="bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-white rounded-lg py-2.5 text-sm font-medium transition-colors"
+              >
+                Delete — show again if re-detected
+              </button>
+              <button
+                onClick={() => handleIgnoreCluster(dismissTarget.id)}
+                disabled={dismissWorking}
+                className="bg-red-900 hover:bg-red-800 disabled:opacity-40 text-white rounded-lg py-2.5 text-sm font-medium transition-colors"
+              >
+                Always ignore — never show this person
+              </button>
+              <button
+                onClick={() => { setDismissTarget(null); setSimilarClusters([]) }}
+                disabled={dismissWorking}
+                className="text-gray-500 hover:text-gray-400 text-sm py-1 transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Merge dialog */}
       {mergeCandidate && namingId !== null && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
@@ -306,10 +451,12 @@ export default function PeoplePage({ onSelectPerson }: Props) {
             {clusters.map(c => (
               <ClusterTile key={c.id} cluster={c}
                 isNaming={namingId === c.id} nameInput={nameInput} saving={saving}
+                personNames={persons.filter(p => p.name).map(p => p.name!)}
                 onStartNaming={() => { setNamingId(c.id); setNameInput('') }}
                 onNameInput={setNameInput}
                 onConfirm={() => handleName(c.id)}
-                onCancel={() => setNamingId(null)} />
+                onCancel={() => setNamingId(null)}
+                onDismiss={() => openDismiss(c)} />
             ))}
           </div>
         </section>
@@ -325,19 +472,30 @@ export default function PeoplePage({ onSelectPerson }: Props) {
             {persons.map(p => {
               const thumb = p.representative_thumbnail
               const thumbUrl = thumb ? '/thumbnails/' + thumb.split('/thumbnails/').pop() : null
+              const isRenaming = renamingPersonId === p.id
               return (
                 <div key={p.id} className="flex flex-col items-center gap-2">
                   {/* Main tile — click to view photos */}
                   <div className="relative group">
                     <button
-                      onClick={() => onSelectPerson?.(p.id, p.name ?? 'Unknown')}
+                      onClick={() => !isRenaming && onSelectPerson?.(p.id, p.name ?? 'Unknown')}
                       title={`View photos of ${p.name}`}
                       className="w-20 h-20 rounded-xl bg-gray-800 border border-gray-700 hover:border-indigo-400 overflow-hidden flex items-center justify-center transition-colors">
                       {thumbUrl
                         ? <img src={thumbUrl} alt={p.name ?? 'person'} className="w-full h-full object-cover" />
                         : <span className="text-2xl">👤</span>}
                     </button>
-                    {/* Review icon overlay */}
+                    {/* Rename icon — top-left on hover */}
+                    {!isRenaming && (
+                      <button
+                        onClick={() => { setRenamingPersonId(p.id); setRenameInput(p.name ?? '') }}
+                        title="Rename"
+                        className="absolute -top-1 -left-1 bg-gray-700 hover:bg-indigo-700 border border-gray-600 rounded-full w-5 h-5 text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+                      >
+                        ✎
+                      </button>
+                    )}
+                    {/* Review icon — top-right on hover */}
                     <button
                       onClick={() => openReview(p)}
                       title="Review faces"
@@ -346,14 +504,44 @@ export default function PeoplePage({ onSelectPerson }: Props) {
                       ⋯
                     </button>
                   </div>
-                  <span className="text-xs text-center truncate max-w-full px-1 flex items-center gap-1 justify-center">
-                    {/* Green = name written to file; Red = DB only, not yet written */}
-                    <span
-                      title={p.name_written ? 'Name written to photo file' : 'Name saved in database only (not yet written to file)'}
-                      className={`inline-block w-1.5 h-1.5 rounded-full flex-shrink-0 ${p.name_written ? 'bg-green-400' : 'bg-red-400'}`}
-                    />
-                    <span className="text-gray-200">{p.name}</span>
-                  </span>
+                  {isRenaming ? (
+                    <div className="flex flex-col gap-1 w-full px-1">
+                      <input
+                        autoFocus
+                        value={renameInput}
+                        onChange={e => setRenameInput(e.target.value)}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter') handleRenamePerson(p.id)
+                          if (e.key === 'Escape') setRenamingPersonId(null)
+                        }}
+                        className="w-full bg-gray-800 border border-indigo-500 rounded px-2 py-0.5 text-xs text-white outline-none text-center"
+                      />
+                      <div className="flex gap-1">
+                        <button
+                          onClick={() => handleRenamePerson(p.id)}
+                          disabled={renameSaving || !renameInput.trim()}
+                          className="flex-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded px-2 py-0.5 text-xs"
+                        >
+                          {renameSaving ? '…' : 'Save'}
+                        </button>
+                        <button
+                          onClick={() => setRenamingPersonId(null)}
+                          className="flex-1 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded px-2 py-0.5 text-xs"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <span className="text-xs text-center truncate max-w-full px-1 flex items-center gap-1 justify-center">
+                      {/* Green = name written to file; Red = DB only, not yet written */}
+                      <span
+                        title={p.name_written ? 'Name written to photo file' : 'Name saved in database only (not yet written to file)'}
+                        className={`inline-block w-1.5 h-1.5 rounded-full flex-shrink-0 ${p.name_written ? 'bg-green-400' : 'bg-red-400'}`}
+                      />
+                      <span className="text-gray-200">{p.name}</span>
+                    </span>
+                  )}
                   <span className="text-xs text-gray-500">{p.photo_count} photo{p.photo_count !== 1 ? 's' : ''}</span>
                   {p.merge_sources_count > 0 && (
                     <span className="text-xs text-indigo-500">⇐ {p.merge_sources_count} merged</span>
@@ -375,35 +563,80 @@ export default function PeoplePage({ onSelectPerson }: Props) {
   )
 }
 
-function ClusterTile({ cluster, isNaming, nameInput, saving, onStartNaming, onNameInput, onConfirm, onCancel }: {
+function ClusterTile({ cluster, isNaming, nameInput, saving, personNames, onStartNaming, onNameInput, onConfirm, onCancel, onDismiss }: {
   cluster: Cluster; isNaming: boolean; nameInput: string; saving: boolean
+  personNames: string[]
   onStartNaming: () => void; onNameInput: (v: string) => void; onConfirm: () => void; onCancel: () => void
+  onDismiss: () => void
 }) {
+  const [showSuggestions, setShowSuggestions] = useState(false)
   const thumb = cluster.representative_thumbnail
   const thumbUrl = thumb ? '/thumbnails/' + thumb.split('/thumbnails/').pop() : null
 
+  const filteredNames = nameInput.trim().length > 0
+    ? personNames.filter(n => n.toLowerCase().includes(nameInput.toLowerCase()))
+    : []
+
   return (
     <div className="flex flex-col items-center gap-2">
-      <button onClick={onStartNaming}
-        className={'relative w-20 h-20 rounded-xl overflow-hidden bg-gray-800 border transition-colors ' +
-          (isNaming ? 'border-indigo-500' : 'border-gray-700 hover:border-indigo-400')}>
-        {thumbUrl
-          ? <img src={thumbUrl} alt="face" className="w-full h-full object-cover" />
-          : <span className="text-gray-500 text-2xl flex items-center justify-center h-full">?</span>}
-        <span className="absolute bottom-0 right-0 bg-indigo-700 text-white text-xs px-1 rounded-tl leading-tight">
-          {cluster.member_count}
-        </span>
-        {cluster.is_high_conf === 1 && (
-          <span className="absolute top-0 left-0 bg-green-700 text-white text-xs px-1 rounded-br leading-tight">✓</span>
-        )}
-      </button>
+      <div className="relative group">
+        <button onClick={onStartNaming}
+          className={'relative w-20 h-20 rounded-xl overflow-hidden bg-gray-800 border transition-colors ' +
+            (isNaming ? 'border-indigo-500' : 'border-gray-700 hover:border-indigo-400')}>
+          {thumbUrl
+            ? <img src={thumbUrl} alt="face" className="w-full h-full object-cover" />
+            : <span className="text-gray-500 text-2xl flex items-center justify-center h-full">?</span>}
+          <span className="absolute bottom-0 right-0 bg-indigo-700 text-white text-xs px-1 rounded-tl leading-tight">
+            {cluster.member_count}
+          </span>
+          {cluster.is_high_conf === 1 && (
+            <span className="absolute top-0 left-0 bg-green-700 text-white text-xs px-1 rounded-br leading-tight">✓</span>
+          )}
+        </button>
+        {/* Dismiss button — shown on hover */}
+        <button
+          onClick={e => { e.stopPropagation(); onDismiss() }}
+          title="Remove this face"
+          className="absolute -top-1 -right-1 w-5 h-5 bg-gray-700 hover:bg-red-700 border border-gray-600 rounded-full text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity text-gray-300 hover:text-white leading-none"
+        >
+          ✕
+        </button>
+      </div>
       {isNaming ? (
         <div className="flex flex-col gap-1 w-full">
-          <input autoFocus value={nameInput} onChange={e => onNameInput(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Enter') onConfirm(); if (e.key === 'Escape') onCancel() }}
-            placeholder="Enter name…"
-            className="w-full bg-gray-800 border border-indigo-500 rounded px-2 py-0.5 text-xs text-white outline-none" />
-          <button onClick={onConfirm} disabled={saving || !nameInput.trim()}
+          {/* Input + autocomplete dropdown */}
+          <div className="relative">
+            <input
+              autoFocus
+              value={nameInput}
+              onChange={e => { onNameInput(e.target.value); setShowSuggestions(true) }}
+              onFocus={() => setShowSuggestions(true)}
+              onBlur={() => setShowSuggestions(false)}
+              onKeyDown={e => {
+                if (e.key === 'Enter') { setShowSuggestions(false); onConfirm() }
+                if (e.key === 'Escape') { setShowSuggestions(false); onCancel() }
+              }}
+              placeholder="Enter name…"
+              className="w-full bg-gray-800 border border-indigo-500 rounded px-2 py-0.5 text-xs text-white outline-none"
+            />
+            {showSuggestions && filteredNames.length > 0 && (
+              <ul
+                onMouseDown={e => e.preventDefault()}
+                className="absolute top-full left-0 right-0 bg-gray-900 border border-gray-700 rounded-b shadow-lg z-20 max-h-36 overflow-y-auto"
+              >
+                {filteredNames.map(name => (
+                  <li
+                    key={name}
+                    onClick={() => { onNameInput(name); setShowSuggestions(false); }}
+                    className="px-2 py-1 text-xs text-gray-200 hover:bg-indigo-700 hover:text-white cursor-pointer truncate"
+                  >
+                    {name}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+          <button onClick={() => { setShowSuggestions(false); onConfirm() }} disabled={saving || !nameInput.trim()}
             className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded px-2 py-0.5 text-xs">
             {saving ? '…' : 'Save'}
           </button>

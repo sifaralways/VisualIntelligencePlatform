@@ -77,8 +77,12 @@ export const api = {
 
   // ─── Clusters ─────────────────────────────────────────────────────────────
   clusters: {
-    unnamed: () => request<Cluster[]>('/persons/unnamed'),
-  },
+    unnamed: () => request<Cluster[]>('/persons/unnamed'),    delete: (clusterId: number) =>
+      request(`/persons/clusters/${clusterId}`, { method: 'DELETE' }),
+    ignore: (clusterId: number) =>
+      request<{ status: string; cluster_id: number; person_id: number }>(
+        `/persons/clusters/${clusterId}/ignore`, { method: 'POST' }
+      ),  },
 
   // ─── Persons ──────────────────────────────────────────────────────────────
   persons: {
@@ -307,6 +311,15 @@ export interface MergeSuggestion {
   is_high_conf: number
   representative_thumbnail: string | null
   similarity: number   // cosine similarity to the named person's centroid
+}
+
+export interface SimilarCluster {
+  cluster_id: number
+  member_count: number
+  intra_similarity: number | null
+  is_high_conf: number
+  representative_thumbnail: string | null
+  similarity: number
 }
 
 export interface FaceRow {

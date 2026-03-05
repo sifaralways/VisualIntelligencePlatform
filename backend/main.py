@@ -118,8 +118,30 @@ def _setup_logging() -> None:
     )
 
 
+def _patch_pillow_limits() -> None:
+    """
+    Raise Pillow's decompression-bomb pixel limit to accommodate large panoramas
+    and ultra-high-res camera output (some cameras exceed 100 MP).
+
+    Pillow's default hard limit is ~179 MP (2 × 89.5 MP).  Reaching it raises
+    a DecompressionBombError that silently drops the photo from the pipeline.
+    The protection was designed for servers processing untrusted uploads;
+    VIP exclusively opens files from the user’s own trusted local library, so
+    the limit is not needed.
+    """
+    try:
+        from PIL import Image
+        Image.MAX_IMAGE_PIXELS = None  # disable bomb check entirely
+        logging.getLogger(__name__).debug("Pillow MAX_IMAGE_PIXELS limit removed")
+    except Exception as exc:  # pragma: no cover
+        logging.getLogger(__name__).warning(
+            "Could not patch Pillow pixel limit (non-fatal): %s", exc
+        )
+
+
 _setup_logging()
 _patch_insightface_skimage()
+_patch_pillow_limits()
 
 
 @asynccontextmanager

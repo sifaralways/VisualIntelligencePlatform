@@ -53,9 +53,10 @@ class Settings(BaseSettings):
     api_port: int = 7474
 
     # -------------------------------------------------------------------------
-    # Supported RAW formats (Canon CR3 primary, others for future users)
+    # Supported formats (RAW + direct image formats)
     # -------------------------------------------------------------------------
     supported_formats: frozenset = frozenset({
+        # RAW formats
         ".cr3",   # Canon — primary
         ".arw",   # Sony
         ".nef",   # Nikon
@@ -64,7 +65,15 @@ class Settings(BaseSettings):
         ".orf",   # Olympus
         ".raf",   # Fujifilm
         ".cr2",   # Canon legacy
+        # Direct image formats
+        ".jpg",   # JPEG
+        ".jpeg",  # JPEG (alternate extension)
+        ".avif",  # AVIF (modern compressed format)
     })
+
+    # Formats that are themselves the full image — no embedded preview extraction.
+    # Pillow is used directly to produce the normalised JPEG for ML inference.
+    direct_image_formats: frozenset = frozenset({".jpg", ".jpeg", ".avif"})
 
     # -------------------------------------------------------------------------
     # iCloud stub detection

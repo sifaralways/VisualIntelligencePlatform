@@ -838,6 +838,43 @@ async def _phase_auto_merge() -> None:
                 seen[cid] = s
         await broadcast("merge_suggestions", suggestions=list(seen.values())[:10])
 
+    # ── Silently suppress new clusters that match ignored persons ────────────
+    # Ignored persons have no name so they are excluded from the person_data
+    # loop above.  We compare their stored centroids against remaining unnamed
+    # clusters here and auto-assign matches so they never surface in the UI.
+    async with get_db() as db:
+        ignored_persons = await db.execute_fetchall("""
+            SELECT p.id AS person_id, p.centroid
+            FROM persons p
+            WHERE p.is_merged = 0 AND p.is_ignored = 1 AND p.centroid IS NOT NULL
+        """)
+
+    for ip in ignored_persons:
+        ic = load_centroid(ip["centroid"])
+        if ic is None:
+            continue
+        for c in cluster_data:
+            cid = c["cluster_id"]
+            if cid in named_cluster_ids:
+                continue
+            sim = float(np.dot(ic, c["centroid"]))
+            if sim >= auto_name_threshold:
+                async with get_db() as db:
+                    await db.execute(
+                        "UPDATE clusters SET person_id=? WHERE id=?",
+                        (ip["person_id"], cid),
+                    )
+                    await db.execute(
+                        "UPDATE faces SET person_id=? WHERE cluster_id=?",
+                        (ip["person_id"], cid),
+                    )
+                    await update_person_centroid(db, ip["person_id"])
+                named_cluster_ids.add(cid)
+                logger.debug(
+                    "Auto-suppressed cluster %d → ignored person %d (sim=%.3f)",
+                    cid, ip["person_id"], sim,
+                )
+
     logger.info(
         "Phase 3b: %d auto-named, %d suggestions surfaced", auto_named, len(suggestions)
     )

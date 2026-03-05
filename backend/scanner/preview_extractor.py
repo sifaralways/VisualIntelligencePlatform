@@ -37,6 +37,10 @@ from backend.scanner.exif_reader import materialise_file
 
 logger = logging.getLogger(__name__)
 
+# Formats that are themselves the full image (no embedded RAW preview needed).
+# Pillow opens these directly and saves a normalised JPEG to the preview dir.
+_DIRECT_IMAGE_SUFFIXES: frozenset[str] = frozenset({".jpg", ".jpeg", ".avif"})
+
 # Maps numeric EXIF Orientation tag value → PIL Transpose method name.
 # Identical to the mapping used internally by PIL.ImageOps.exif_transpose,
 # except we read the tag from the RAW file, not from the (often wrong) preview.
@@ -104,11 +108,20 @@ def _correct_preview_orientation(out_path: Path, orientation: int) -> None:
 
 async def extract_preview(raw_path: Path) -> Optional[Path]:
     """
-    Extract the largest embedded JPEG preview from a RAW file.
+    Produce a normalised JPEG preview suitable for ML inference.
+
+    For RAW files (CR3, ARW, NEF, …): extracts the largest embedded JPEG
+    using ExifTool (fast, camera-agnostic, no full RAW decode).
+
+    For direct image formats (JPEG, AVIF): opens with Pillow, applies EXIF
+    orientation, converts to RGB, and saves as JPEG to the preview dir.
 
     Returns:
-        Path to the extracted JPEG in preview_dir, or None on failure.
+        Path to the JPEG in preview_dir, or None on failure.
     """
+    if raw_path.suffix.lower() in _DIRECT_IMAGE_SUFFIXES:
+        return await _preview_from_direct_image(raw_path)
+
     out_path = settings.preview_dir / f"{raw_path.stem}_{_hash_path(raw_path)}.jpg"
 
     if out_path.exists():
@@ -120,6 +133,92 @@ async def extract_preview(raw_path: Path) -> Optional[Path]:
         None, _extract_sync, raw_path, out_path
     )
     return out_path if success else None
+
+
+async def _preview_from_direct_image(image_path: Path) -> Optional[Path]:
+    """
+    Convert a JPEG or AVIF file to a normalised JPEG in the preview dir.
+
+    Orientation is corrected via EXIF transpose so that all downstream
+    consumers receive geometrically upright pixels without any extra handling.
+    Alpha channels (possible in AVIF) are dropped via conversion to RGB.
+    """
+    out_path = settings.preview_dir / f"{image_path.stem}_{_hash_path(image_path)}.jpg"
+    if out_path.exists():
+        logger.debug("Preview already exists: %s", out_path)
+        return out_path
+
+    loop = asyncio.get_event_loop()
+    success = await loop.run_in_executor(
+        None, _direct_image_to_jpeg, image_path, out_path
+    )
+    return out_path if success else None
+
+
+def _direct_image_to_jpeg(src: Path, dst: Path) -> bool:
+    """
+    Convert a direct image (JPEG or AVIF) to a normalised JPEG in the preview
+    dir.  Runs in an executor thread.
+
+    AVIF: macOS `sips` CLI is used because standard Pillow pip wheels have no
+    AVIF codec.  `sips` delegates to Apple's native image pipeline — no extra
+    dependencies, works on every Apple Silicon Mac.
+
+    JPEG: Pillow handles conversion; EXIF orientation is applied so all
+    downstream models receive geometrically upright pixels.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    if src.suffix.lower() == ".avif":
+        return _avif_to_jpeg_via_sips(src, dst)
+
+    # --- JPEG (and any other format Pillow supports) ---
+    try:
+        from PIL import Image, ImageOps
+        with Image.open(src) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            img.save(dst, "JPEG", quality=92, optimize=True)
+        logger.debug("Direct image preview saved: %s → %s", src.name, dst.name)
+        return True
+    except Exception as e:
+        logger.error("Failed to convert %s to JPEG preview: %s", src.name, e)
+        return False
+
+
+def _avif_to_jpeg_via_sips(src: Path, dst: Path) -> bool:
+    """
+    Convert an AVIF file to JPEG using macOS `sips`.
+
+    `sips` is bundled with every macOS installation and supports AVIF via the
+    OS-native ImageIO framework.  No Homebrew packages or pip extras required.
+    """
+    try:
+        result = subprocess.run(
+            ["sips", "-s", "format", "jpeg", "-s", "formatOptions", "92",
+             str(src), "--out", str(dst)],
+            capture_output=True,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            logger.error(
+                "sips failed for %s (exit %d): %s",
+                src.name, result.returncode,
+                result.stderr.decode(errors="replace").strip(),
+            )
+            return False
+        logger.debug("AVIF → JPEG via sips: %s → %s", src.name, dst.name)
+        return True
+    except subprocess.TimeoutExpired:
+        logger.error("sips timed out converting: %s", src.name)
+        return False
+    except FileNotFoundError:
+        logger.error("`sips` not found — should be present on every macOS installation")
+        return False
+    except Exception as e:
+        logger.error("AVIF conversion error for %s: %s", src.name, e)
+        return False
 
 
 def _extract_sync(raw_path: Path, out_path: Path) -> bool:
