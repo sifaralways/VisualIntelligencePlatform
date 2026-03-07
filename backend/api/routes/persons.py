@@ -31,6 +31,10 @@ class MergeNamedPersonsRequest(BaseModel):
     new_name: Optional[str] = None   # None = keep the survivor's current name
 
 
+class FindSimilarAllRequest(BaseModel):
+    auto_threshold: float = 0.85   # Clusters >= this similarity are merged automatically
+
+
 @router.get("")
 async def list_persons():
     """All persons — named and unnamed (clusters awaiting a name)."""
@@ -533,6 +537,136 @@ async def get_merge_suggestions(person_id: int, limit: int = 1):
 
         scored.sort(key=lambda x: x["similarity"], reverse=True)
         return scored[:limit]
+
+
+@router.post("/find-similar-all")
+async def find_similar_all(request: FindSimilarAllRequest):
+    """
+    Scan every named person against every unnamed cluster.
+
+    Clusters with cosine similarity >= auto_threshold are merged automatically.
+    Clusters between SUGGEST_THRESHOLD and auto_threshold are returned as
+    suggestions for the user to accept or reject interactively.
+
+    Clusters previously rejected for a person are skipped.
+    A cluster is only auto-merged once (first matching person wins).
+    """
+    auto_threshold = max(_SUGGEST_THRESHOLD, min(1.0, request.auto_threshold))
+
+    auto_merged: list[dict] = []
+    suggestions: list[dict] = []
+
+    async with get_db() as db:
+        named_persons = await db.execute_fetchall("""
+            SELECT p.id, p.name,
+                   (SELECT MIN(f2.thumbnail_path) FROM faces f2 WHERE f2.person_id = p.id) AS thumbnail
+            FROM persons p
+            WHERE p.name IS NOT NULL AND p.is_merged = 0 AND p.is_ignored = 0
+        """)
+        if not named_persons:
+            return {"auto_merged": [], "suggestions": []}
+
+        unnamed_clusters = await db.execute_fetchall("""
+            SELECT c.id AS cluster_id, c.member_count, c.intra_similarity, c.is_high_conf,
+                   MIN(f.thumbnail_path) AS representative_thumbnail
+            FROM clusters c
+            JOIN faces f ON f.cluster_id = c.id
+            WHERE c.person_id IS NULL
+            GROUP BY c.id
+        """)
+        if not unnamed_clusters:
+            return {"auto_merged": [], "suggestions": []}
+
+        # Pre-load unnamed cluster embeddings once (avoids N×M round-trips)
+        cluster_centroids: dict[int, np.ndarray] = {}
+        for cluster in unnamed_clusters:
+            cid = cluster["cluster_id"]
+            cand_embs = await db.execute_fetchall("""
+                SELECT e.vector FROM embeddings e
+                JOIN faces f ON f.id = e.face_id
+                WHERE f.cluster_id = ?
+            """, (cid,))
+            if not cand_embs:
+                continue
+            vecs = np.stack([np.frombuffer(r["vector"], dtype=np.float32) for r in cand_embs])
+            c_vec = vecs.mean(axis=0)
+            n = np.linalg.norm(c_vec)
+            if n > 0:
+                c_vec /= n
+            cluster_centroids[cid] = c_vec
+
+        cluster_by_id = {c["cluster_id"]: c for c in unnamed_clusters}
+
+        # Track clusters already auto-merged this run — don't suggest them again
+        already_merged_cluster_ids: set[int] = set()
+
+        for person in named_persons:
+            person_id = person["id"]
+            person_name = person["name"]
+            person_thumbnail = person["thumbnail"]
+
+            emb_rows = await db.execute_fetchall("""
+                SELECT e.vector FROM embeddings e
+                JOIN faces f ON f.id = e.face_id
+                WHERE f.person_id = ?
+            """, (person_id,))
+            if not emb_rows:
+                continue
+
+            p_vecs = np.stack([np.frombuffer(r["vector"], dtype=np.float32) for r in emb_rows])
+            p_centroid = p_vecs.mean(axis=0)
+            norm = np.linalg.norm(p_centroid)
+            if norm > 0:
+                p_centroid /= norm
+
+            rejected = await db.execute_fetchall(
+                "SELECT cluster_id FROM rejected_suggestions WHERE person_id = ?", (person_id,)
+            )
+            rejected_ids = {r["cluster_id"] for r in rejected}
+
+            for cid, c_vec in cluster_centroids.items():
+                if cid in rejected_ids or cid in already_merged_cluster_ids:
+                    continue
+                sim = float(np.dot(p_centroid, c_vec))
+                cluster = cluster_by_id[cid]
+
+                if sim >= auto_threshold:
+                    # Auto-merge: assign cluster to person
+                    await db.execute("UPDATE clusters SET person_id=? WHERE id=?", (person_id, cid))
+                    await db.execute("UPDATE faces SET person_id=? WHERE cluster_id=?", (person_id, cid))
+                    await db.execute("""
+                        DELETE FROM rejected_suggestions WHERE person_id=? AND cluster_id=?
+                    """, (person_id, cid))
+                    await db.execute("""
+                        INSERT OR REPLACE INTO writeback_queue (media_file_id)
+                        SELECT DISTINCT media_file_id FROM faces WHERE cluster_id=?
+                    """, (cid,))
+                    await _sync_photo_count(db, person_id)
+                    await update_person_centroid(db, person_id)
+                    already_merged_cluster_ids.add(cid)
+                    auto_merged.append({
+                        "person_id": person_id,
+                        "person_name": person_name,
+                        "cluster_id": cid,
+                        "similarity": round(sim, 3),
+                        "member_count": cluster["member_count"],
+                    })
+
+                elif sim >= _SUGGEST_THRESHOLD:
+                    suggestions.append({
+                        "person_id": person_id,
+                        "person_name": person_name,
+                        "person_thumbnail": person_thumbnail,
+                        "cluster_id": cid,
+                        "member_count": cluster["member_count"],
+                        "intra_similarity": cluster["intra_similarity"],
+                        "is_high_conf": cluster["is_high_conf"],
+                        "representative_thumbnail": cluster["representative_thumbnail"],
+                        "similarity": round(sim, 3),
+                    })
+
+    suggestions.sort(key=lambda x: x["similarity"], reverse=True)
+    return {"auto_merged": auto_merged, "suggestions": suggestions}
 
 
 @router.post("/{person_id}/reject-suggestion/{cluster_id}")

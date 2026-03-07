@@ -8,7 +8,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api/client'
-import type { Cluster, Person, MergeSuggestion, FaceRow, SimilarCluster, MergePersonsResult } from '../api/client'
+import type { Cluster, Person, MergeSuggestion, FaceRow, SimilarCluster, MergePersonsResult, FindSimilarSuggestion, FindSimilarAllResult } from '../api/client'
 
 interface Props {
   /** Called when user clicks a named person tile to view their photos. */
@@ -82,6 +82,50 @@ export default function PeoplePage({ onSelectPerson }: Props) {
   const [suggestionPersonId, setSuggestionPersonId] = useState<number | null>(null)
   const [suggestionPersonName, setSuggestionPersonName] = useState<string | null>(null)
   const [suggestionBusy, setSuggestionBusy] = useState(false)
+
+  // ── Find Similar (bulk scan across all named persons) ─────────────────────
+  const [findSimilarOpen, setFindSimilarOpen] = useState(false)
+  const [findSimilarThreshold, setFindSimilarThreshold] = useState(0.85)
+  const [findSimilarWorking, setFindSimilarWorking] = useState(false)
+  const [findSimilarResult, setFindSimilarResult] = useState<{ autoMerged: number; suggestionsFound: number } | null>(null)
+  const [bulkSuggestionQueue, setBulkSuggestionQueue] = useState<FindSimilarSuggestion[]>([])
+  const [bulkSuggestionWorking, setBulkSuggestionWorking] = useState(false)
+
+  async function handleFindSimilar() {
+    setFindSimilarOpen(false)
+    setFindSimilarWorking(true)
+    setFindSimilarResult(null)
+    try {
+      const result: FindSimilarAllResult = await api.persons.findSimilarAll(findSimilarThreshold)
+      if (result.auto_merged.length > 0) await load()
+      const queue: FindSimilarSuggestion[] = result.suggestions
+      setBulkSuggestionQueue(queue)
+      setFindSimilarResult({ autoMerged: result.auto_merged.length, suggestionsFound: result.suggestions.length })
+    } finally {
+      setFindSimilarWorking(false)
+    }
+  }
+
+  async function acceptBulkSuggestion() {
+    const current = bulkSuggestionQueue[0]
+    if (!current) return
+    setBulkSuggestionWorking(true)
+    try {
+      await api.persons.addCluster(current.person_id, current.cluster_id)
+      setBulkSuggestionQueue(q => q.slice(1))
+      await load()
+    } finally { setBulkSuggestionWorking(false) }
+  }
+
+  async function rejectBulkSuggestion() {
+    const current = bulkSuggestionQueue[0]
+    if (!current) return
+    setBulkSuggestionWorking(true)
+    try {
+      await api.persons.rejectSuggestion(current.person_id, current.cluster_id)
+      setBulkSuggestionQueue(q => q.slice(1))
+    } finally { setBulkSuggestionWorking(false) }
+  }
 
   async function fetchNextSuggestion(personId: number) {
     try {
@@ -893,6 +937,17 @@ export default function PeoplePage({ onSelectPerson }: Props) {
               {namedSelectMode && namedSelected.size > 0 && (
                 <span className="text-xs text-gray-400">{namedSelected.size} selected</span>
               )}
+              {/* Find Similar — only useful when unnamed clusters exist */}
+              {!namedSelectMode && clusters.length > 0 && (
+                <button
+                  onClick={() => setFindSimilarOpen(true)}
+                  disabled={findSimilarWorking}
+                  title={`Scan all ${persons.length} named persons against ${clusters.length} unnamed clusters`}
+                  className="text-xs px-2.5 py-1 rounded-lg border border-yellow-700 bg-yellow-900/20 text-yellow-400 hover:bg-yellow-900/40 hover:text-yellow-300 transition-colors disabled:opacity-40"
+                >
+                  {findSimilarWorking ? 'Scanning…' : '≈ Find Similar'}
+                </button>
+              )}
               <button
                 onClick={() => { setNamedSelectMode(s => !s); setNamedSelected(new Set()) }}
                 className={`text-xs px-2.5 py-1 rounded-lg border transition-colors ${
@@ -905,6 +960,24 @@ export default function PeoplePage({ onSelectPerson }: Props) {
               </button>
             </div>
           </div>
+
+          {/* Find Similar result banner */}
+          {findSimilarResult && bulkSuggestionQueue.length === 0 && (
+            <div className="mb-4 flex items-center justify-between rounded-xl bg-indigo-900/30 border border-indigo-800 px-4 py-2.5">
+              <p className="text-sm text-indigo-300">
+                Scan complete —{' '}
+                {findSimilarResult.autoMerged > 0
+                  ? <span className="text-green-400 font-medium">{findSimilarResult.autoMerged} auto-merged</span>
+                  : <span>0 auto-merged</span>}
+                {', '}
+                {findSimilarResult.suggestionsFound > 0
+                  ? <span className="text-yellow-400 font-medium">{findSimilarResult.suggestionsFound} suggestion{findSimilarResult.suggestionsFound !== 1 ? 's' : ''} reviewed</span>
+                  : <span>no suggestions found</span>}
+              </p>
+              <button onClick={() => setFindSimilarResult(null)} className="text-indigo-600 hover:text-indigo-400 text-sm ml-4">✕</button>
+            </div>
+          )}
+
           <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-4">
             {[...persons].sort((a, b) => (a.name ?? '').localeCompare(b.name ?? '')).map(p => {
               const thumb = p.representative_thumbnail
@@ -1052,6 +1125,128 @@ export default function PeoplePage({ onSelectPerson }: Props) {
           )}
         </section>
       )}
+
+      {/* ── Find Similar threshold dialog ──────────────────────────────────── */}
+      {findSimilarOpen && (
+        <div className="fixed inset-0 bg-black/75 flex items-center justify-center z-50">
+          <div className="bg-gray-900 border border-gray-700 rounded-2xl p-7 max-w-sm w-full shadow-2xl mx-4">
+            <p className="text-white font-semibold text-lg mb-1">Find Similar Faces</p>
+            <p className="text-gray-400 text-sm mb-5">
+              Scans all {persons.length} named person{persons.length !== 1 ? 's' : ''} against{' '}
+              {clusters.length} unnamed cluster{clusters.length !== 1 ? 's' : ''} for visual similarity.
+            </p>
+
+            <label className="block text-xs text-gray-400 mb-2">
+              Auto-merge threshold
+              <span className="ml-1 text-gray-600">(above this → merged without asking)</span>
+            </label>
+            <div className="flex items-center gap-3 mb-2">
+              <input
+                type="range" min={60} max={99} step={1}
+                value={Math.round(findSimilarThreshold * 100)}
+                onChange={e => setFindSimilarThreshold(Number(e.target.value) / 100)}
+                className="flex-1 accent-indigo-500"
+              />
+              <span className="text-sm text-white font-mono w-10 text-right">
+                {Math.round(findSimilarThreshold * 100)}%
+              </span>
+            </div>
+            <p className="text-xs text-gray-600 mb-6">
+              Matches between 55% and {Math.round(findSimilarThreshold * 100)}% will be shown for manual review.
+            </p>
+
+            <div className="flex gap-3">
+              <button
+                onClick={handleFindSimilar}
+                className="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl py-2.5 text-sm font-semibold transition-colors"
+              >
+                Scan now
+              </button>
+              <button
+                onClick={() => setFindSimilarOpen(false)}
+                className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-xl py-2.5 text-sm font-medium transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Bulk suggestion review modal ───────────────────────────────────── */}
+      {bulkSuggestionQueue.length > 0 && (() => {
+        const current = bulkSuggestionQueue[0]
+        const personThumbUrl = current.person_thumbnail
+          ? '/thumbnails/' + current.person_thumbnail.split('/thumbnails/').pop()
+          : null
+        const clusterThumbUrl = current.representative_thumbnail
+          ? '/thumbnails/' + current.representative_thumbnail.split('/thumbnails/').pop()
+          : null
+        return (
+          <div className="fixed inset-0 bg-black/75 flex items-center justify-center z-50">
+            <div className="bg-gray-900 border border-gray-700 rounded-2xl p-7 max-w-md w-full shadow-2xl mx-4">
+              <div className="flex items-center justify-between mb-1">
+                <p className="text-white font-semibold text-lg">
+                  Same person as <span className="text-indigo-400">{current.person_name}</span>?
+                </p>
+                <span className="text-xs text-gray-600 ml-3 flex-shrink-0">
+                  {bulkSuggestionQueue.length} remaining
+                </span>
+              </div>
+              <p className="text-gray-400 text-xs mb-5">
+                Similarity {Math.round(current.similarity * 100)}% —{' '}
+                cluster of {current.member_count} face{current.member_count !== 1 ? 's' : ''}
+                {current.is_high_conf === 1 && <span className="ml-1 text-green-400">✓ high confidence</span>}
+              </p>
+
+              <div className="flex gap-6 items-center justify-center mb-6">
+                {/* Named person */}
+                <div className="flex flex-col items-center gap-1">
+                  <div className="w-24 h-24 rounded-xl overflow-hidden bg-gray-800 border border-indigo-600">
+                    {personThumbUrl
+                      ? <img src={personThumbUrl} alt={current.person_name} className="w-full h-full object-cover" />
+                      : <span className="flex items-center justify-center h-full text-gray-500 text-2xl">👤</span>}
+                  </div>
+                  <span className="text-xs text-indigo-400 font-medium">{current.person_name}</span>
+                </div>
+                <span className="text-gray-400 text-2xl">≈</span>
+                {/* Candidate cluster */}
+                <div className="flex flex-col items-center gap-1">
+                  <div className="w-24 h-24 rounded-xl overflow-hidden bg-gray-800 border border-gray-600">
+                    {clusterThumbUrl
+                      ? <img src={clusterThumbUrl} alt="candidate" className="w-full h-full object-cover" />
+                      : <span className="flex items-center justify-center h-full text-gray-500 text-2xl">?</span>}
+                  </div>
+                  <span className="text-xs text-gray-500">{current.member_count} face{current.member_count !== 1 ? 's' : ''}</span>
+                </div>
+              </div>
+
+              <div className="flex gap-3">
+                <button
+                  onClick={acceptBulkSuggestion}
+                  disabled={bulkSuggestionWorking}
+                  className="flex-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-xl py-2.5 text-sm font-semibold transition-colors"
+                >
+                  {bulkSuggestionWorking ? 'Merging…' : '✓ Yes, same person'}
+                </button>
+                <button
+                  onClick={rejectBulkSuggestion}
+                  disabled={bulkSuggestionWorking}
+                  className="flex-1 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-gray-300 rounded-xl py-2.5 text-sm font-medium transition-colors"
+                >
+                  Different person
+                </button>
+              </div>
+              <button
+                onClick={() => { setBulkSuggestionQueue([]); setFindSimilarResult(r => r ? { ...r, suggestionsFound: r.suggestionsFound } : null) }}
+                className="mt-3 w-full text-center text-xs text-gray-600 hover:text-gray-400 transition-colors"
+              >
+                Stop reviewing — skip remaining
+              </button>
+            </div>
+          </div>
+        )
+      })()}
     </div>
   )
 }

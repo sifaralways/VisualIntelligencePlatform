@@ -114,6 +114,11 @@ export const api = {
       request<MergeSuggestion[]>(`/persons/${personId}/merge-suggestions?limit=1`),
     rejectSuggestion: (personId: number, clusterId: number) =>
       request(`/persons/${personId}/reject-suggestion/${clusterId}`, { method: 'POST' }),
+    findSimilarAll: (autoThreshold: number) =>
+      request<FindSimilarAllResult>('/persons/find-similar-all', {
+        method: 'POST',
+        body: JSON.stringify({ auto_threshold: autoThreshold }),
+      }),
   },
 
   // ─── Faces ────────────────────────────────────────────────────────────────
@@ -365,6 +370,17 @@ export interface MergeSuggestion {
   is_high_conf: number
   representative_thumbnail: string | null
   similarity: number   // cosine similarity to the named person's centroid
+}
+
+export interface FindSimilarSuggestion extends MergeSuggestion {
+  person_id: number
+  person_name: string
+  person_thumbnail: string | null
+}
+
+export interface FindSimilarAllResult {
+  auto_merged: Array<{ person_id: number; person_name: string; cluster_id: number; similarity: number; member_count: number }>
+  suggestions: FindSimilarSuggestion[]
 }
 
 export interface MergePersonsResult {
