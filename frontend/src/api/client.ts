@@ -94,6 +94,11 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ into_person_id: intoId }),
       }),
+    mergePersons: (personAId: number, personBId: number, newName?: string) =>
+      request<MergePersonsResult>(`/persons/${personAId}/merge-with/${personBId}`, {
+        method: 'POST',
+        body: JSON.stringify({ new_name: newName ?? null }),
+      }),
     fromCluster: (clusterId: number, name: string) =>
       request<{ person_id: number; uuid: string }>(`/persons/from-cluster/${clusterId}`, {
         method: 'POST',
@@ -311,6 +316,14 @@ export interface MergeSuggestion {
   is_high_conf: number
   representative_thumbnail: string | null
   similarity: number   // cosine similarity to the named person's centroid
+}
+
+export interface MergePersonsResult {
+  status: string
+  survivor_id: number
+  survivor_name: string
+  absorbed_id: number
+  photos_queued_for_writeback: number
 }
 
 export interface SimilarCluster {

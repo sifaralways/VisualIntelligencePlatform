@@ -27,7 +27,11 @@ logger = logging.getLogger(__name__)
 _writer = ExifToolWriter()
 
 
-def _merge_with_existing_xmp(vip_fields: dict, existing: dict) -> dict:
+def _merge_with_existing_xmp(
+    vip_fields: dict,
+    existing: dict,
+    all_vip_names: set[str] | None = None,
+) -> dict:
     """
     Merge VIP-generated fields with the metadata already present in the file,
     so that repeated writebacks and edits from other apps are never destroyed.
@@ -36,6 +40,9 @@ def _merge_with_existing_xmp(vip_fields: dict, existing: dict) -> dict:
     - XMP:PersonInImage  — union(VIP persons, existing file persons).
                            VIP is the authority for its own persons; external
                            persons (added by Lightroom, Photos, etc.) are kept.
+                           If *all_vip_names* is provided, previously-written
+                           VIP person names (e.g. a merged-away "Bob") are NOT
+                           preserved — they are superseded by the current set.
     - XMP:Subject /
       IPTC:Keywords      — VIP-prefixed keywords (obj:, animal:, geo:, place:)
                            are replaced with the current DB values.
@@ -46,7 +53,7 @@ def _merge_with_existing_xmp(vip_fields: dict, existing: dict) -> dict:
     """
     merged = dict(vip_fields)
 
-    # ── PersonInImage: union — never remove a known person from the file ────
+    # ── PersonInImage: union — keep truly external persons, drop VIP-old ones ──
     file_persons = existing.get("XMP:PersonInImage", [])
     if isinstance(file_persons, str):
         file_persons = [file_persons]
@@ -54,7 +61,17 @@ def _merge_with_existing_xmp(vip_fields: dict, existing: dict) -> dict:
     if file_persons:
         # Preserve order: VIP persons first, then file-only persons appended.
         vip_set = set(vip_persons)
-        extra = [p for p in file_persons if p not in vip_set]
+        # When all_vip_names is supplied we can distinguish between:
+        #   • truly external persons (written by Lightroom, Photos, etc.) → keep
+        #   • previously VIP-written persons that are now merged/renamed → drop
+        # Without all_vip_names we fall back to the conservative union.
+        if all_vip_names:
+            extra = [
+                p for p in file_persons
+                if p not in vip_set and p not in all_vip_names
+            ]
+        else:
+            extra = [p for p in file_persons if p not in vip_set]
         merged["XMP:PersonInImage"] = vip_persons + extra
 
     # ── Subject / IPTC:Keywords: keep external keywords, refresh VIP ones ───
@@ -76,6 +93,19 @@ def _merge_with_existing_xmp(vip_fields: dict, existing: dict) -> dict:
             merged["IPTC:Keywords"]  = merged_kw
 
     return merged
+
+
+async def _load_all_vip_names() -> set[str]:
+    """
+    Return the set of every person name VIP has ever managed (including
+    persons that were subsequently merged away).  Used by _merge_with_existing_xmp
+    to distinguish truly-external file persons from VIP ones that need replacing.
+    """
+    async with get_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT name FROM persons WHERE name IS NOT NULL"
+        )
+    return {r["name"] for r in rows}
 
 
 async def preview_pending() -> list[dict]:
@@ -145,18 +175,24 @@ async def execute_writes(queue_ids: list[int] | None = None) -> dict:
     media_ids = [r["media_file_id"] for r in rows]
     all_fields = await _build_fields_batch(media_ids)
 
+    # Load all VIP-ever-known person names so that merged-away names in files
+    # get replaced on the next writeback rather than preserved as "external".
+    all_vip_names = await _load_all_vip_names()
+
     # Run all ExifTool writes in a single executor thread using the persistent
     # stay_open process — eliminates one Perl interpreter startup per file.
     loop = asyncio.get_event_loop()
 
     def _do_writes() -> list[tuple[int, int, bool, str]]:
         """Returns list of (queue_id, media_id, success, msg)."""
-        # Batch-read existing PersonInImage + Subject from all target files
-        # in one ExifTool subprocess so external metadata is never wiped.
-        file_paths = [Path(r["file_path"]) for r in rows]
-        existing_xmp = ExifToolWriter.read_xmp_fields(
-            [p for p in file_paths if p.exists()]
-        )
+        # Only pre-read existing XMP from files that have been written before
+        # (writeback_done=1). First-write files have no VIP metadata to merge,
+        # so skipping their NAS round-trip avoids significant I/O overhead.
+        rewrite_paths = [
+            Path(r["file_path"]) for r in rows
+            if bool(r["writeback_done"]) and Path(r["file_path"]).exists()
+        ]
+        existing_xmp = ExifToolWriter.read_xmp_fields(rewrite_paths) if rewrite_paths else {}
 
         writer = ExifToolWriter()
         writer.open()
@@ -177,7 +213,7 @@ async def execute_writes(queue_ids: list[int] | None = None) -> dict:
                 # Merge VIP fields with whatever is already in the file so
                 # persons and keywords from other apps are preserved.
                 existing = existing_xmp.get(str(file_path), {})
-                fields = _merge_with_existing_xmp(vip_fields, existing)
+                fields = _merge_with_existing_xmp(vip_fields, existing, all_vip_names)
 
                 success, msg = writer.write(
                     file_path, fields, dry_run=False, is_first_write=is_first_write
@@ -488,14 +524,17 @@ async def write_single_file(media_file_id: int) -> dict:
         return {"status": "skipped", "reason": "No metadata to write yet", "fields_written": []}
 
     # Merge with what's already in the file so existing persons/keywords survive.
-    loop = asyncio.get_event_loop()
-    existing_xmp = await loop.run_in_executor(
-        None, ExifToolWriter.read_xmp_fields, [file_path]
-    )
-    existing = existing_xmp.get(str(file_path), {})
-    fields = _merge_with_existing_xmp(fields, existing)
-
+    # Skip the NAS read entirely on first write — nothing to preserve yet.
     is_first_write = not bool(row["writeback_done"])
+    if not is_first_write:
+        loop = asyncio.get_event_loop()
+        existing_xmp = await loop.run_in_executor(
+            None, ExifToolWriter.read_xmp_fields, [file_path]
+        )
+        existing = existing_xmp.get(str(file_path), {})
+        all_vip_names = await _load_all_vip_names()
+        fields = _merge_with_existing_xmp(fields, existing, all_vip_names)
+
     success, msg = _writer.write(file_path, fields, dry_run=False, is_first_write=is_first_write)
 
     if not success:

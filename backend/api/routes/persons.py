@@ -24,7 +24,11 @@ class NamePersonRequest(BaseModel):
 
 
 class MergeRequest(BaseModel):
-    into_person_id: int     # merge source → target
+    into_person_id: int     # merge source → target (kept for backward compat)
+
+
+class MergeNamedPersonsRequest(BaseModel):
+    new_name: Optional[str] = None   # None = keep the survivor's current name
 
 
 @router.get("")
@@ -236,23 +240,149 @@ async def name_person(person_id: int, req: NamePersonRequest):
 
 @router.post("/merge")
 async def merge_persons(req: MergeRequest, source_id: int):
-    """Merge two persons (same person, different clusters)."""
+    """Merge two persons (legacy endpoint — use /{a}/merge-with/{b} instead)."""
     async with get_db() as db:
-        # Re-assign all faces from source → target
         await db.execute(
             "UPDATE faces SET person_id=? WHERE person_id=?",
             (req.into_person_id, source_id),
         )
-        # Mark source as merged
         await db.execute("""
             UPDATE persons SET is_merged=1, merged_into_id=? WHERE id=?
         """, (req.into_person_id, source_id))
-        # Sync stored photo_count on target
         await _sync_photo_count(db, req.into_person_id)
-        # Refresh centroid to include faces from the merged source
         await update_person_centroid(db, req.into_person_id)
 
     return {"status": "merged", "into": req.into_person_id}
+
+
+@router.post("/{person_a_id}/merge-with/{person_b_id}")
+async def merge_named_persons(
+    person_a_id: int,
+    person_b_id: int,
+    req: MergeNamedPersonsRequest,
+):
+    """
+    Merge two named persons into a single record end-to-end.
+
+    Survivor is determined by photo count (ties favour person_a).
+    All faces and clusters from the loser are moved to the survivor.
+    The old name is removed from photo files on the next writeback run.
+
+    Body:
+        new_name: optional override for the merged person's name.
+                  Omit to keep the survivor's existing name.
+    """
+    if person_a_id == person_b_id:
+        raise HTTPException(status_code=400, detail="Cannot merge a person with themselves.")
+
+    async with get_db() as db:
+        row_a = await (
+            await db.execute(
+                "SELECT id, name, is_merged, is_ignored FROM persons WHERE id=?",
+                (person_a_id,),
+            )
+        ).fetchone()
+        row_b = await (
+            await db.execute(
+                "SELECT id, name, is_merged, is_ignored FROM persons WHERE id=?",
+                (person_b_id,),
+            )
+        ).fetchone()
+
+        if not row_a:
+            raise HTTPException(status_code=404, detail=f"Person {person_a_id} not found.")
+        if not row_b:
+            raise HTTPException(status_code=404, detail=f"Person {person_b_id} not found.")
+        if row_a["is_merged"]:
+            raise HTTPException(status_code=400, detail=f"Person {person_a_id} is already merged.")
+        if row_b["is_merged"]:
+            raise HTTPException(status_code=400, detail=f"Person {person_b_id} is already merged.")
+
+        # Determine survivor = person with more associated photos; ties → person_a.
+        count_a_row = await (
+            await db.execute(
+                "SELECT COUNT(DISTINCT media_file_id) AS n FROM faces WHERE person_id=?",
+                (person_a_id,),
+            )
+        ).fetchone()
+        count_b_row = await (
+            await db.execute(
+                "SELECT COUNT(DISTINCT media_file_id) AS n FROM faces WHERE person_id=?",
+                (person_b_id,),
+            )
+        ).fetchone()
+
+        count_a = count_a_row["n"] if count_a_row else 0
+        count_b = count_b_row["n"] if count_b_row else 0
+
+        if count_b > count_a:
+            survivor_id, loser_id = person_b_id, person_a_id
+            survivor_name = row_b["name"]
+        else:
+            survivor_id, loser_id = person_a_id, person_b_id
+            survivor_name = row_a["name"]
+
+        new_name_clean = req.new_name.strip() if req.new_name and req.new_name.strip() else None
+        effective_name = new_name_clean if new_name_clean else survivor_name
+
+        # ── All DB mutations in a single implicit transaction ───────────────
+        # 1. Reassign all faces from loser → survivor.
+        await db.execute(
+            "UPDATE faces SET person_id=? WHERE person_id=?",
+            (survivor_id, loser_id),
+        )
+        # 2. Reassign all clusters from loser → survivor.
+        await db.execute(
+            "UPDATE clusters SET person_id=? WHERE person_id=?",
+            (survivor_id, loser_id),
+        )
+        # 3. Apply the effective name to the survivor (update named_at if changed).
+        if effective_name != survivor_name or not survivor_name:
+            await db.execute(
+                "UPDATE persons SET name=?, named_at=datetime('now') WHERE id=?",
+                (effective_name, survivor_id),
+            )
+        # 4. Mark loser as merged (hidden from all future queries).
+        await db.execute(
+            "UPDATE persons SET is_merged=1, merged_into_id=? WHERE id=?",
+            (survivor_id, loser_id),
+        )
+        # 5. Clear merge-suggestion rejections for both.
+        await db.execute(
+            "DELETE FROM rejected_suggestions WHERE person_id IN (?, ?)",
+            (survivor_id, loser_id),
+        )
+        # 6. Queue ALL survivor photos (post-reassignment) for writeback.
+        #    INSERT OR REPLACE resets any prior 'written' row back to 'pending'
+        #    so ExifTool will overwrite files, removing the loser's old name and
+        #    writing the effective_name in its place.
+        await db.execute("""
+            INSERT OR REPLACE INTO writeback_queue (media_file_id)
+            SELECT DISTINCT media_file_id FROM faces WHERE person_id=?
+        """, (survivor_id,))
+
+        # Count the queued photos for the response summary.
+        queued_row = await (
+            await db.execute(
+                "SELECT COUNT(DISTINCT media_file_id) AS n FROM faces WHERE person_id=?",
+                (survivor_id,),
+            )
+        ).fetchone()
+        photos_queued = queued_row["n"] if queued_row else 0
+
+        # 7. Refresh the denormalised photo_count column.
+        await _sync_photo_count(db, survivor_id)
+
+        # 8. Recompute centroid from all merged embeddings.
+        await update_person_centroid(db, survivor_id)
+
+    return {
+        "status": "merged",
+        "survivor_id": survivor_id,
+        "survivor_name": effective_name,
+        "absorbed_id": loser_id,
+        "photos_queued_for_writeback": photos_queued,
+    }
 
 
 class NameClusterRequest(BaseModel):

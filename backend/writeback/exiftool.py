@@ -267,7 +267,8 @@ class ExifToolWriter:
         if not paths:
             return {}
         cmd = [
-            "exiftool", "-json", "-charset", "filename=UTF8", "-q",
+            "exiftool", "-json", "-fast2",   # -fast2: read only the metadata block, skip full RAW scan
+            "-charset", "filename=UTF8", "-q",
             "-XMP:PersonInImage", "-XMP:Subject",
         ] + [str(p) for p in paths]
         try:

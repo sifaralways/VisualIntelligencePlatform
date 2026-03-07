@@ -8,7 +8,7 @@
 
 import { useEffect, useState } from 'react'
 import { api } from '../api/client'
-import type { Cluster, Person, MergeSuggestion, FaceRow, SimilarCluster } from '../api/client'
+import type { Cluster, Person, MergeSuggestion, FaceRow, SimilarCluster, MergePersonsResult } from '../api/client'
 
 interface Props {
   /** Called when user clicks a named person tile to view their photos. */
@@ -31,6 +31,51 @@ export default function PeoplePage({ onSelectPerson }: Props) {
   const [reviewPerson, setReviewPerson] = useState<Person | null>(null)
   const [reviewFaces, setReviewFaces] = useState<FaceRow[]>([])
   const [reviewLoading, setReviewLoading] = useState(false)
+
+  // ── Named-person merge flow ───────────────────────────────────────────────
+  const [mergingFrom, setMergingFrom] = useState<Person | null>(null)
+  const [mergeTarget, setMergeTarget] = useState<Person | null>(null)
+  const [mergeNameInput, setMergeNameInput] = useState('')
+  const [mergeWorking, setMergeWorking] = useState(false)
+  const [mergeResult, setMergeResult] = useState<MergePersonsResult | null>(null)
+
+  function startMergeFrom(p: Person) {
+    setMergingFrom(p)
+    setMergeTarget(null)
+    setMergeNameInput('')
+    setMergeResult(null)
+  }
+
+  function selectMergeTarget(p: Person) {
+    if (!mergingFrom || p.id === mergingFrom.id) return
+    // Pre-fill the name with the survivor's name (more photos wins, ties → mergingFrom)
+    const survivor = p.photo_count > mergingFrom.photo_count ? p : mergingFrom
+    setMergeTarget(p)
+    setMergeNameInput(survivor.name ?? '')
+  }
+
+  function cancelMerge() {
+    setMergingFrom(null)
+    setMergeTarget(null)
+    setMergeNameInput('')
+    setMergeResult(null)
+  }
+
+  async function confirmMerge() {
+    if (!mergingFrom || !mergeTarget) return
+    setMergeWorking(true)
+    try {
+      const result = await api.persons.mergePersons(
+        mergingFrom.id,
+        mergeTarget.id,
+        mergeNameInput.trim() || undefined,
+      )
+      setMergeResult(result)
+      await load()
+    } finally {
+      setMergeWorking(false)
+    }
+  }
 
   // ── Proactive merge suggestions ─────────────────────────────────────────
   const [suggestion, setSuggestion] = useState<MergeSuggestion | null>(null)
@@ -269,6 +314,99 @@ export default function PeoplePage({ onSelectPerson }: Props) {
   return (
     <div>
       <h1 className="text-xl font-semibold mb-6">People</h1>
+
+      {/* ── Named-person merge dialog ─────────────────────────────────────── */}
+      {mergingFrom && mergeTarget && (
+        <div className="fixed inset-0 bg-black/75 flex items-center justify-center z-50">
+          <div className="bg-gray-900 border border-gray-700 rounded-2xl p-7 max-w-md w-full shadow-2xl mx-4">
+            {mergeResult ? (
+              /* ── Success state ── */
+              <>
+                <p className="text-white font-semibold text-lg mb-2 text-center">Merge complete ✓</p>
+                <p className="text-gray-400 text-sm text-center mb-5">
+                  <span className="text-indigo-300 font-medium">{mergeResult.survivor_name}</span> now has{' '}
+                  {mergeResult.photos_queued_for_writeback} photo{mergeResult.photos_queued_for_writeback !== 1 ? 's' : ''} queued for writeback.
+                  Old name will be removed from files on next write.
+                </p>
+                <button
+                  onClick={cancelMerge}
+                  className="w-full bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl py-2.5 text-sm font-semibold transition-colors"
+                >
+                  Done
+                </button>
+              </>
+            ) : (
+              /* ── Confirm state ── */
+              <>
+                <p className="text-white font-semibold text-lg mb-1">Merge these two people?</p>
+                <p className="text-gray-400 text-xs mb-5">
+                  All faces and photos will be combined. Files will be updated on next writeback.
+                </p>
+
+                {/* Side-by-side thumbnails */}
+                <div className="flex gap-6 items-center justify-center mb-5">
+                  {[mergingFrom, mergeTarget].map((p, i) => {
+                    const url = p.representative_thumbnail
+                      ? '/thumbnails/' + p.representative_thumbnail.split('/thumbnails/').pop()
+                      : null
+                    return (
+                      <div key={p.id} className="flex flex-col items-center gap-1">
+                        <div className={`w-24 h-24 rounded-xl overflow-hidden bg-gray-800 border ${i === 0 ? 'border-indigo-600' : 'border-gray-600'}`}>
+                          {url
+                            ? <img src={url} alt={p.name ?? ''} className="w-full h-full object-cover" />
+                            : <span className="flex items-center justify-center h-full text-gray-500 text-2xl">👤</span>}
+                        </div>
+                        <span className="text-xs font-medium text-gray-300 max-w-[96px] truncate text-center">{p.name}</span>
+                        <span className="text-xs text-gray-500">{p.photo_count} photo{p.photo_count !== 1 ? 's' : ''}</span>
+                      </div>
+                    )
+                  })}
+                </div>
+
+                {/* Quick-name buttons */}
+                <p className="text-xs text-gray-500 mb-1.5">Merged name:</p>
+                <div className="flex gap-2 mb-2">
+                  {[mergingFrom.name, mergeTarget.name].filter((n): n is string => !!n).filter((n, i, a) => a.indexOf(n) === i).map(n => (
+                    <button key={n}
+                      onClick={() => setMergeNameInput(n)}
+                      className={`flex-1 rounded-lg py-1.5 text-xs font-medium border transition-colors ${
+                        mergeNameInput === n
+                          ? 'bg-indigo-600 border-indigo-500 text-white'
+                          : 'bg-gray-800 border-gray-600 text-gray-300 hover:border-indigo-400'
+                      }`}
+                    >
+                      {n}
+                    </button>
+                  ))}
+                </div>
+                <input
+                  value={mergeNameInput}
+                  onChange={e => setMergeNameInput(e.target.value)}
+                  placeholder="Custom name…"
+                  className="w-full bg-gray-800 border border-gray-600 focus:border-indigo-500 rounded-lg px-3 py-2 text-sm text-white outline-none mb-5"
+                />
+
+                <div className="flex gap-3">
+                  <button
+                    onClick={confirmMerge}
+                    disabled={mergeWorking || !mergeNameInput.trim()}
+                    className="flex-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-xl py-2.5 text-sm font-semibold transition-colors"
+                  >
+                    {mergeWorking ? 'Merging…' : 'Merge'}
+                  </button>
+                  <button
+                    onClick={cancelMerge}
+                    disabled={mergeWorking}
+                    className="flex-1 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-gray-300 rounded-xl py-2.5 text-sm font-medium transition-colors"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Suggestion modal — proactive same-person proposal */}
       {suggestion && suggestionPersonId !== null && (
@@ -647,28 +785,60 @@ export default function PeoplePage({ onSelectPerson }: Props) {
       {/* Named persons — sorted alphabetically */}
       {persons.length > 0 && (
         <section>
-          <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider mb-3">
-            Named ({persons.length})
-          </h2>
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
+              Named ({persons.length})
+            </h2>
+            {mergingFrom && !mergeTarget && (
+              <div className="flex items-center gap-3">
+                <span className="text-xs text-indigo-300 font-medium animate-pulse">
+                  Select a person to merge with <span className="font-semibold">{mergingFrom.name}</span>
+                </span>
+                <button onClick={cancelMerge} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">
+                  ✕ Cancel
+                </button>
+              </div>
+            )}
+          </div>
           <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-4">
             {[...persons].sort((a, b) => (a.name ?? '').localeCompare(b.name ?? '')).map(p => {
               const thumb = p.representative_thumbnail
               const thumbUrl = thumb ? '/thumbnails/' + thumb.split('/thumbnails/').pop() : null
               const isRenaming = renamingPersonId === p.id
+              const isMergingFrom = mergingFrom?.id === p.id
+              const isMergeMode = !!mergingFrom && !mergeTarget
               return (
                 <div key={p.id} className="flex flex-col items-center gap-2">
-                  {/* Main tile — click to view photos */}
+                  {/* Main tile — click to view photos or select merge target */}
                   <div className="relative group">
                     <button
-                      onClick={() => !isRenaming && onSelectPerson?.(p.id, p.name ?? 'Unknown')}
-                      title={`View photos of ${p.name}`}
-                      className="w-20 h-20 rounded-xl bg-gray-800 border border-gray-700 hover:border-indigo-400 overflow-hidden flex items-center justify-center transition-colors">
+                      onClick={() => {
+                        if (isMergeMode && !isMergingFrom) {
+                          selectMergeTarget(p)
+                        } else if (!isRenaming && !isMergeMode) {
+                          onSelectPerson?.(p.id, p.name ?? 'Unknown')
+                        }
+                      }}
+                      title={isMergeMode && !isMergingFrom ? `Merge with ${p.name}` : `View photos of ${p.name}`}
+                      className={`w-20 h-20 rounded-xl bg-gray-800 border overflow-hidden flex items-center justify-center transition-colors ${
+                        isMergingFrom
+                          ? 'border-indigo-500 ring-2 ring-indigo-600'
+                          : isMergeMode
+                            ? 'border-indigo-400 hover:border-indigo-300 cursor-pointer'
+                            : 'border-gray-700 hover:border-indigo-400'
+                      }`}
+                    >
                       {thumbUrl
                         ? <img src={thumbUrl} alt={p.name ?? 'person'} className="w-full h-full object-cover" />
                         : <span className="text-2xl">👤</span>}
+                      {isMergeMode && !isMergingFrom && (
+                        <span className="absolute inset-0 bg-indigo-900/30 flex items-center justify-center text-indigo-300 text-xs font-bold opacity-0 group-hover:opacity-100 transition-opacity">
+                          merge
+                        </span>
+                      )}
                     </button>
-                    {/* Rename icon — top-left on hover */}
-                    {!isRenaming && (
+                    {/* Rename icon — top-left on hover (hidden in merge mode) */}
+                    {!isRenaming && !isMergeMode && (
                       <button
                         onClick={() => { setRenamingPersonId(p.id); setRenameInput(p.name ?? '') }}
                         title="Rename"
@@ -677,14 +847,16 @@ export default function PeoplePage({ onSelectPerson }: Props) {
                         ✎
                       </button>
                     )}
-                    {/* Review icon — top-right on hover */}
-                    <button
-                      onClick={() => openReview(p)}
-                      title="Review faces"
-                      className="absolute -top-1 -right-1 bg-gray-700 hover:bg-gray-600 border border-gray-600 rounded-full w-5 h-5 text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
-                    >
-                      ⋯
-                    </button>
+                    {/* Review icon — top-right on hover (hidden in merge mode) */}
+                    {!isMergeMode && (
+                      <button
+                        onClick={() => openReview(p)}
+                        title="Review faces"
+                        className="absolute -top-1 -right-1 bg-gray-700 hover:bg-gray-600 border border-gray-600 rounded-full w-5 h-5 text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+                      >
+                        ⋯
+                      </button>
+                    )}
                   </div>
                   {isRenaming ? (
                     <div className="flex flex-col gap-1 w-full px-1">
@@ -728,13 +900,29 @@ export default function PeoplePage({ onSelectPerson }: Props) {
                   {p.merge_sources_count > 0 && (
                     <span className="text-xs text-indigo-500">⇐ {p.merge_sources_count} merged</span>
                   )}
-                  <button
-                    onClick={() => startSuggestions(p.id, p.name!)}
-                    title="Find similar faces"
-                    className="text-xs text-gray-600 hover:text-indigo-400 transition-colors"
-                  >
-                    ≈ find similar
-                  </button>
+                  {!isMergeMode && (
+                    <div className="flex gap-3">
+                      <button
+                        onClick={() => startSuggestions(p.id, p.name!)}
+                        title="Find similar faces"
+                        className="text-xs text-gray-600 hover:text-indigo-400 transition-colors"
+                      >
+                        ≈ similar
+                      </button>
+                      <button
+                        onClick={() => startMergeFrom(p)}
+                        title="Merge with another person"
+                        className="text-xs text-gray-600 hover:text-orange-400 transition-colors"
+                      >
+                        ⇔ merge
+                      </button>
+                    </div>
+                  )}
+                  {isMergingFrom && (
+                    <button onClick={cancelMerge} className="text-xs text-indigo-400 hover:text-gray-300 transition-colors">
+                      cancel merge
+                    </button>
+                  )}
                 </div>
               )
             })}
