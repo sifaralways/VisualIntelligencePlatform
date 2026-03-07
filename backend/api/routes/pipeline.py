@@ -59,9 +59,15 @@ async def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
 
 @router.post("/rescan")
 async def rescan_library(background_tasks: BackgroundTasks):
-    """Re-evaluate quality signals and auto-merge suggestions for all photos
-    already in the library.  Does NOT re-scan the filesystem or re-detect
-    faces — person/cluster assignments are preserved.
+    """Full library reprocess without a filesystem walk.
+
+    Re-detects faces on photos not owned by a named person (applies any
+    updated detection/clustering settings from the Admin page), re-clusters
+    all unowned faces with the current HDBSCAN settings, runs auto-merge
+    + always-ignore suppression, and refreshes quality signals.
+
+    Named-person assignments are preserved.  Always-ignored faces are
+    never re-surfaced.
     """
     if _pipeline_state["status"] == "running":
         raise HTTPException(status_code=409, detail="Pipeline already running")

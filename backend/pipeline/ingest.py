@@ -68,21 +68,110 @@ def _ensure_models() -> None:
 # ---------------------------------------------------------------------------
 async def run_reprocess() -> None:
     """
-    Re-evaluate quality signals and auto-merge suggestions for every photo
-    already in the library.  Does NOT re-scan the filesystem, re-detect
-    faces, or disturb cluster / person assignments.
+    Full reprocess of the existing library without a filesystem walk.
 
     Steps:
-      1. Re-run blur + closed-eyes detection on each photo thumbnail
-      2. Re-run Phase 3b auto-merge (surface new merge suggestions)
-      3. Rebuild analysis documents so quality flags appear in the UI
+      1. Re-detect faces on photos not owned by a named person (respects
+         updated detection settings; always-ignored faces are preserved).
+      2. Re-cluster all unowned face embeddings with updated HDBSCAN settings.
+      3. Re-run Phase 3b auto-merge + auto-suppress against ignored persons.
+      4. Re-run Phase 3c VIP-history name restore for newly-detected faces.
+      5. Re-run quality signals (blur, closed-eyes) on stored thumbnails.
+      6. Rebuild analysis documents so all changes appear in the UI.
     """
     logger.info("=== Reprocess start ===")
     await broadcast("pipeline_start", folder="[library reprocess]")
     await settings_store.load_cache()
     _ensure_models()
 
-    # Step 1: quality re-check on stored photo thumbnails
+    # -------------------------------------------------------------------------
+    # Step 1: Prepare files for face re-detection
+    # -------------------------------------------------------------------------
+    # For every media file where NO face belongs to a named (non-ignored)
+    # person we:
+    #   a) Delete unowned face rows and their embeddings
+    #   b) Reset ingest_state → 'scanned' so _phase_embed re-processes them
+    #
+    # Files that DO have named-person faces are left untouched — those
+    # assignments are preserved and will survive the re-cluster.
+    #
+    # Faces assigned to always-ignored persons (is_ignored=1) have
+    # person_id IS NOT NULL, so the WHERE person_id IS NULL condition
+    # below never touches them — they cannot re-surface.
+    await broadcast("phase_start", phase="redetect_prep")
+    async with get_db() as db:
+        _cnt = await (await db.execute("""
+            SELECT COUNT(DISTINCT m.id) AS n
+            FROM media_files m
+            WHERE m.is_stub = 0
+              AND m.id NOT IN (
+                  SELECT DISTINCT f.media_file_id FROM faces f
+                  JOIN persons p ON p.id = f.person_id
+                  WHERE p.name IS NOT NULL AND p.is_ignored = 0
+              )
+        """)).fetchone()
+        redetect_count = _cnt["n"] if _cnt else 0
+
+        # 1a. Drop embeddings for unowned faces in the re-detection scope
+        await db.execute("""
+            DELETE FROM embeddings
+            WHERE face_id IN (
+                SELECT f.id FROM faces f
+                WHERE f.person_id IS NULL
+                  AND f.media_file_id NOT IN (
+                      SELECT DISTINCT f2.media_file_id FROM faces f2
+                      JOIN persons p ON p.id = f2.person_id
+                      WHERE p.name IS NOT NULL AND p.is_ignored = 0
+                  )
+            )
+        """)
+
+        # 1b. Drop the unowned face rows themselves
+        await db.execute("""
+            DELETE FROM faces
+            WHERE person_id IS NULL
+              AND media_file_id NOT IN (
+                  SELECT DISTINCT f2.media_file_id FROM faces f2
+                  JOIN persons p ON p.id = f2.person_id
+                  WHERE p.name IS NOT NULL AND p.is_ignored = 0
+              )
+        """)
+
+        # 1c. Reset ingest_state so _phase_embed re-processes these files
+        await db.execute("""
+            UPDATE media_files SET ingest_state = 'scanned'
+            WHERE is_stub = 0
+              AND id NOT IN (
+                  SELECT DISTINCT f.media_file_id FROM faces f
+                  JOIN persons p ON p.id = f.person_id
+                  WHERE p.name IS NOT NULL AND p.is_ignored = 0
+              )
+        """)
+
+    logger.info("Redetect prep: %d files reset for re-detection", redetect_count)
+    await broadcast("phase_complete", phase="redetect_prep", count=redetect_count)
+
+    # Step 2: Re-detect + embed on all 'scanned' files.
+    # Files that still have embeddings (named-person files) are skipped by
+    # the existing idempotency guard inside _phase_embed.
+    await _phase_embed()
+
+    # Step 3: Re-cluster all unowned face embeddings.
+    # Named/ignored-person faces (cluster_id IS NOT NULL) are excluded.
+    # This picks up both freshly-detected faces AND previously-stored
+    # embeddings from mixed files (some named, some unnamed).
+    await _phase_cluster()
+
+    # Step 4: Auto-merge + suppress.
+    # Matches new clusters → named persons (auto-name or suggestion).
+    # Matches new clusters → ignored persons (silently suppressed).
+    await _phase_auto_merge()
+
+    # Step 5: Restore VIP-history names for newly-detected faces in files
+    # that VIP previously wrote XMP data to.
+    await _phase_restore_vip_names()
+
+    # Step 6: quality re-check on stored photo thumbnails
     await broadcast("phase_start", phase="quality_recheck")
     async with get_db() as db:
         media_rows = await db.execute_fetchall(
@@ -148,11 +237,20 @@ async def run_reprocess() -> None:
     if _q and _q["cnt"] > 0:
         await broadcast("quality_issues_found", count=_q["cnt"])
 
-    # Step 2: auto-merge check
-    await _phase_auto_merge()
-
-    # Step 3: rebuild analysis docs so new quality info appears
+    # Step 7: Rebuild analysis documents so all changes appear in the UI
     await _phase_analyse()
+
+    # Sync denormalised photo_count on all active persons
+    async with get_db() as db:
+        await db.execute("""
+            UPDATE persons
+            SET photo_count = (
+                SELECT COUNT(DISTINCT f.media_file_id)
+                FROM faces f
+                WHERE f.person_id = persons.id
+            )
+            WHERE is_merged = 0
+        """)
 
     await broadcast("pipeline_complete", folder="[library reprocess]")
     logger.info("=== Reprocess complete ===")

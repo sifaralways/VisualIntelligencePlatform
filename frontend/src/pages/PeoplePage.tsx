@@ -83,6 +83,72 @@ export default function PeoplePage({ onSelectPerson }: Props) {
   const [similarClusters, setSimilarClusters] = useState<SimilarCluster[]>([])
   const [similarLoading, setSimilarLoading] = useState(false)
 
+  // ── Multi-select for unnamed clusters ────────────────────────────────────
+  const [selectMode, setSelectMode] = useState(false)
+  const [selected, setSelected] = useState<Set<number>>(new Set())
+  const [bulkWorking, setBulkWorking] = useState(false)
+  const [bulkNameOpen, setBulkNameOpen] = useState(false)
+  const [bulkNameInput, setBulkNameInput] = useState('')
+  const [bulkNameSuggestions, setBulkNameSuggestions] = useState(false)
+
+  function toggleSelect(id: number) {
+    setSelected(prev => {
+      const next = new Set(prev)
+      next.has(id) ? next.delete(id) : next.add(id)
+      return next
+    })
+  }
+
+  function exitSelectMode() {
+    setSelectMode(false)
+    setSelected(new Set())
+    setBulkNameOpen(false)
+    setBulkNameInput('')
+  }
+
+  async function handleBulkDelete() {
+    if (selected.size === 0) return
+    setBulkWorking(true)
+    try {
+      await Promise.all([...selected].map(id => api.clusters.delete(id)))
+      setClusters(prev => prev.filter(c => !selected.has(c.id)))
+      exitSelectMode()
+    } finally { setBulkWorking(false) }
+  }
+
+  async function handleBulkIgnore() {
+    if (selected.size === 0) return
+    setBulkWorking(true)
+    try {
+      await Promise.all([...selected].map(id => api.clusters.ignore(id)))
+      setClusters(prev => prev.filter(c => !selected.has(c.id)))
+      exitSelectMode()
+    } finally { setBulkWorking(false) }
+  }
+
+  async function handleBulkName() {
+    const name = bulkNameInput.trim()
+    if (!name || selected.size === 0) return
+    setBulkWorking(true)
+    try {
+      const ids = [...selected]
+      const existing = persons.find(p => p.name?.toLowerCase() === name.toLowerCase())
+      if (existing) {
+        // Merge all selected clusters into the existing person
+        await Promise.all(ids.map(id => api.persons.addCluster(existing.id, id)))
+      } else {
+        // Create person from first cluster, add remaining clusters to it
+        const [first, ...rest] = ids
+        const result = await api.persons.fromCluster(first, name)
+        if (rest.length > 0) {
+          await Promise.all(rest.map(id => api.persons.addCluster(result.person_id, id)))
+        }
+      }
+      await load()
+      exitSelectMode()
+    } finally { setBulkWorking(false) }
+  }
+
   async function openDismiss(cluster: Cluster) {
     setDismissTarget(cluster)
     setSimilarClusters([])
@@ -444,32 +510,148 @@ export default function PeoplePage({ onSelectPerson }: Props) {
       {/* Unnamed clusters */}
       {clusters.length > 0 && (
         <section className="mb-8">
-          <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider mb-3">
-            Unnamed clusters ({clusters.length})
-          </h2>
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
+              Unnamed clusters ({clusters.length})
+            </h2>
+            <div className="flex items-center gap-2">
+              {selectMode && selected.size > 0 && (
+                <span className="text-xs text-gray-400">{selected.size} selected</span>
+              )}
+              <button
+                onClick={() => { setSelectMode(s => !s); setSelected(new Set()) }}
+                className={`text-xs px-2.5 py-1 rounded-lg border transition-colors ${
+                  selectMode
+                    ? 'bg-indigo-700 border-indigo-500 text-white'
+                    : 'bg-gray-800 border-gray-600 text-gray-400 hover:text-white hover:border-gray-400'
+                }`}
+              >
+                {selectMode ? 'Cancel select' : 'Select'}
+              </button>
+            </div>
+          </div>
           <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-4">
             {clusters.map(c => (
               <ClusterTile key={c.id} cluster={c}
-                isNaming={namingId === c.id} nameInput={nameInput} saving={saving}
+                isNaming={!selectMode && namingId === c.id} nameInput={nameInput} saving={saving}
                 personNames={persons.filter(p => p.name).map(p => p.name!)}
-                onStartNaming={() => { setNamingId(c.id); setNameInput('') }}
+                selectMode={selectMode}
+                isSelected={selected.has(c.id)}
+                onToggleSelect={() => toggleSelect(c.id)}
+                onStartNaming={() => { if (!selectMode) { setNamingId(c.id); setNameInput('') } }}
                 onNameInput={setNameInput}
                 onConfirm={() => handleName(c.id)}
                 onCancel={() => setNamingId(null)}
                 onDismiss={() => openDismiss(c)} />
             ))}
           </div>
+
+          {/* Bulk action bar — floats at bottom when items are selected */}
+          {selectMode && selected.size > 0 && (
+            <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 bg-gray-900 border border-gray-700 rounded-2xl px-5 py-3 shadow-2xl">
+              {/* Name input row — shown when Name button is clicked */}
+              {bulkNameOpen && (
+                <div className="flex items-center gap-2 mb-3 relative">
+                  <div className="relative flex-1">
+                    <input
+                      autoFocus
+                      value={bulkNameInput}
+                      onChange={e => { setBulkNameInput(e.target.value); setBulkNameSuggestions(true) }}
+                      onFocus={() => setBulkNameSuggestions(true)}
+                      onBlur={() => setBulkNameSuggestions(false)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') { setBulkNameSuggestions(false); handleBulkName() }
+                        if (e.key === 'Escape') { setBulkNameOpen(false); setBulkNameInput('') }
+                      }}
+                      placeholder="Enter name…"
+                      className="w-full bg-gray-800 border border-indigo-500 rounded-lg px-3 py-1.5 text-sm text-white outline-none min-w-[180px]"
+                    />
+                    {bulkNameSuggestions && bulkNameInput.trim().length > 0 && (() => {
+                      const matches = persons
+                        .filter(p => p.name && p.name.toLowerCase().includes(bulkNameInput.toLowerCase()))
+                        .map(p => p.name!)
+                      return matches.length > 0 ? (
+                        <ul
+                          onMouseDown={e => e.preventDefault()}
+                          className="absolute bottom-full mb-1 left-0 right-0 bg-gray-900 border border-gray-700 rounded-lg shadow-xl z-50 max-h-40 overflow-y-auto"
+                        >
+                          {matches.map(name => (
+                            <li
+                              key={name}
+                              onClick={() => { setBulkNameInput(name); setBulkNameSuggestions(false) }}
+                              className="px-3 py-1.5 text-sm text-gray-200 hover:bg-indigo-700 hover:text-white cursor-pointer truncate"
+                            >
+                              {name}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : null
+                    })()}
+                  </div>
+                  <button
+                    onClick={() => { setBulkNameSuggestions(false); handleBulkName() }}
+                    disabled={bulkWorking || !bulkNameInput.trim()}
+                    className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white text-sm font-medium px-4 py-1.5 rounded-lg transition-colors whitespace-nowrap"
+                  >
+                    {bulkWorking ? 'Saving…' : 'Save'}
+                  </button>
+                  <button
+                    onClick={() => { setBulkNameOpen(false); setBulkNameInput('') }}
+                    className="text-gray-500 hover:text-gray-300 text-sm transition-colors"
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+              {/* Main action row */}
+              <div className="flex items-center gap-3">
+                <span className="text-sm text-gray-300 mr-1">{selected.size} face{selected.size !== 1 ? 's' : ''}</span>
+                <button
+                  onClick={() => { setBulkNameOpen(o => !o); setBulkNameInput('') }}
+                  disabled={bulkWorking}
+                  className={`text-sm font-medium px-4 py-1.5 rounded-lg transition-colors disabled:opacity-40 ${
+                    bulkNameOpen
+                      ? 'bg-indigo-700 text-white'
+                      : 'bg-indigo-600 hover:bg-indigo-500 text-white'
+                  }`}
+                >
+                  Name
+                </button>
+                <button
+                  onClick={handleBulkDelete}
+                  disabled={bulkWorking}
+                  className="bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-white text-sm font-medium px-4 py-1.5 rounded-lg transition-colors"
+                >
+                  {bulkWorking ? 'Working…' : 'Delete'}
+                </button>
+                <button
+                  onClick={handleBulkIgnore}
+                  disabled={bulkWorking}
+                  className="bg-red-900 hover:bg-red-800 disabled:opacity-40 text-white text-sm font-medium px-4 py-1.5 rounded-lg transition-colors"
+                >
+                  Always ignore
+                </button>
+                <button
+                  onClick={exitSelectMode}
+                  disabled={bulkWorking}
+                  className="text-gray-500 hover:text-gray-300 text-sm transition-colors"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
         </section>
       )}
 
-      {/* Named persons */}
+      {/* Named persons — sorted alphabetically */}
       {persons.length > 0 && (
         <section>
           <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider mb-3">
             Named ({persons.length})
           </h2>
           <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-4">
-            {persons.map(p => {
+            {[...persons].sort((a, b) => (a.name ?? '').localeCompare(b.name ?? '')).map(p => {
               const thumb = p.representative_thumbnail
               const thumbUrl = thumb ? '/thumbnails/' + thumb.split('/thumbnails/').pop() : null
               const isRenaming = renamingPersonId === p.id
@@ -563,9 +745,10 @@ export default function PeoplePage({ onSelectPerson }: Props) {
   )
 }
 
-function ClusterTile({ cluster, isNaming, nameInput, saving, personNames, onStartNaming, onNameInput, onConfirm, onCancel, onDismiss }: {
+function ClusterTile({ cluster, isNaming, nameInput, saving, personNames, selectMode, isSelected, onToggleSelect, onStartNaming, onNameInput, onConfirm, onCancel, onDismiss }: {
   cluster: Cluster; isNaming: boolean; nameInput: string; saving: boolean
   personNames: string[]
+  selectMode: boolean; isSelected: boolean; onToggleSelect: () => void
   onStartNaming: () => void; onNameInput: (v: string) => void; onConfirm: () => void; onCancel: () => void
   onDismiss: () => void
 }) {
@@ -580,9 +763,14 @@ function ClusterTile({ cluster, isNaming, nameInput, saving, personNames, onStar
   return (
     <div className="flex flex-col items-center gap-2">
       <div className="relative group">
-        <button onClick={onStartNaming}
+        <button
+          onClick={selectMode ? onToggleSelect : onStartNaming}
           className={'relative w-20 h-20 rounded-xl overflow-hidden bg-gray-800 border transition-colors ' +
-            (isNaming ? 'border-indigo-500' : 'border-gray-700 hover:border-indigo-400')}>
+            (selectMode
+              ? isSelected
+                ? 'border-indigo-400 ring-2 ring-indigo-500'
+                : 'border-gray-600 hover:border-indigo-300'
+              : isNaming ? 'border-indigo-500' : 'border-gray-700 hover:border-indigo-400')}>
           {thumbUrl
             ? <img src={thumbUrl} alt="face" className="w-full h-full object-cover" />
             : <span className="text-gray-500 text-2xl flex items-center justify-center h-full">?</span>}
@@ -592,15 +780,25 @@ function ClusterTile({ cluster, isNaming, nameInput, saving, personNames, onStar
           {cluster.is_high_conf === 1 && (
             <span className="absolute top-0 left-0 bg-green-700 text-white text-xs px-1 rounded-br leading-tight">✓</span>
           )}
+          {/* Selection checkbox overlay */}
+          {selectMode && (
+            <span className={`absolute top-1 right-1 w-5 h-5 rounded-full border-2 flex items-center justify-center text-xs font-bold transition-colors ${
+              isSelected ? 'bg-indigo-500 border-indigo-400 text-white' : 'bg-black/40 border-gray-400'
+            }`}>
+              {isSelected ? '✓' : ''}
+            </span>
+          )}
         </button>
-        {/* Dismiss button — shown on hover */}
-        <button
-          onClick={e => { e.stopPropagation(); onDismiss() }}
-          title="Remove this face"
-          className="absolute -top-1 -right-1 w-5 h-5 bg-gray-700 hover:bg-red-700 border border-gray-600 rounded-full text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity text-gray-300 hover:text-white leading-none"
-        >
-          ✕
-        </button>
+        {/* Dismiss button — shown on hover, hidden in select mode */}
+        {!selectMode && (
+          <button
+            onClick={e => { e.stopPropagation(); onDismiss() }}
+            title="Remove this face"
+            className="absolute -top-1 -right-1 w-5 h-5 bg-gray-700 hover:bg-red-700 border border-gray-600 rounded-full text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity text-gray-300 hover:text-white leading-none"
+          >
+            ✕
+          </button>
+        )}
       </div>
       {isNaming ? (
         <div className="flex flex-col gap-1 w-full">
