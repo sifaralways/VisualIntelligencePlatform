@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from backend.config import settings, ensure_dirs
 from backend.database.db import init_db
-from backend.api.routes import media, persons, faces, search, pipeline, writeback, admin, tags, analysis, settings as settings_route, folders
+from backend.api.routes import media, persons, faces, search, pipeline, writeback, admin, tags, analysis, settings as settings_route, folders, remote
 from backend.api.websocket import router as ws_router
 
 
@@ -198,6 +198,7 @@ app.include_router(admin.router,    prefix="/api/admin",    tags=["admin"])
 app.include_router(tags.router,      prefix="/api/tags",      tags=["tags"])
 app.include_router(analysis.router,  prefix="/api/analysis",  tags=["analysis"])
 app.include_router(settings_route.router, prefix="/api/settings", tags=["settings"])
+app.include_router(remote.router,         prefix="/api/remote",   tags=["remote"])
 app.include_router(folders.router,        prefix="/api/folders",  tags=["folders"])
 
 # ---------------------------------------------------------------------------

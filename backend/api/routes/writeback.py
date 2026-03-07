@@ -73,3 +73,27 @@ async def get_writeback_status():
             GROUP BY status
         """)
     return {r["status"]: r["count"] for r in rows}
+
+
+@router.post("/retry-failed")
+async def retry_failed_writes():
+    """
+    Reset all failed writeback queue items back to 'pending' and re-execute them.
+    Returns the same summary dict as /confirm.
+    """
+    from backend.database.db import get_db
+    async with get_db() as db:
+        # Collect the IDs before resetting so we can target them explicitly.
+        rows = await db.execute_fetchall(
+            "SELECT id FROM writeback_queue WHERE status='failed'"
+        )
+        if not rows:
+            return {"written": 0, "failed": 0, "retried": 0}
+        failed_ids = [r["id"] for r in rows]
+        await db.executemany(
+            "UPDATE writeback_queue SET status='pending', error_msg=NULL WHERE id=?",
+            [(i,) for i in failed_ids],
+        )
+    result = await execute_writes(failed_ids)
+    result["retried"] = len(failed_ids)
+    return result

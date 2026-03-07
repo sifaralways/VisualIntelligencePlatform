@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 import subprocess
 import threading
 from pathlib import Path
@@ -253,6 +254,120 @@ class ExifToolWriter:
             logger.info("Purged backup: %s", backup)
             return True
         return False
+
+    @staticmethod
+    def write_remote(
+        remote_path: str,
+        fields: dict[str, Any],
+        *,
+        host: str,
+        port: int,
+        user: str,
+        ssh_key_path: str,
+        is_first_write: bool = True,
+        timeout: int = 120,
+    ) -> tuple[bool, str]:
+        """
+        Run ExifTool on the remote host via SSH so the file is never
+        transferred over the network — only the metadata command crosses
+        the wire.
+
+        The remote path must already be translated from the local mount path
+        to the server-side filesystem path before calling this method.
+        """
+        # Build the per-tag ExifTool flags as a single shell-safe string.
+        tag_args: list[str] = ["-charset", "filename=UTF8", "-charset", "UTF8"]
+        if not (is_first_write and settings.exiftool_write_backup):
+            tag_args.append("-overwrite_original")
+        tag_args.append("-preserve")
+        for tag, value in fields.items():
+            tag_args.append(f"-{tag}=")
+            if isinstance(value, list):
+                for v in value:
+                    tag_args.append(f"-{tag}={v}")
+            else:
+                tag_args.append(f"-{tag}={value}")
+        tag_args.append(remote_path)
+
+        # Quote each argument for safe remote shell expansion.
+        # Use zsh -lc so ~/.zprofile (Homebrew PATH) is sourced on macOS remotes.
+        # remote_cmd is passed as a single SSH arg so zsh receives the
+        # quoted inner command as one string for its -c flag.
+        inner_cmd = "exiftool " + " ".join(shlex.quote(a) for a in tag_args)
+
+        # Remove any stale _exiftool_tmp file on the remote before writing —
+        # ExifTool will refuse to proceed if it already exists (e.g. from a
+        # previous interrupted run).
+        tmp_path = remote_path + "_exiftool_tmp"
+        cleanup_cmd = f"rm -f {shlex.quote(tmp_path)} && {inner_cmd}"
+        remote_cmd = "zsh -lc " + shlex.quote(cleanup_cmd)
+
+        ssh_cmd = [
+            "ssh",
+            "-i", ssh_key_path,
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+            "-p", str(port),
+            f"{user}@{host}",
+            remote_cmd,
+        ]
+        try:
+            result = subprocess.run(
+                ssh_cmd,
+                capture_output=True,
+                timeout=timeout,
+            )
+            stdout = result.stdout.decode("utf-8", errors="replace").strip()
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            combined = (stderr + "\n" + stdout).strip()
+
+            # Mirror the persistent-process success logic: ExifTool exits with
+            # rc=1 for warnings (e.g. unrecognised tags) but still writes the
+            # file and prints "N image files updated" to stdout.  Only treat as
+            # failure when stdout says "0 image files" (nothing written) or
+            # when rc!=0 AND stdout is empty (SSH/process-level error).
+            is_failure = (
+                "0 image files" in stdout.lower()
+                or (result.returncode != 0 and not stdout)
+            )
+            if is_failure:
+                if "error opening file" in combined.lower():
+                    # Log the raw ExifTool output so we can see whether it's
+                    # truly not-found, read-only, permission denied, etc.
+                    logger.error(
+                        "Remote ExifTool 'Error opening file' for %s | rc=%d | stdout=%r | stderr=%r",
+                        remote_path, result.returncode, stdout, stderr,
+                    )
+                    msg = (
+                        f"Remote ExifTool could not open '{remote_path}' "
+                        f"(rc={result.returncode}). "
+                        "This usually means the file is read-only, the mount is read-only, "
+                        "or SSH has no write permission. "
+                        "Use Admin → Remote Servers → Check Write Access to diagnose. "
+                        f"Raw error: {stderr or stdout}"
+                    )
+                    return False, msg
+                error_lines = [
+                    l for l in combined.splitlines()
+                    if not l.lower().startswith("warning:")
+                ]
+                detail = "\n".join(error_lines).strip() or combined or "ExifTool write failed on remote"
+                logger.error("Remote write failed for %s: %s", remote_path, detail)
+                return False, f"SSH/ExifTool error: {detail}"
+
+            if stderr:
+                logger.debug("Remote ExifTool warnings for %s: %s", remote_path, stderr)
+            logger.info("Remote write OK: %s on %s", remote_path, host)
+            return True, stdout or f"Written to {remote_path} on {host}"
+        except subprocess.TimeoutExpired:
+            msg = f"SSH/ExifTool timed out writing to {remote_path} on {host}"
+            logger.error(msg)
+            return False, msg
+        except Exception as exc:
+            msg = f"Remote write error: {exc}"
+            logger.error(msg)
+            return False, msg
 
     @staticmethod
     def read_xmp_fields(paths: list[Path]) -> dict[str, dict]:

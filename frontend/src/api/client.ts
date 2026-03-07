@@ -143,6 +143,10 @@ export const api = {
         body: JSON.stringify({ queue_ids: queueIds ?? null }),
       }),
     status: () => request<Record<string, number>>('/writeback/status'),
+    retryFailed: () =>
+      request<{ written: number; failed: number; retried: number }>('/writeback/retry-failed', {
+        method: 'POST',
+      }),
     /** Write EXIF for a single photo immediately (bypasses queue). */
     writeOne: (mediaId: number) =>
       request<{ status: string; media_id: number; fields_written?: string[]; reason?: string }>(
@@ -199,6 +203,47 @@ export const api = {
         body: JSON.stringify({ updates }),
       }),
     reset: () => request<{ status: string; detail: string }>('/settings/reset', { method: 'POST' }),
+  },
+
+  // ─── Remote servers ──────────────────────────────────────────────────────
+  remote: {
+    list: () => request<RemoteServer[]>('/remote/servers'),
+    create: (cfg: RemoteServerConfig) =>
+      request<RemoteServer>('/remote/servers', { method: 'POST', body: JSON.stringify(cfg) }),
+    update: (id: number, cfg: RemoteServerConfig) =>
+      request<RemoteServer>(`/remote/servers/${id}`, { method: 'PUT', body: JSON.stringify(cfg) }),
+    delete: (id: number) =>
+      request<{ status: string }>(`/remote/servers/${id}`, { method: 'DELETE' }),
+    toggle: (id: number) =>
+      request<RemoteServer>(`/remote/servers/${id}/toggle`, { method: 'PATCH' }),
+    generateKey: (host: string) =>
+      request<{ ssh_key_path: string; public_key: string; already_existed: boolean }>(
+        '/remote/generate-key', { method: 'POST', body: JSON.stringify({ host }) }
+      ),
+    deployKey: (params: { host: string; port: number; user: string; password: string }) =>
+      request<{ status: string; message: string }>(
+        '/remote/deploy-key', { method: 'POST', body: JSON.stringify(params) }
+      ),
+    testSSH: (params: { host: string; port: number; user: string; ssh_key_path: string }) =>
+      request<{ status: string; message: string }>(
+        '/remote/test-ssh', { method: 'POST', body: JSON.stringify(params) }
+      ),
+    testExiftool: (params: { host: string; port: number; user: string; ssh_key_path: string }) =>
+      request<{ status: string; version: string; message: string }>(
+        '/remote/test-exiftool', { method: 'POST', body: JSON.stringify(params) }
+      ),
+    testPath: (params: {
+      host: string; port: number; user: string; ssh_key_path: string
+      local_path_prefix: string; remote_path_prefix: string; sample_local_path: string
+    }) =>
+      request<{ status: string; local_path: string; remote_path: string; found: boolean; message: string }>(
+        '/remote/test-path', { method: 'POST', body: JSON.stringify(params) }
+      ),
+    checkWrite: (serverId: number, path?: string) =>
+      request<{ status: string; path: string; readable: boolean; writable: boolean; exists: boolean; stat: string; message: string }>(
+        `/remote/servers/${serverId}/check-write`,
+        { method: 'POST', body: JSON.stringify(path ? { path } : {}) },
+      ),
   },
 }
 
@@ -522,4 +567,33 @@ export interface AppSetting {
   description: string
   group: string
   options?: { value: number; label: string }[]  // present → render segmented control
+}
+
+// ─── Remote servers ────────────────────────────────────────────────────────
+
+export interface RemoteServer {
+  id: number
+  label: string
+  host: string
+  port: number
+  user: string
+  ssh_key_path: string
+  local_path_prefix: string
+  remote_path_prefix: string
+  writeback_concurrency: number
+  enabled: number   // 0 | 1 from SQLite
+  created_at: string
+  updated_at: string
+}
+
+export interface RemoteServerConfig {
+  label: string
+  host: string
+  port: number
+  user: string
+  ssh_key_path: string
+  local_path_prefix: string
+  remote_path_prefix: string
+  writeback_concurrency: number
+  enabled: boolean
 }

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from backend.config import settings
@@ -25,6 +26,41 @@ from backend.writeback.fields import build_field_map, FaceRegion, VIP_SUBJECT_PR
 logger = logging.getLogger(__name__)
 
 _writer = ExifToolWriter()
+
+
+async def _load_remote_servers() -> list[dict]:
+    """Return all enabled remote server configs from the DB."""
+    try:
+        async with get_db() as db:
+            rows = await db.execute_fetchall(
+                "SELECT * FROM remote_servers WHERE enabled=1 ORDER BY id"
+            )
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        # Table may not exist yet on first run before migration 014.
+        logger.debug("_load_remote_servers: %s", exc)
+        return []
+
+
+def _match_remote_server(
+    file_path_str: str, servers: list[dict]
+) -> dict | None:
+    """
+    Return the first enabled remote server whose local_path_prefix matches
+    the given file path, or None for local-only dispatch.
+    """
+    for srv in servers:
+        prefix = srv.get("local_path_prefix", "")
+        if prefix and file_path_str.startswith(prefix):
+            return srv
+    return None
+
+
+def _translate_path(file_path_str: str, server: dict) -> str:
+    """Translate a local mount path to the server-side path."""
+    local_prefix  = server["local_path_prefix"]
+    remote_prefix = server["remote_path_prefix"]
+    return remote_prefix + file_path_str[len(local_prefix):]
 
 
 def _merge_with_existing_xmp(
@@ -179,6 +215,9 @@ async def execute_writes(queue_ids: list[int] | None = None) -> dict:
     # get replaced on the next writeback rather than preserved as "external".
     all_vip_names = await _load_all_vip_names()
 
+    # Load any enabled remote server configs for SSH dispatch.
+    remote_servers = await _load_remote_servers()
+
     # Run all ExifTool writes in a single executor thread using the persistent
     # stay_open process — eliminates one Perl interpreter startup per file.
     loop = asyncio.get_event_loop()
@@ -188,17 +227,41 @@ async def execute_writes(queue_ids: list[int] | None = None) -> dict:
         # Only pre-read existing XMP from files that have been written before
         # (writeback_done=1). First-write files have no VIP metadata to merge,
         # so skipping their NAS round-trip avoids significant I/O overhead.
+        # Note: reads use the local mount path (fast -fast2) even for remote files.
         rewrite_paths = [
             Path(r["file_path"]) for r in rows
             if bool(r["writeback_done"]) and Path(r["file_path"]).exists()
         ]
         existing_xmp = ExifToolWriter.read_xmp_fields(rewrite_paths) if rewrite_paths else {}
 
+        # Separate rows into local (persistent ExifTool) and remote (SSH) buckets.
+        local_rows: list[dict] = []
+        remote_rows: list[tuple[dict, dict]] = []  # (row, server)
+        for row in rows:
+            srv = _match_remote_server(row["file_path"], remote_servers)
+            if srv:
+                remote_rows.append((row, srv))
+            else:
+                local_rows.append(row)
+
+        # Clean up any stale _exiftool_tmp files left by a previous interrupted
+        # run — ExifTool refuses to write when its temp file already exists.
+        for row in local_rows:
+            tmp = Path(row["file_path"] + "_exiftool_tmp")
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                    logger.info("Removed stale tmp file: %s", tmp)
+                except OSError as e:
+                    logger.warning("Could not remove stale tmp %s: %s", tmp, e)
+
+        results: list[tuple[int, int, bool, str]] = []
+
+        # ── Local writes — persistent ExifTool stay_open process ──────────
         writer = ExifToolWriter()
         writer.open()
-        results: list[tuple[int, int, bool, str]] = []
         try:
-            for row in rows:
+            for row in local_rows:
                 queue_id = row["id"]
                 media_id = row["media_file_id"]
                 file_path = Path(row["file_path"])
@@ -210,8 +273,6 @@ async def execute_writes(queue_ids: list[int] | None = None) -> dict:
                     results.append((queue_id, media_id, True, "skipped"))
                     continue
 
-                # Merge VIP fields with whatever is already in the file so
-                # persons and keywords from other apps are preserved.
                 existing = existing_xmp.get(str(file_path), {})
                 fields = _merge_with_existing_xmp(vip_fields, existing, all_vip_names)
 
@@ -225,6 +286,59 @@ async def execute_writes(queue_ids: list[int] | None = None) -> dict:
                 results.append((queue_id, media_id, success, msg))
         finally:
             writer.close()
+
+        # ── Remote writes — ExifTool executed on the remote host via SSH ──
+        if remote_rows:
+            # Group by server so each server uses its own concurrency pool.
+            by_server: dict[int, tuple[dict, list[tuple[dict, dict]]]] = {}
+            for row, srv in remote_rows:
+                sid = srv["id"]
+                if sid not in by_server:
+                    by_server[sid] = (srv, [])
+                by_server[sid][1].append((row, srv))
+
+            for sid, (srv, srv_rows) in by_server.items():
+                concurrency = max(1, srv.get("writeback_concurrency", 4))
+
+                def _write_remote_row(item: tuple[dict, dict]) -> tuple[int, int, bool, str]:
+                    row, server = item
+                    queue_id = row["id"]
+                    media_id = row["media_file_id"]
+                    is_first_write = not bool(row["writeback_done"])
+                    vip_fields = all_fields.get(media_id, {})
+
+                    if not vip_fields:
+                        logger.info(
+                            "No fields to write for media_id=%d (remote), skipping", media_id
+                        )
+                        return (queue_id, media_id, True, "skipped")
+
+                    file_path_str = row["file_path"]
+                    existing = existing_xmp.get(file_path_str, {})
+                    fields = _merge_with_existing_xmp(vip_fields, existing, all_vip_names)
+                    remote_path = _translate_path(file_path_str, server)
+
+                    success, msg = ExifToolWriter.write_remote(
+                        remote_path,
+                        fields,
+                        host=server["host"],
+                        port=server["port"],
+                        user=server["user"],
+                        ssh_key_path=server["ssh_key_path"],
+                        is_first_write=is_first_write,
+                    )
+                    logger.info(
+                        "Remote write %s for %s → %s: %s",
+                        "OK" if success else "FAILED",
+                        file_path_str, remote_path, msg,
+                    )
+                    return (queue_id, media_id, success, msg)
+
+                with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                    futures = [pool.submit(_write_remote_row, item) for item in srv_rows]
+                    for fut in as_completed(futures):
+                        results.append(fut.result())
+
         return results
 
     write_results = await loop.run_in_executor(None, _do_writes)

@@ -14,15 +14,18 @@ export default function WritebackPage() {
   const [warning, setWarning] = useState('')
   const [loading, setLoading] = useState(true)
   const [confirming, setConfirming] = useState(false)
-  const [result, setResult] = useState<{ written: number; failed: number } | null>(null)
+  const [retrying, setRetrying] = useState(false)
+  const [failedCount, setFailedCount] = useState(0)
+  const [result, setResult] = useState<{ written: number; failed: number; retried?: number } | null>(null)
 
   async function loadPreview() {
     setLoading(true)
     setResult(null)
     try {
-      const p = await api.writeback.preview()
+      const [p, s] = await Promise.all([api.writeback.preview(), api.writeback.status()])
       setItems(p.items)
       setWarning(p.warning)
+      setFailedCount(s.failed ?? 0)
     } finally {
       setLoading(false)
     }
@@ -38,6 +41,17 @@ export default function WritebackPage() {
       loadPreview()
     } finally {
       setConfirming(false)
+    }
+  }
+
+  async function retryFailed() {
+    setRetrying(true)
+    try {
+      const res = await api.writeback.retryFailed()
+      setResult(res)
+      loadPreview()
+    } finally {
+      setRetrying(false)
     }
   }
 
@@ -60,6 +74,20 @@ export default function WritebackPage() {
           result.failed > 0 ? 'bg-red-900/40 border border-red-700 text-red-200' : 'bg-green-900/40 border border-green-700 text-green-200'
         }`}>
           ✅ Written: {result.written} &nbsp;&nbsp; ❌ Failed: {result.failed}
+          {result.retried !== undefined && <> &nbsp;&nbsp; 🔁 Retried: {result.retried}</>}
+        </div>
+      )}
+
+      {!result && failedCount > 0 && (
+        <div className="bg-red-900/40 border border-red-700 rounded-lg px-4 py-3 text-sm text-red-200 mb-4 flex items-center justify-between">
+          <span>❌ {failedCount} file{failedCount !== 1 ? 's' : ''} failed on last run</span>
+          <button
+            onClick={retryFailed}
+            disabled={retrying}
+            className="ml-4 bg-red-700 hover:bg-red-600 disabled:opacity-40 text-white rounded px-3 py-1 text-xs font-medium"
+          >
+            {retrying ? 'Retrying…' : 'Retry Failed'}
+          </button>
         </div>
       )}
 

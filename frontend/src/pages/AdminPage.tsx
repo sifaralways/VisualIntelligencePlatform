@@ -8,6 +8,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api/client'
 import type { AppSetting } from '../api/client'
+import RemoteServersPanel from '../components/RemoteServersPanel'
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -409,6 +410,9 @@ export default function AdminPage() {
             ))}
           </div>
         </section>
+
+      {/* ── Remote Servers ──────────────────────────────────────── */}
+      <RemoteServersPanel />
 
       {/* ── Confirmation modal ───────────────────────────────────── */}
       {confirm && confirmAction && (
