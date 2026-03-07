@@ -1,7 +1,7 @@
 """VIP API — Faces routes (thumbnail serving + face management)."""
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from pathlib import Path
 
 from backend.database.db import get_db
@@ -24,7 +24,9 @@ async def get_face_thumbnail(face_id: int):
     if not path.exists():
         raise HTTPException(status_code=404, detail="Thumbnail file missing on disk")
 
-    return FileResponse(path, media_type="image/jpeg")
+    # Read into memory so Content-Length comes from actual bytes read, not a
+    # potentially stale stat() on a NAS/SMB mount.
+    return Response(content=path.read_bytes(), media_type="image/jpeg")
 
 
 @router.get("/cluster/{cluster_id}")

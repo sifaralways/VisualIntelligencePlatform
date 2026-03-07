@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import unicodedata
 from pathlib import Path
 
 import aiosqlite
@@ -71,8 +72,10 @@ async def check_idempotency(
             logger.debug("Reprocess requested: %s (id=%d)", file_path, existing_id)
         return False, existing_id
 
-    # Already processed — update path if it moved
-    if existing_path != file_path:
+    # Already processed — update path if it moved.
+    # Normalise both sides to NFC so that a path written on HFS+ (NFD) is not
+    # mistakenly reported as moved when the same file is re-scanned over SMB (NFC).
+    if unicodedata.normalize("NFC", existing_path) != unicodedata.normalize("NFC", file_path):
         logger.info("File moved: %s → %s (id=%d)", existing_path, file_path, existing_id)
         await db.execute(
             "UPDATE media_files SET file_path = ?, last_seen_at = datetime('now') WHERE id = ?",

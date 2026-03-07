@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import List
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 from backend.config import settings
@@ -331,7 +331,10 @@ async def serve_photo_thumbnail(media_id: int):
     """
     thumb = _thumb_path(media_id)
     if thumb.exists():
-        return FileResponse(thumb, media_type="image/jpeg")
+        # Read into memory so Content-Length is derived from actual bytes, not
+        # a potentially stale stat() on a NAS/SMB mount (avoids uvicorn's
+        # "Response content shorter than Content-Length" RuntimeError).
+        return Response(content=thumb.read_bytes(), media_type="image/jpeg")
 
     # Fallback: re-extract (requires file to be locally present)
     async with get_db() as db:
@@ -358,7 +361,7 @@ async def serve_photo_thumbnail(media_id: int):
         await delete_preview(preview)
 
     if thumb.exists():
-        return FileResponse(thumb, media_type="image/jpeg")
+        return Response(content=thumb.read_bytes(), media_type="image/jpeg")
     raise HTTPException(status_code=500, detail="Thumbnail generation failed.")
 
 
@@ -382,4 +385,4 @@ async def serve_preview(media_id: int):
 
     if not preview.exists():
         raise HTTPException(status_code=404, detail="Preview not available. Try /thumbnail instead.")
-    return FileResponse(preview, media_type="image/jpeg")
+    return Response(content=preview.read_bytes(), media_type="image/jpeg")

@@ -112,3 +112,53 @@ class ObjectDetector:
                     )
 
         return sorted(best.values(), key=lambda t: t.confidence, reverse=True)
+
+    def detect_batch(
+        self,
+        image_paths: list[Path],
+        conf_threshold: float | None = None,
+    ) -> list[list[ObjectTag]]:
+        """
+        Detect objects/animals for a batch of images in one YOLO forward pass.
+
+        Returns one list[ObjectTag] per image, in the same order as
+        image_paths.  Paths that don't exist are returned as [].
+        Using a list of paths triggers Ultralytics' native batch mode,
+        which is significantly faster than N individual calls on MPS.
+        """
+        if self._model is None or not image_paths:
+            return [[] for _ in image_paths]
+
+        threshold = (
+            conf_threshold
+            if conf_threshold is not None
+            else get_setting("yolo_conf_threshold")
+        )
+        try:
+            yolo_results = self._model(
+                [str(p) for p in image_paths],
+                device=self._device,
+                verbose=False,
+                conf=threshold,
+            )
+        except Exception as e:
+            logger.warning("YOLOv11 batch detection failed: %s", e)
+            return [[] for _ in image_paths]
+
+        output: list[list[ObjectTag]] = []
+        for result in yolo_results:
+            best: dict[str, ObjectTag] = {}
+            boxes = result.boxes
+            if boxes is not None:
+                for cls_idx, conf in zip(boxes.cls.tolist(), boxes.conf.tolist()):
+                    name = result.names[int(cls_idx)]
+                    if name in _SKIP_CLASSES:
+                        continue
+                    if name not in best or conf > best[name].confidence:
+                        best[name] = ObjectTag(
+                            label=name.replace("-", " ").title(),
+                            confidence=float(conf),
+                            is_animal=name in _ANIMAL_CLASSES,
+                        )
+            output.append(sorted(best.values(), key=lambda t: t.confidence, reverse=True))
+        return output

@@ -28,9 +28,20 @@ def _is_icloud_stub(path: Path) -> bool:
     """
     Return True if this file is an iCloud stub (not downloaded).
 
-    Two checks — first is fast (xattr), second is a size fallback
-    for edge cases where the xattr is not present.
+    iCloud stubs only exist inside the local user's home directory tree.
+    Files on mounted volumes (/Volumes/…) — network shares (SMB/NFS/AFP)
+    and external drives — are never iCloud placeholders, so skip both
+    the xattr check and the size-based fallback entirely for those paths.
+    Applying the size fallback on a NAS would incorrectly mark small-but-
+    valid JPEGs as stubs and cause them to be silently skipped in Phase 2.
     """
+    # Mounted volumes are never managed by iCloud.
+    try:
+        if str(path.resolve()).startswith("/Volumes/"):
+            return False
+    except OSError:
+        pass
+
     try:
         import xattr  # type: ignore
         val = xattr.getxattr(str(path), _ICLOUD_ATTR)

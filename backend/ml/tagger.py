@@ -161,3 +161,102 @@ class Tagger:
             result.geography, result.places,
         )
         return result
+
+    def tag_batch(
+        self,
+        items: list[tuple[Path, Optional[float], Optional[float]]],
+    ) -> list[TagResult]:
+        """
+        Tag a batch of images, using YOLO batch inference for the GPU-bound
+        forward pass, then per-image models for scene / landmark / geo.
+
+        Args:
+            items: list of (image_path, gps_lat, gps_lon).
+
+        Returns:
+            list[TagResult] in the same order as items.
+        """
+        results = [TagResult() for _ in items]
+        paths = [item[0] for item in items]
+        valid_mask = [p.exists() for p in paths]
+        valid_paths = [p for p, ok in zip(paths, valid_mask) if ok]
+
+        if not valid_paths:
+            return results
+
+        # ── Batch YOLO: one GPU forward pass for all valid images ───────────
+        try:
+            from backend.database.settings_store import get as _gs
+            batch_detections = self._object_detector.detect_batch(valid_paths)
+            vi = 0
+            for i, ok in enumerate(valid_mask):
+                if not ok:
+                    continue
+                detections = batch_detections[vi]; vi += 1
+                has_animal = False
+                for det in detections:
+                    if det.is_animal:
+                        results[i].animals.append(det.label)
+                        has_animal = True
+                    else:
+                        results[i].objects.append(det.label)
+
+                # Species (BioCLIP) — only when YOLO found an animal
+                if has_animal:
+                    try:
+                        species = self._species.classify(
+                            paths[i], threshold=float(_gs("species_threshold"))
+                        )
+                        if species and species.label not in results[i].animals:
+                            results[i].animals.insert(0, species.label)
+                    except Exception as e:
+                        logger.warning("Species classification failed for %s: %s", paths[i].name, e)
+        except Exception as e:
+            logger.warning("Batch YOLO tagging failed: %s", e)
+
+        # ── Per-image scene / landmark / geo ────────────────────────────────
+        for i, (image_path, gps_lat, gps_lon) in enumerate(items):
+            if not valid_mask[i]:
+                logger.warning("Image not found for tagging: %s", image_path)
+                continue
+            result = results[i]
+
+            try:
+                from backend.database.settings_store import get as _gs
+                scenes = self._scene_classifier.classify(
+                    image_path, top_k=int(_gs("places365_top_k"))
+                )
+                for s in scenes:
+                    if s.category == "geography" and s.label not in result.geography:
+                        result.geography.append(s.label)
+                    elif s.category == "place" and s.label not in result.places:
+                        result.places.append(s.label)
+            except Exception as e:
+                logger.warning("Scene classification failed for %s: %s", image_path.name, e)
+
+            try:
+                from backend.database.settings_store import get as _gs
+                landmarks = self._landmark.recognise(
+                    image_path, threshold=float(_gs("landmark_threshold"))
+                )
+                for lm in landmarks:
+                    if lm.label not in result.places:
+                        result.places.append(lm.label)
+            except Exception as e:
+                logger.warning("Landmark recognition failed for %s: %s", image_path.name, e)
+
+            if gps_lat is not None and gps_lon is not None:
+                try:
+                    geo = self._geo.resolve(gps_lat, gps_lon)
+                    if geo and geo.label and geo.label not in result.places:
+                        result.places.insert(0, geo.label)
+                except Exception as e:
+                    logger.warning("Geo resolution failed: %s", e)
+
+            logger.debug(
+                "Tagged %s → objects=%s animals=%s geography=%s places=%s",
+                image_path.name, result.objects, result.animals,
+                result.geography, result.places,
+            )
+
+        return results

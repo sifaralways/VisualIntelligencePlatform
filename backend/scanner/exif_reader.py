@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 # in well under 5 seconds. 30 s gives plenty of headroom.
 _PER_FILE_TIMEOUT = 30
 
+# Timeout for a single ExifTool call operating on a whole batch of files.
+# 500 files × ~200 ms each = 100 s on a local disk; double for NAS headroom.
+_BATCH_TIMEOUT = 300
+
 
 def materialise_file(path: Path) -> bool:
     """
@@ -82,9 +86,70 @@ def _run_exiftool(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def _run_exiftool_batch(paths: list[Path]) -> dict[str, dict[str, Any]]:
+    """
+    Run ExifTool once for a list of files in a single subprocess.
+
+    This avoids the Perl interpreter startup cost (100-200 ms) that we would
+    otherwise pay per file.  Returns a mapping of str(path) → normalised
+    metadata dict.  Files that ExifTool cannot parse are absent from the
+    result; callers should treat a missing key as an empty dict.
+
+    Unlike stay_open interactive mode (which caused hangs on certain CR3
+    files), passing paths as plain arguments is stateless and safe — a bad
+    file at most produces a missing entry, never a deadlock.
+    """
+    if not paths:
+        return {}
+
+    try:
+        result = subprocess.run(
+            [
+                "exiftool",
+                "-json",
+                "-fast2",
+                "-charset", "filename=UTF8",
+                "-q",
+            ] + [str(p) for p in paths],
+            capture_output=True,
+            timeout=_BATCH_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "ExifTool batch timed out (%ds) for %d files — EXIF fields will be empty",
+            _BATCH_TIMEOUT, len(paths),
+        )
+        return {}
+    except FileNotFoundError:
+        logger.error("exiftool not found — install with: brew install exiftool")
+        return {}
+    except Exception as e:
+        logger.error("ExifTool batch error: %s", e)
+        return {}
+
+    # ExifTool exits non-zero when *any* file fails, but still writes valid
+    # JSON for the files that did succeed — so we only bail if stdout is empty.
+    if not result.stdout.strip():
+        logger.debug("ExifTool batch returned %d with no output", result.returncode)
+        return {}
+
+    try:
+        parsed = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        logger.error("ExifTool batch JSON parse error: %s", e)
+        return {}
+
+    out: dict[str, dict[str, Any]] = {}
+    for record in parsed:
+        source = record.get("SourceFile", "")
+        if source:
+            out[source] = _normalise(record)
+    return out
+
+
 class ExifToolReader:
     """
-    Async wrapper around per-file ExifTool subprocess calls.
+    Async wrapper around ExifTool subprocess calls.
 
     Keeps the same context-manager interface as the old stay_open version
     so call sites in the pipeline do not need to change.
@@ -118,12 +183,17 @@ class ExifToolReader:
         )
         return normalised
 
-    async def read_batch(self, paths: list[Path]) -> list[dict[str, Any]]:
-        """Read EXIF for a list of files sequentially."""
-        results = []
-        for path in paths:
-            results.append(await self.read(path))
-        return results
+    async def read_batch(self, paths: list[Path]) -> dict[str, dict[str, Any]]:
+        """
+        Read EXIF for many files in a single ExifTool subprocess call.
+
+        Returns a dict mapping str(path) → normalised metadata.  Paths
+        absent from the result had no parseable metadata; treat them as {}.
+        """
+        if not paths:
+            return {}
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _run_exiftool_batch, paths)
 
 
 def _parse_float(value: Any) -> float | None:

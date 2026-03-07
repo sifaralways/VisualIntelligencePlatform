@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -332,34 +333,76 @@ async def run_ingest(folder: str) -> None:
 # ---------------------------------------------------------------------------
 # Phase 1: Scan
 # ---------------------------------------------------------------------------
+# Phase 1 tuning — adjust to taste for your hardware / network
+# ---------------------------------------------------------------------------
+_SCAN_BATCH_SIZE  = 500   # files per ExifTool subprocess call
+_HASH_CONCURRENCY = 8     # simultaneous SHA-256 read streams
+_TAG_BATCH_SIZE   = 16    # images per YOLO GPU forward pass in Phase 4
+
+
 async def _phase_scan(folder: Path) -> None:
     logger.info("Phase 1: Scanning %s", folder)
     await broadcast("phase_start", phase="scan")
 
+    # Drain the walker up front.  walk_folder already buffers the full
+    # os.walk result in a thread-pool call, so this just consumes the async
+    # generator without additional blocking.
+    all_paths: list[Path] = []
+    async for file_path in walk_folder(folder):
+        all_paths.append(file_path)
+
+    total_files = len(all_paths)
+    if total_files == 0:
+        await broadcast("phase_complete", phase="scan", scanned=0, skipped=0)
+        logger.info("Phase 1 complete: 0 scanned, 0 skipped")
+        return
+
+    logger.info("Phase 1: %d files to process (batches of %d)", total_files, _SCAN_BATCH_SIZE)
+
     scanned = 0
     skipped = 0
+    loop = asyncio.get_event_loop()
+    hash_sem = asyncio.Semaphore(_HASH_CONCURRENCY)
+    exif_reader = ExifToolReader()
 
-    async with ExifToolReader() as exif:
-        async for file_path in walk_folder(folder):
-            async with get_db() as db:
-                # 1a. Hash + idempotency
-                file_hash = await asyncio.get_event_loop().run_in_executor(
-                    None, compute_hash, file_path
-                )
-                skip, existing_id = await check_idempotency(db, file_hash, str(file_path))
+    for batch_start in range(0, total_files, _SCAN_BATCH_SIZE):
+        batch = all_paths[batch_start : batch_start + _SCAN_BATCH_SIZE]
 
+        # ── 1a + 1b: ExifTool (one subprocess for the whole batch) and ────────
+        # file hashing (up to _HASH_CONCURRENCY concurrent readers) run in
+        # parallel via asyncio.gather so network I/O and CPU overlap.
+        async def _hash_one(path: Path) -> tuple[Path, str]:
+            async with hash_sem:
+                h = await loop.run_in_executor(None, compute_hash, path)
+                return path, h
+
+        gather_result = await asyncio.gather(
+            exif_reader.read_batch(batch),
+            *[_hash_one(p) for p in batch],
+        )
+        exif_map: dict[str, dict] = gather_result[0]          # str(path) → meta
+        path_to_hash: dict[str, str] = {str(p): h for p, h in gather_result[1:]}
+
+        # ── 1c: One DB connection + one implicit transaction for the batch ─────
+        # aiosqlite commits at __aexit__ — all inserts/updates for the batch
+        # land in a single fsync instead of one fsync per file.
+        async with get_db() as db:
+            for file_path in batch:
+                # NFC normalisation: prevents false "moved" events when the
+                # same path is seen via HFS+ (NFD) on one scan and SMB (NFC)
+                # on the next.
+                file_path_str = unicodedata.normalize("NFC", str(file_path))
+                file_hash = path_to_hash[str(file_path)]
+                meta = exif_map.get(str(file_path)) or {}
+
+                skip, existing_id = await check_idempotency(db, file_hash, file_path_str)
                 if skip:
                     skipped += 1
                     continue
 
-                # 1b. File stats
                 stat = file_path.stat()
-
-                # 1c. EXIF metadata
-                meta = await exif.read(file_path)
-
-                # 1d. iCloud stub check
-                is_stub = stat.st_size < settings.stub_max_size_bytes
+                _on_mounted_volume = file_path_str.startswith("/Volumes/")
+                is_stub = (not _on_mounted_volume) and (stat.st_size < settings.stub_max_size_bytes)
 
                 if existing_id:
                     # Re-evaluation: update existing record (also clears removed_from_app)
@@ -372,7 +415,7 @@ async def _phase_scan(folder: Path) -> None:
                             last_seen_at=datetime('now')
                         WHERE id=?
                     """, (
-                        str(file_path), stat.st_size, meta.get("file_format"),
+                        file_path_str, stat.st_size, meta.get("file_format"),
                         meta.get("camera_make"), meta.get("camera_model"),
                         meta.get("date_taken"), meta.get("gps_lat"), meta.get("gps_lon"),
                         meta.get("width"), meta.get("height"), int(is_stub),
@@ -417,7 +460,7 @@ async def _phase_scan(folder: Path) -> None:
                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'scanned',?)
                     """, (
                         new_vip_id,
-                        str(file_path), file_hash, stat.st_size, meta.get("file_format"),
+                        file_path_str, file_hash, stat.st_size, meta.get("file_format"),
                         meta.get("camera_make"), meta.get("camera_model"),
                         meta.get("date_taken"), meta.get("gps_lat"), meta.get("gps_lon"),
                         meta.get("width"), meta.get("height"), int(is_stub),
@@ -427,8 +470,9 @@ async def _phase_scan(folder: Path) -> None:
 
                 scanned += 1
 
-            if scanned % 100 == 0:
-                await broadcast("scan_progress", done=scanned, skipped=skipped)
+        # Progress update and event-loop yield after each batch
+        await broadcast("scan_progress", done=scanned + skipped, total=total_files)
+        await asyncio.sleep(0)
 
     await broadcast("phase_complete", phase="scan", scanned=scanned, skipped=skipped)
     logger.info("Phase 1 complete: %d scanned, %d skipped", scanned, skipped)
@@ -475,201 +519,215 @@ async def _phase_embed() -> None:
 
     total = len(rows)
     logger.info("%d files to embed", total)
-    processed = 0
 
-    for row in rows:
-        media_id, file_path = row["id"], row["file_path"]
-        path = Path(file_path)
+    # Read concurrency limit from user-adjustable setting.
+    # Default 4 is conservative — safe on a MacBook; raise in Admin → System.
+    concurrency = int(settings_store.get("embed_concurrency") or 4)
+    logger.info("Phase 2: concurrency=%d", concurrency)
+    sem = asyncio.Semaphore(concurrency)
 
-        if not path.exists():
-            logger.warning("File not on disk (possibly offloaded): %s", file_path)
-            continue
+    # Shared mutable counter across concurrent workers (asyncio is single-
+    # threaded so plain int inside a list is safe without a lock).
+    _counter = [0]  # [processed]
 
-        # Extract embedded JPEG preview
-        preview_path = await extract_preview(path)
-        if preview_path is None:
+    async def _process_one(row: aiosqlite.Row) -> None:
+        async with sem:
+            media_id = row["id"]
+            file_path = row["file_path"]
+            path = Path(file_path)
+
+            if not path.exists():
+                logger.warning("File not on disk (possibly offloaded): %s", file_path)
+                return
+
+            # Extract embedded JPEG preview
+            preview_path = await extract_preview(path)
+            if preview_path is None:
+                async with get_db() as db:
+                    await db.execute(
+                        "UPDATE media_files SET ingest_state='embedded' WHERE id=?", (media_id,)
+                    )
+                _counter[0] += 1
+                return
+
+            # ── Skip re-embedding if face embeddings already exist (re-scan case) ──
+            # When a file is removed then re-added, its ingest_state is reset to
+            # 'scanned' (see hasher.py / ingest.py UPDATE path), but the old face
+            # rows — with their cluster_id / person_id intact — still exist in the
+            # DB.  Re-running detection would INSERT duplicate face rows and then
+            # the cluster phase would create duplicate persons.  Instead, just
+            # advance ingest_state and leave the existing faces untouched.
             async with get_db() as db:
-                await db.execute(
-                    "UPDATE media_files SET ingest_state='embedded' WHERE id=?", (media_id,)
+                _emb_check = await db.execute_fetchall(
+                    """SELECT 1 FROM faces f
+                       JOIN embeddings e ON e.face_id = f.id
+                       WHERE f.media_file_id = ?
+                       LIMIT 1""",
+                    (media_id,),
                 )
-            continue
+            if _emb_check:
+                async with get_db() as db:
+                    await db.execute(
+                        "UPDATE media_files SET ingest_state='embedded' WHERE id=?", (media_id,)
+                    )
+                _counter[0] += 1
+                return
 
-        # ── Skip re-embedding if face embeddings already exist (re-scan case) ──
-        # When a file is removed then re-added, its ingest_state is reset to
-        # 'scanned' (see hasher.py / ingest.py UPDATE path), but the old face
-        # rows — with their cluster_id / person_id intact — still exist in the
-        # DB.  Re-running detection would INSERT duplicate face rows and then
-        # the cluster phase would create duplicate persons.  Instead, just
-        # advance ingest_state and leave the existing faces untouched.
-        async with get_db() as db:
-            _emb_check = await db.execute_fetchall(
-                """SELECT 1 FROM faces f
-                   JOIN embeddings e ON e.face_id = f.id
-                   WHERE f.media_file_id = ?
-                   LIMIT 1""",
-                (media_id,),
-            )
-        if _emb_check:
-            async with get_db() as db:
-                await db.execute(
-                    "UPDATE media_files SET ingest_state='embedded' WHERE id=?", (media_id,)
-                )
-            processed += 1
-            continue
-
-        # ── Blur detection on full preview (must happen before thumbnail resize) ──
-        blur_score: float | None = None
-        is_blurry: int | None = None
-        long_exposure_flag: int | None = None
-        exp_s: float | None = None  # exposure time read here, reused for face-blur override
-        try:
-            from backend.ml.quality_checker import score_blur, classify_blur
-            preview_arr = np.array(_PILImage.open(preview_path).convert("L"))  # greyscale
-            # Read exposure_time_s from DB (set during Phase 1 scan)
-            async with get_db() as db:
-                exp_row = await (await db.execute(
-                    "SELECT exposure_time_s FROM media_files WHERE id=?", (media_id,)
-                )).fetchone()
-            _raw_exp = exp_row["exposure_time_s"] if exp_row else None
+            # ── Blur detection on full preview (must happen before thumbnail resize) ──
+            blur_score: float | None = None
+            is_blurry: int | None = None
+            long_exposure_flag: int | None = None
+            exp_s: float | None = None  # exposure time read here, reused for face-blur override
             try:
-                exp_s = float(_raw_exp) if _raw_exp is not None else None
-            except (ValueError, TypeError):
-                exp_s = None
-            blur_score = score_blur(preview_arr)
-            is_blurry, long_exposure_flag = classify_blur(blur_score, exp_s)
-        except Exception as _blur_exc:
-            logger.debug("Blur check failed for %s: %s", file_path, _blur_exc)
+                from backend.ml.quality_checker import score_blur, classify_blur
+                preview_arr = np.array(_PILImage.open(preview_path).convert("L"))  # greyscale
+                # Read exposure_time_s from DB (set during Phase 1 scan)
+                async with get_db() as db:
+                    exp_row = await (await db.execute(
+                        "SELECT exposure_time_s FROM media_files WHERE id=?", (media_id,)
+                    )).fetchone()
+                _raw_exp = exp_row["exposure_time_s"] if exp_row else None
+                try:
+                    exp_s = float(_raw_exp) if _raw_exp is not None else None
+                except (ValueError, TypeError):
+                    exp_s = None
+                blur_score = score_blur(preview_arr)
+                is_blurry, long_exposure_flag = classify_blur(blur_score, exp_s)
+            except Exception as _blur_exc:
+                logger.debug("Blur check failed for %s: %s", file_path, _blur_exc)
 
-        # Generate permanent photo thumbnail for the UI grid
-        await asyncio.get_event_loop().run_in_executor(
-            None, _make_photo_thumb, preview_path, media_id
-        )
-        faces = await asyncio.get_event_loop().run_in_executor(
-            None, _detector.detect, preview_path
-        )
-
-        async with get_db() as db:
-            for face in faces:
-                # Build face_attributes JSON from rich InsightFace data
-                face_attrs: dict = {}
-
-                # Gate gender/age on sharpness: the GenderAge sub-model produces
-                # near-random results on blurry or tiny crops.  quality_sharpness
-                # is a Laplacian-variance proxy normalised to 0–100.
-                _sharp_enough = (face.quality_sharpness or 0) >= settings_store.get('gender_min_sharpness')
-                if face.age is not None and _sharp_enough:
-                    face_attrs["AgeRange"] = {
-                        "Low":  max(0, face.age - 4),
-                        "High": face.age + 4,
-                    }
-                if face.gender is not None and _sharp_enough:
-                    face_attrs["Gender"] = {"Value": face.gender, "Confidence": 95.0}
-                if face.pose_yaw is not None:
-                    face_attrs["Pose"] = {
-                        "Yaw":   round(face.pose_yaw, 4),
-                        "Pitch": round(face.pose_pitch, 4),
-                        "Roll":  round(face.pose_roll, 4),
-                    }
-                if face.landmarks:
-                    face_attrs["Landmarks"] = face.landmarks
-                if face.quality_brightness is not None:
-                    face_attrs["Quality"] = {
-                        "Brightness": round(face.quality_brightness, 4),
-                        "Sharpness":  round(face.quality_sharpness, 4),
-                    }
-                # Stubs for attributes needing extra models (filled in a future phase)
-                face_attrs.setdefault("Smile",       None)
-                face_attrs.setdefault("Eyeglasses",  None)
-                face_attrs.setdefault("Sunglasses",  None)
-                # EyesOpen: now computed from vertical gradient of eye-region patch
-                if face.eyes_open is not None:
-                    face_attrs["EyesOpen"] = {
-                        "Value": face.eyes_open,
-                        "Confidence": 80.0,  # heuristic, not a calibrated model
-                    }
-                else:
-                    face_attrs.setdefault("EyesOpen",    None)
-                face_attrs.setdefault("MouthOpen",   None)
-                face_attrs.setdefault("Beard",       None)
-                face_attrs.setdefault("Emotions",    None)
-                face_attrs.setdefault("FaceOccluded",None)
-
-                # Insert face record
-                cursor = await db.execute("""
-                    INSERT INTO faces (media_file_id, bbox_x, bbox_y, bbox_w, bbox_h,
-                                       detection_conf, face_attributes)
-                    VALUES (?,?,?,?,?,?,?)
-                """, (media_id, face.bbox_x, face.bbox_y, face.bbox_w, face.bbox_h,
-                      face.detection_conf, json.dumps(face_attrs) if face_attrs else None))
-                face_id = cursor.lastrowid
-
-                # Save thumbnail
-                thumb_path = save_face_thumbnail(face.crop, face_id)
-                await db.execute(
-                    "UPDATE faces SET thumbnail_path=? WHERE id=?",
-                    (str(thumb_path), face_id)
-                )
-
-                # Embedding — InsightFace already computed it during detection.
-                # face.embedding is the 512-D normed ArcFace vector.
-                vector = face.embedding
-                if vector is not None:
-                    await db.execute("""
-                        INSERT INTO embeddings (face_id, vector, model_version)
-                        VALUES (?,?,?)
-                    """, (face_id, _embedder.vector_to_bytes(vector), _embedder.model_version))
-
-            await db.execute(
-                "UPDATE media_files SET ingest_state='embedded' WHERE id=?", (media_id,)
+            # Generate permanent photo thumbnail for the UI grid
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, _make_photo_thumb, preview_path, media_id
+            )
+            faces = await loop.run_in_executor(
+                None, _detector.detect, preview_path
             )
 
-        # ── Derive has_closed_eyes from the faces we just inserted ─────────────
-        has_closed_eyes = 0
-        try:
             async with get_db() as db:
-                face_attr_rows = await db.execute_fetchall(
-                    "SELECT face_attributes FROM faces WHERE media_file_id=? AND face_attributes IS NOT NULL",
-                    (media_id,)
+                for face in faces:
+                    # Build face_attributes JSON from rich InsightFace data
+                    face_attrs: dict = {}
+
+                    # Gate gender/age on sharpness: the GenderAge sub-model produces
+                    # near-random results on blurry or tiny crops.  quality_sharpness
+                    # is a Laplacian-variance proxy normalised to 0–100.
+                    _sharp_enough = (face.quality_sharpness or 0) >= settings_store.get('gender_min_sharpness')
+                    if face.age is not None and _sharp_enough:
+                        face_attrs["AgeRange"] = {
+                            "Low":  max(0, face.age - 4),
+                            "High": face.age + 4,
+                        }
+                    if face.gender is not None and _sharp_enough:
+                        face_attrs["Gender"] = {"Value": face.gender, "Confidence": 95.0}
+                    if face.pose_yaw is not None:
+                        face_attrs["Pose"] = {
+                            "Yaw":   round(face.pose_yaw, 4),
+                            "Pitch": round(face.pose_pitch, 4),
+                            "Roll":  round(face.pose_roll, 4),
+                        }
+                    if face.landmarks:
+                        face_attrs["Landmarks"] = face.landmarks
+                    if face.quality_brightness is not None:
+                        face_attrs["Quality"] = {
+                            "Brightness": round(face.quality_brightness, 4),
+                            "Sharpness":  round(face.quality_sharpness, 4),
+                        }
+                    # Stubs for attributes needing extra models (filled in a future phase)
+                    face_attrs.setdefault("Smile",       None)
+                    face_attrs.setdefault("Eyeglasses",  None)
+                    face_attrs.setdefault("Sunglasses",  None)
+                    # EyesOpen: now computed from vertical gradient of eye-region patch
+                    if face.eyes_open is not None:
+                        face_attrs["EyesOpen"] = {
+                            "Value": face.eyes_open,
+                            "Confidence": 80.0,  # heuristic, not a calibrated model
+                        }
+                    else:
+                        face_attrs.setdefault("EyesOpen",    None)
+                    face_attrs.setdefault("MouthOpen",   None)
+                    face_attrs.setdefault("Beard",       None)
+                    face_attrs.setdefault("Emotions",    None)
+                    face_attrs.setdefault("FaceOccluded",None)
+
+                    # Insert face record
+                    cursor = await db.execute("""
+                        INSERT INTO faces (media_file_id, bbox_x, bbox_y, bbox_w, bbox_h,
+                                           detection_conf, face_attributes)
+                        VALUES (?,?,?,?,?,?,?)
+                    """, (media_id, face.bbox_x, face.bbox_y, face.bbox_w, face.bbox_h,
+                          face.detection_conf, json.dumps(face_attrs) if face_attrs else None))
+                    face_id = cursor.lastrowid
+
+                    # Save thumbnail
+                    thumb_path = save_face_thumbnail(face.crop, face_id)
+                    await db.execute(
+                        "UPDATE faces SET thumbnail_path=? WHERE id=?",
+                        (str(thumb_path), face_id)
+                    )
+
+                    # Embedding — InsightFace already computed it during detection.
+                    # face.embedding is the 512-D normed ArcFace vector.
+                    vector = face.embedding
+                    if vector is not None:
+                        await db.execute("""
+                            INSERT INTO embeddings (face_id, vector, model_version)
+                            VALUES (?,?,?)
+                        """, (face_id, _embedder.vector_to_bytes(vector), _embedder.model_version))
+
+                await db.execute(
+                    "UPDATE media_files SET ingest_state='embedded' WHERE id=?", (media_id,)
                 )
-            for far in face_attr_rows:
-                attrs = json.loads(far["face_attributes"])
-                eyes = attrs.get("EyesOpen")
-                if isinstance(eyes, dict) and eyes.get("Value") is False:
-                    has_closed_eyes = 1
-                    break
-        except Exception:
-            pass
 
-        # ── Write quality signals back to media_files ────────────────────────
-        # If any face was detected, use the MAXIMUM face-crop sharpness as the
-        # blur signal instead of the full-image Laplacian.  This avoids false
-        # positives on shallow depth-of-field shots where the subject is sharp
-        # but the background / foreground bokeh drives the global score down.
-        if faces:
-            face_sharpnesses = [
-                f.quality_sharpness for f in faces if f.quality_sharpness is not None
-            ]
-            if face_sharpnesses:
-                best_face_sharpness = max(face_sharpnesses)
-                from backend.ml.quality_checker import classify_blur
-                is_blurry, long_exposure_flag = classify_blur(best_face_sharpness, exp_s)
-                blur_score = round(best_face_sharpness, 2)
+            # ── Derive has_closed_eyes from the faces we just inserted ─────────────
+            has_closed_eyes = 0
+            try:
+                async with get_db() as db:
+                    face_attr_rows = await db.execute_fetchall(
+                        "SELECT face_attributes FROM faces WHERE media_file_id=? AND face_attributes IS NOT NULL",
+                        (media_id,)
+                    )
+                for far in face_attr_rows:
+                    attrs = json.loads(far["face_attributes"])
+                    eyes = attrs.get("EyesOpen")
+                    if isinstance(eyes, dict) and eyes.get("Value") is False:
+                        has_closed_eyes = 1
+                        break
+            except Exception:
+                pass
 
-        async with get_db() as db:
-            await db.execute("""
-                UPDATE media_files
-                SET blur_score=?, is_blurry=?, long_exposure=?, has_closed_eyes=?
-                WHERE id=?
-            """, (blur_score, is_blurry, long_exposure_flag, has_closed_eyes, media_id))
+            # ── Write quality signals back to media_files ────────────────────────
+            # If any face was detected, use the MAXIMUM face-crop sharpness as the
+            # blur signal instead of the full-image Laplacian.  This avoids false
+            # positives on shallow depth-of-field shots where the subject is sharp
+            # but the background / foreground bokeh drives the global score down.
+            if faces:
+                face_sharpnesses = [
+                    f.quality_sharpness for f in faces if f.quality_sharpness is not None
+                ]
+                if face_sharpnesses:
+                    best_face_sharpness = max(face_sharpnesses)
+                    from backend.ml.quality_checker import classify_blur
+                    is_blurry, long_exposure_flag = classify_blur(best_face_sharpness, exp_s)
+                    blur_score = round(best_face_sharpness, 2)
 
-        processed += 1
-        if processed % 50 == 0:
-            await broadcast("embed_progress", done=processed, total=total)
-            # Thermal-aware pause
-            await asyncio.sleep(settings.thermal_sleep_sec)
+            async with get_db() as db:
+                await db.execute("""
+                    UPDATE media_files
+                    SET blur_score=?, is_blurry=?, long_exposure=?, has_closed_eyes=?
+                    WHERE id=?
+                """, (blur_score, is_blurry, long_exposure_flag, has_closed_eyes, media_id))
 
-    await broadcast("phase_complete", phase="embed", processed=processed)
-    logger.info("Phase 2 complete: %d files processed", processed)
+            _counter[0] += 1
+            if _counter[0] % 10 == 0:
+                await broadcast("embed_progress", done=_counter[0], total=total)
+
+    # Fan out all rows concurrently, bounded by the semaphore.
+    await asyncio.gather(*[_process_one(row) for row in rows])
+
+    await broadcast("phase_complete", phase="embed", processed=_counter[0])
+    logger.info("Phase 2 complete: %d files processed", _counter[0])
 
 
 # ---------------------------------------------------------------------------
@@ -679,13 +737,17 @@ async def _phase_cluster() -> None:
     logger.info("Phase 3: Clustering")
     await broadcast("phase_start", phase="cluster")
 
-    # Step 1: Wipe unnamed clusters so their faces rejoin the pool.
-    # This ensures new arrivals get context from ALL unowned faces, not just
-    # themselves — critical when a single new photo brings few new faces.
+    # Step 1: Clear any clusters that no longer have a named person.
+    # Named-person clusters (person_id IS NOT NULL) are kept so assignments survive.
     async with get_db() as db:
-        unnamed = await db.execute_fetchall(
-            "SELECT id FROM clusters WHERE person_id IS NULL"
-        )
+        unnamed = await db.execute_fetchall("""
+            SELECT c.id FROM clusters c
+            WHERE NOT EXISTS (
+                SELECT 1 FROM faces f
+                JOIN persons p ON p.id = f.person_id
+                WHERE f.cluster_id = c.id AND p.name IS NOT NULL AND p.is_ignored = 0
+            )
+        """)
         unnamed_ids = [r["id"] for r in unnamed]
         if unnamed_ids:
             ph = ",".join("?" * len(unnamed_ids))
@@ -720,6 +782,9 @@ async def _phase_cluster() -> None:
     results = cluster_embeddings(face_ids, vectors)
 
     async with get_db() as db:
+        all_face_updates: list[tuple] = []   # (cluster_id, face_id) pairs
+        all_cluster_ids:  list[int]   = []
+
         for cluster in results:
             cursor = await db.execute("""
                 INSERT INTO clusters (centroid, member_count, intra_similarity, is_high_conf)
@@ -731,21 +796,27 @@ async def _phase_cluster() -> None:
                 int(cluster.is_high_conf),
             ))
             cluster_id = cursor.lastrowid
+            all_cluster_ids.append(cluster_id)
+            all_face_updates.extend((cluster_id, fid) for fid in cluster.face_ids)
 
-            for face_id in cluster.face_ids:
-                await db.execute(
-                    "UPDATE faces SET cluster_id=? WHERE id=?", (cluster_id, face_id)
-                )
+        # Batch all face cluster assignments in one executemany call
+        # instead of one UPDATE per face (N → 1 round-trips).
+        if all_face_updates:
+            await db.executemany(
+                "UPDATE faces SET cluster_id=? WHERE id=?", all_face_updates
+            )
 
-            # Advance media_files state to 'clustered' — but never demote a
-            # file that has already been tagged.  Without this guard, re-clustering
-            # across all folders resets previously-tagged files back to 'clustered',
-            # causing Phase 4 to re-tag them on every subsequent scan.
-            await db.execute("""
+        # Advance media_files state for every newly-clustered file in one
+        # query — never demote files already tagged by Phase 4.
+        if all_cluster_ids:
+            ph = ",".join("?" * len(all_cluster_ids))
+            await db.execute(f"""
                 UPDATE media_files SET ingest_state='clustered'
-                WHERE id IN (SELECT media_file_id FROM faces WHERE cluster_id=?)
+                WHERE id IN (
+                    SELECT media_file_id FROM faces WHERE cluster_id IN ({ph})
+                )
                   AND ingest_state NOT IN ('tagged')
-            """, (cluster_id,))
+            """, all_cluster_ids)
 
     # Rebuild FAISS index
     _faiss.build(face_ids, vectors)
@@ -1188,7 +1259,12 @@ async def _phase_restore_vip_names() -> None:
 # Phase 4: Tag — objects, animals, geography, places
 # ---------------------------------------------------------------------------
 async def _phase_tag() -> None:
-    logger.info("Phase 4: Tagging (objects, animals, geography, places)")
+    concurrency = int(settings_store.get("tag_concurrency"))
+    logger.info(
+        "Phase 4: Tagging (objects, animals, geography, places) "
+        "[concurrency=%d, yolo_batch=%d]",
+        concurrency, _TAG_BATCH_SIZE,
+    )
     await broadcast("phase_start", phase="tag")
 
     # Load tagging models lazily (first pipeline run only)
@@ -1210,59 +1286,74 @@ async def _phase_tag() -> None:
         await broadcast("phase_complete", phase="tag", tagged=0)
         return
 
-    processed = 0
-    for row in rows:
-        media_id = row["id"]
-        file_path = row["file_path"]
-        gps_lat = row["gps_lat"]
-        gps_lon = row["gps_lon"]
-        path = Path(file_path)
+    sem = asyncio.Semaphore(concurrency)
+    _counter = [0]
 
-        # Preview may have been kept from Phase 2 or needs re-extraction
-        preview_path = settings.preview_dir / f"{path.stem}_{_hash_path(path)}.jpg"
-        if not preview_path.exists():
-            preview_path = await extract_preview(path) or preview_path
+    async def _process_batch(batch: list) -> None:
+        async with sem:
+            # Ensure previews exist for every image in the batch.
+            preview_paths: list[Path] = []
+            for row in batch:
+                path = Path(row["file_path"])
+                pp = settings.preview_dir / f"{path.stem}_{_hash_path(path)}.jpg"
+                if not pp.exists():
+                    pp = await extract_preview(path) or pp
+                preview_paths.append(pp)
 
-        # Run all tagging models
-        result = await loop.run_in_executor(
-            None, _tagger.tag, preview_path, gps_lat, gps_lon
-        )
+            gps_data  = [(row["gps_lat"], row["gps_lon"]) for row in batch]
+            media_ids = [row["id"] for row in batch]
 
-        # Persist tags to DB
-        async with get_db() as db:
-            tag_rows: list[tuple] = []
+            # One YOLO GPU forward pass for up to _TAG_BATCH_SIZE images,
+            # followed by per-image scene / landmark / geo models.
+            items = [(pp, gps[0], gps[1]) for pp, gps in zip(preview_paths, gps_data)]
+            tag_results = await loop.run_in_executor(None, _tagger.tag_batch, items)
 
-            for label in result.objects:
-                tag_rows.append((media_id, "object", label, None, "yolov11"))
-            for label in result.animals:
-                tag_rows.append((media_id, "animal", label, None, "bioclip"))
-            for label in result.geography:
-                tag_rows.append((media_id, "geography", label, None, "places365"))
-            for label in result.places:
-                model = "nominatim" if gps_lat is not None and label == result.places[0] else "clip"
-                tag_rows.append((media_id, "place", label, None, model))
+            # Batch-persist all tags and state transitions in one DB write.
+            async with get_db() as db:
+                tag_rows: list[tuple] = []
+                for media_id, result, (gps_lat, gps_lon) in zip(
+                    media_ids, tag_results, gps_data
+                ):
+                    for label in result.objects:
+                        tag_rows.append((media_id, "object", label, None, "yolov11"))
+                    for label in result.animals:
+                        tag_rows.append((media_id, "animal", label, None, "bioclip"))
+                    for label in result.geography:
+                        tag_rows.append((media_id, "geography", label, None, "places365"))
+                    for label in result.places:
+                        model = (
+                            "nominatim"
+                            if gps_lat is not None and label == result.places[0]
+                            else "clip"
+                        )
+                        tag_rows.append((media_id, "place", label, None, model))
 
-            for t in tag_rows:
-                await db.execute("""
-                    INSERT OR IGNORE INTO media_tags
-                        (media_file_id, category, label, confidence, model)
-                    VALUES (?,?,?,?,?)
-                """, t)
+                if tag_rows:
+                    await db.executemany("""
+                        INSERT OR IGNORE INTO media_tags
+                            (media_file_id, category, label, confidence, model)
+                        VALUES (?,?,?,?,?)
+                    """, tag_rows)
 
-            await db.execute(
-                "UPDATE media_files SET ingest_state='tagged' WHERE id=?", (media_id,)
-            )
+                await db.executemany(
+                    "UPDATE media_files SET ingest_state='tagged' WHERE id=?",
+                    [(mid,) for mid in media_ids],
+                )
 
-        # Clean up preview now that both Phase 2 and Phase 4 are done
-        if preview_path.exists():
-            await delete_preview(preview_path)
+            # Clean up previews now that both Phase 2 and Phase 4 are done.
+            for pp in preview_paths:
+                if pp.exists():
+                    await delete_preview(pp)
 
-        processed += 1
-        if processed % 20 == 0:
-            await broadcast("tag_progress", done=processed, total=total)
+            _counter[0] += len(batch)
+            await broadcast("tag_progress", done=_counter[0], total=total)
 
-    await broadcast("phase_complete", phase="tag", tagged=processed)
-    logger.info("Phase 4 complete: %d files tagged", processed)
+    # Chunk rows into YOLO-batch-sized groups and fan them out concurrently.
+    batches = [rows[i : i + _TAG_BATCH_SIZE] for i in range(0, len(rows), _TAG_BATCH_SIZE)]
+    await asyncio.gather(*[_process_batch(b) for b in batches])
+
+    await broadcast("phase_complete", phase="tag", tagged=_counter[0])
+    logger.info("Phase 4 complete: %d files tagged", _counter[0])
 
 
 def _hash_path(path: Path) -> str:

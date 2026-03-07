@@ -154,6 +154,28 @@ DEFAULTS: dict[str, dict[str, Any]] = {
             {"value": 2, "label": "Debug"},
         ],
     },
+    "embed_concurrency": {
+        "value": 4, "type": "int", "min": 1, "max": 16, "step": 1,
+        "label": "Phase 2 parallel workers",
+        "description": (
+            "Number of photos processed simultaneously during Phase 2 (face detection & embedding). "
+            "Higher values finish faster but use more CPU, memory, and thermal budget. "
+            "Reduce to 1-2 if your device becomes hot or unresponsive during a pipeline run. "
+            "Change takes effect on the next scan."
+        ),
+        "group": "System",
+    },
+    "tag_concurrency": {
+        "value": 2, "type": "int", "min": 1, "max": 8, "step": 1,
+        "label": "Phase 4 parallel workers",
+        "description": (
+            "Number of 16-image YOLO batches processed simultaneously during Phase 4 (object/scene tagging). "
+            "Each batch runs YOLO in one GPU forward pass. "
+            "1-2 is safe for all Macs; 3-4 on M2 Max / Mac Pro with ample thermal headroom. "
+            "Change takes effect on the next scan."
+        ),
+        "group": "System",
+    },
 }
 
 # ---------------------------------------------------------------------------
