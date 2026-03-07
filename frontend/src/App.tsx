@@ -4,10 +4,10 @@ import PeoplePage from './pages/PeoplePage'
 import DiscoverPage from './pages/DiscoverPage'
 import TagsPage from './pages/TagsPage'
 import WritebackPage from './pages/WritebackPage'
-import PipelinePage from './pages/PipelinePage'
 import AdminPage from './pages/AdminPage'
 import QualityPage from './pages/QualityPage'
 import PhotoGrid from './components/PhotoGrid'
+import PipelinePanel from './components/PipelinePanel'
 import { api } from './api/client'
 import type { MediaFilter, WsEvent, MergeSuggestionItem, FolderItem, RemoveResult } from './api/client'
 import './index.css'
@@ -16,7 +16,7 @@ import './index.css'
 // View state machine
 // ---------------------------------------------------------------------------
 
-type SidebarSection = 'library' | 'people' | 'animals' | 'places' | 'things' | 'tags' | 'pipeline' | 'writeback' | 'admin' | 'quality'
+type SidebarSection = 'library' | 'people' | 'animals' | 'places' | 'things' | 'tags' | 'writeback' | 'quality'
 
 interface FilteredView {
   title: string
@@ -33,6 +33,20 @@ interface FilteredView {
 export default function App() {
   const [section, setSection]       = useState<SidebarSection>('library')
   const [filtered, setFiltered]     = useState<FilteredView | null>(null)
+
+  // Pipeline panel collapse state (persisted in sessionStorage for comfort)
+  const [pipelineCollapsed, setPipelineCollapsed] = useState(() => {
+    return sessionStorage.getItem('pipeline_collapsed') === 'true'
+  })
+  function togglePipeline() {
+    setPipelineCollapsed(v => {
+      sessionStorage.setItem('pipeline_collapsed', String(!v))
+      return !v
+    })
+  }
+
+  // Admin floating popup
+  const [adminOpen, setAdminOpen] = useState(false)
 
   // Scanned folders displayed in sidebar
   const [folders, setFolders] = useState<FolderItem[]>([])
@@ -158,7 +172,7 @@ export default function App() {
   } else {
     switch (section) {
       case 'library':
-        mainContent = <LibraryPage onScanStarted={() => { loadFolders(); navigate('pipeline') }} />
+        mainContent = <LibraryPage onScanStarted={() => { loadFolders() }} />
         break
       case 'people':
         mainContent = (
@@ -202,17 +216,11 @@ export default function App() {
       case 'tags':
         mainContent = <TagsPage />
         break
-      case 'pipeline':
-        mainContent = <PipelinePage />
-        break
       case 'writeback':
         mainContent = <WritebackPage />
         break
       case 'quality':
         mainContent = <QualityPage />
-        break
-      case 'admin':
-        mainContent = <AdminPage />
         break
     }
   }
@@ -223,10 +231,19 @@ export default function App() {
       <header className="h-11 border-b border-gray-800 flex items-center px-4 gap-3 shrink-0">
         <span className="font-semibold text-white text-sm tracking-wide">📸 VIP</span>
         <span className="text-gray-600 text-xs">Visual Intelligence Platform</span>
+        <div className="flex-1" />
+        {/* Gear icon — opens Admin popup */}
+        <button
+          onClick={() => setAdminOpen(true)}
+          title="Admin & Settings"
+          className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-gray-800 transition-colors text-base"
+        >
+          ⚙
+        </button>
       </header>
 
       <div className="flex flex-1 overflow-hidden">
-        {/* ── Sidebar ── */}
+        {/* ── Nav sidebar ── */}
         <aside className="w-48 shrink-0 border-r border-gray-800 py-3 flex flex-col gap-1 overflow-y-auto bg-gray-950">
           <NavGroup label="Library">
             <NavItem id="library" icon="📚" label="All Photos" active={section === 'library' && !filtered} onClick={() => navigate('library')} />
@@ -259,18 +276,46 @@ export default function App() {
           </NavGroup>
 
           <NavGroup label="Tools">
-            <NavItem id="pipeline"  icon="⚙️" label="Pipeline"     active={section === 'pipeline'  && !filtered} onClick={() => navigate('pipeline')} />
             <NavItem id="writeback" icon="💾" label="Write to Files" active={section === 'writeback' && !filtered} onClick={() => navigate('writeback')} />
             <NavItem id="quality"   icon="🎯" label="Quality"       active={section === 'quality'   && !filtered} onClick={() => navigate('quality')} />
-            <NavItem id="admin"     icon="🛠" label="Admin"         active={section === 'admin'     && !filtered} onClick={() => navigate('admin')} />
           </NavGroup>
         </aside>
+
+        {/* ── Pipeline panel (always mounted, collapsible) ── */}
+        <PipelinePanel
+          collapsed={pipelineCollapsed}
+          onToggle={togglePipeline}
+          onPipelineComplete={loadFolders}
+        />
 
         {/* ── Main content ── */}
         <main className="flex-1 overflow-y-auto p-6">
           {mainContent}
         </main>
       </div>
+
+      {/* ── Admin floating popup ── */}
+      {adminOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-start justify-end bg-black/50 backdrop-blur-sm pt-12 pr-4"
+          onClick={e => { if (e.target === e.currentTarget) setAdminOpen(false) }}
+        >
+          <div className="bg-gray-950 border border-gray-700 rounded-2xl shadow-2xl w-full max-w-2xl max-h-[85vh] overflow-y-auto">
+            <div className="flex items-center justify-between px-6 pt-5 pb-3 border-b border-gray-800 sticky top-0 bg-gray-950 z-10">
+              <h2 className="text-base font-semibold text-white">Admin &amp; Settings</h2>
+              <button
+                onClick={() => setAdminOpen(false)}
+                className="w-7 h-7 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-gray-800 transition-colors text-lg leading-none"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="px-6 py-4">
+              <AdminPage />
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Folder remove warning modal ── */}
       {folderWarning && (

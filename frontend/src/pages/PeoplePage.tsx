@@ -6,7 +6,7 @@
  * Unnamed clusters: shown first, sorted by size.
  */
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api } from '../api/client'
 import type { Cluster, Person, MergeSuggestion, FaceRow, SimilarCluster, MergePersonsResult } from '../api/client'
 
@@ -19,6 +19,7 @@ export default function PeoplePage({ onSelectPerson }: Props) {
   const [clusters, setClusters] = useState<Cluster[]>([])
   const [persons, setPersons] = useState<Person[]>([])
   const [loading, setLoading] = useState(true)
+  const [activeTab, setActiveTab] = useState<'named' | 'unnamed'>('named')
   const [namingId, setNamingId] = useState<number | null>(null)  // cluster id being named
   const [nameInput, setNameInput] = useState('')
   const [saving, setSaving] = useState(false)
@@ -32,48 +33,47 @@ export default function PeoplePage({ onSelectPerson }: Props) {
   const [reviewFaces, setReviewFaces] = useState<FaceRow[]>([])
   const [reviewLoading, setReviewLoading] = useState(false)
 
-  // ── Named-person merge flow ───────────────────────────────────────────────
-  const [mergingFrom, setMergingFrom] = useState<Person | null>(null)
-  const [mergeTarget, setMergeTarget] = useState<Person | null>(null)
-  const [mergeNameInput, setMergeNameInput] = useState('')
-  const [mergeWorking, setMergeWorking] = useState(false)
-  const [mergeResult, setMergeResult] = useState<MergePersonsResult | null>(null)
+  // ── Multi-select for named persons ─────────────────────────────────────
+  const [namedSelectMode, setNamedSelectMode] = useState(false)
+  const [namedSelected, setNamedSelected] = useState<Set<number>>(new Set())
+  const [namedBulkWorking, setNamedBulkWorking] = useState(false)
+  const [namedMergeOpen, setNamedMergeOpen] = useState(false)
+  const [namedMergeNameInput, setNamedMergeNameInput] = useState('')
+  const [namedMergeResult, setNamedMergeResult] = useState<MergePersonsResult | null>(null)
 
-  function startMergeFrom(p: Person) {
-    setMergingFrom(p)
-    setMergeTarget(null)
-    setMergeNameInput('')
-    setMergeResult(null)
+  function toggleNamedSelect(id: number) {
+    setNamedSelected(prev => {
+      const next = new Set(prev)
+      next.has(id) ? next.delete(id) : next.add(id)
+      return next
+    })
   }
 
-  function selectMergeTarget(p: Person) {
-    if (!mergingFrom || p.id === mergingFrom.id) return
-    // Pre-fill the name with the survivor's name (more photos wins, ties → mergingFrom)
-    const survivor = p.photo_count > mergingFrom.photo_count ? p : mergingFrom
-    setMergeTarget(p)
-    setMergeNameInput(survivor.name ?? '')
+  function exitNamedSelectMode() {
+    setNamedSelectMode(false)
+    setNamedSelected(new Set())
+    setNamedMergeOpen(false)
+    setNamedMergeNameInput('')
+    setNamedMergeResult(null)
   }
 
-  function cancelMerge() {
-    setMergingFrom(null)
-    setMergeTarget(null)
-    setMergeNameInput('')
-    setMergeResult(null)
-  }
-
-  async function confirmMerge() {
-    if (!mergingFrom || !mergeTarget) return
-    setMergeWorking(true)
+  async function handleNamedBulkMerge() {
+    const name = namedMergeNameInput.trim()
+    if (namedSelected.size < 2 || !name) return
+    setNamedBulkWorking(true)
     try {
-      const result = await api.persons.mergePersons(
-        mergingFrom.id,
-        mergeTarget.id,
-        mergeNameInput.trim() || undefined,
-      )
-      setMergeResult(result)
+      const selectedPersons = persons.filter(p => namedSelected.has(p.id))
+      // Survivor = most photos; ties → first in list
+      const survivor = selectedPersons.reduce((a, b) => b.photo_count > a.photo_count ? b : a)
+      const others = selectedPersons.filter(p => p.id !== survivor.id)
+      let result: MergePersonsResult | null = null
+      for (const other of others) {
+        result = await api.persons.mergePersons(other.id, survivor.id, name)
+      }
+      setNamedMergeResult(result)
       await load()
     } finally {
-      setMergeWorking(false)
+      setNamedBulkWorking(false)
     }
   }
 
@@ -135,6 +135,7 @@ export default function PeoplePage({ onSelectPerson }: Props) {
   const [bulkNameOpen, setBulkNameOpen] = useState(false)
   const [bulkNameInput, setBulkNameInput] = useState('')
   const [bulkNameSuggestions, setBulkNameSuggestions] = useState(false)
+  const lastSelectedIdxRef = useRef<number>(-1)
 
   function toggleSelect(id: number) {
     setSelected(prev => {
@@ -144,11 +145,40 @@ export default function PeoplePage({ onSelectPerson }: Props) {
     })
   }
 
+  function rangeSelect(clickedIdx: number, shiftHeld: boolean) {
+    if (!shiftHeld || lastSelectedIdxRef.current < 0) {
+      // Normal click — toggle just this tile
+      toggleSelect(clusters[clickedIdx].id)
+      lastSelectedIdxRef.current = clickedIdx
+      return
+    }
+    // Shift+click — select the inclusive range
+    const lo = Math.min(lastSelectedIdxRef.current, clickedIdx)
+    const hi = Math.max(lastSelectedIdxRef.current, clickedIdx)
+    setSelected(prev => {
+      const next = new Set(prev)
+      for (let i = lo; i <= hi; i++) next.add(clusters[i].id)
+      return next
+    })
+    lastSelectedIdxRef.current = clickedIdx
+  }
+
+  function selectAll() {
+    setSelected(new Set(clusters.map(c => c.id)))
+    lastSelectedIdxRef.current = clusters.length - 1
+  }
+
+  function selectHighConf() {
+    setSelected(new Set(clusters.filter(c => c.is_high_conf === 1).map(c => c.id)))
+    lastSelectedIdxRef.current = -1
+  }
+
   function exitSelectMode() {
     setSelectMode(false)
     setSelected(new Set())
     setBulkNameOpen(false)
     setBulkNameInput('')
+    lastSelectedIdxRef.current = -1
   }
 
   async function handleBulkDelete() {
@@ -313,23 +343,59 @@ export default function PeoplePage({ onSelectPerson }: Props) {
 
   return (
     <div>
-      <h1 className="text-xl font-semibold mb-6">People</h1>
+      {/* ── Sub-tab bar ────────────────────────────────────────────────────── */}
+      <div className="flex items-center gap-1 mb-6 border-b border-gray-800 pb-0">
+        <button
+          onClick={() => setActiveTab('named')}
+          className={`px-4 py-2 text-sm font-medium rounded-t-lg transition-colors -mb-px border-b-2 ${
+            activeTab === 'named'
+              ? 'border-indigo-500 text-white'
+              : 'border-transparent text-gray-400 hover:text-white'
+          }`}
+        >
+          Named Faces
+          {persons.length > 0 && (
+            <span className={`ml-1.5 text-xs px-1.5 py-0.5 rounded-full ${
+              activeTab === 'named' ? 'bg-indigo-600 text-white' : 'bg-gray-800 text-gray-500'
+            }`}>
+              {persons.length}
+            </span>
+          )}
+        </button>
+        <button
+          onClick={() => setActiveTab('unnamed')}
+          className={`px-4 py-2 text-sm font-medium rounded-t-lg transition-colors -mb-px border-b-2 ${
+            activeTab === 'unnamed'
+              ? 'border-indigo-500 text-white'
+              : 'border-transparent text-gray-400 hover:text-white'
+          }`}
+        >
+          Unnamed Faces
+          {clusters.length > 0 && (
+            <span className={`ml-1.5 text-xs px-1.5 py-0.5 rounded-full ${
+              activeTab === 'unnamed' ? 'bg-indigo-600 text-white' : 'bg-gray-800 text-gray-500'
+            }`}>
+              {clusters.length}
+            </span>
+          )}
+        </button>
+      </div>
 
-      {/* ── Named-person merge dialog ─────────────────────────────────────── */}
-      {mergingFrom && mergeTarget && (
+      {/* ── Named-person multi-select merge dialog ────────────────────────── */}
+      {namedMergeOpen && (
         <div className="fixed inset-0 bg-black/75 flex items-center justify-center z-50">
           <div className="bg-gray-900 border border-gray-700 rounded-2xl p-7 max-w-md w-full shadow-2xl mx-4">
-            {mergeResult ? (
+            {namedMergeResult ? (
               /* ── Success state ── */
               <>
                 <p className="text-white font-semibold text-lg mb-2 text-center">Merge complete ✓</p>
                 <p className="text-gray-400 text-sm text-center mb-5">
-                  <span className="text-indigo-300 font-medium">{mergeResult.survivor_name}</span> now has{' '}
-                  {mergeResult.photos_queued_for_writeback} photo{mergeResult.photos_queued_for_writeback !== 1 ? 's' : ''} queued for writeback.
-                  Old name will be removed from files on next write.
+                  <span className="text-indigo-300 font-medium">{namedMergeResult.survivor_name}</span> now has{' '}
+                  {namedMergeResult.photos_queued_for_writeback} photo{namedMergeResult.photos_queued_for_writeback !== 1 ? 's' : ''} queued for writeback.
+                  Old names will be removed from files on next write.
                 </p>
                 <button
-                  onClick={cancelMerge}
+                  onClick={exitNamedSelectMode}
                   className="w-full bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl py-2.5 text-sm font-semibold transition-colors"
                 >
                   Done
@@ -338,65 +404,72 @@ export default function PeoplePage({ onSelectPerson }: Props) {
             ) : (
               /* ── Confirm state ── */
               <>
-                <p className="text-white font-semibold text-lg mb-1">Merge these two people?</p>
+                <p className="text-white font-semibold text-lg mb-1">
+                  Merge {namedSelected.size} people?
+                </p>
                 <p className="text-gray-400 text-xs mb-5">
-                  All faces and photos will be combined. Files will be updated on next writeback.
+                  All faces and photos will be combined into one person. Files will be updated on next writeback.
                 </p>
 
-                {/* Side-by-side thumbnails */}
-                <div className="flex gap-6 items-center justify-center mb-5">
-                  {[mergingFrom, mergeTarget].map((p, i) => {
+                {/* Thumbnails of selected persons */}
+                <div className="flex gap-3 flex-wrap justify-center mb-5">
+                  {persons.filter(p => namedSelected.has(p.id)).map(p => {
                     const url = p.representative_thumbnail
                       ? '/thumbnails/' + p.representative_thumbnail.split('/thumbnails/').pop()
                       : null
                     return (
                       <div key={p.id} className="flex flex-col items-center gap-1">
-                        <div className={`w-24 h-24 rounded-xl overflow-hidden bg-gray-800 border ${i === 0 ? 'border-indigo-600' : 'border-gray-600'}`}>
+                        <div className="w-16 h-16 rounded-xl overflow-hidden bg-gray-800 border border-gray-600">
                           {url
                             ? <img src={url} alt={p.name ?? ''} className="w-full h-full object-cover" />
                             : <span className="flex items-center justify-center h-full text-gray-500 text-2xl">👤</span>}
                         </div>
-                        <span className="text-xs font-medium text-gray-300 max-w-[96px] truncate text-center">{p.name}</span>
-                        <span className="text-xs text-gray-500">{p.photo_count} photo{p.photo_count !== 1 ? 's' : ''}</span>
+                        <span className="text-xs text-gray-300 max-w-[64px] truncate text-center">{p.name}</span>
+                        <span className="text-[10px] text-gray-500">{p.photo_count} photo{p.photo_count !== 1 ? 's' : ''}</span>
                       </div>
                     )
                   })}
                 </div>
 
-                {/* Quick-name buttons */}
+                {/* Quick-name buttons — one per unique selected name */}
                 <p className="text-xs text-gray-500 mb-1.5">Merged name:</p>
-                <div className="flex gap-2 mb-2">
-                  {[mergingFrom.name, mergeTarget.name].filter((n): n is string => !!n).filter((n, i, a) => a.indexOf(n) === i).map(n => (
-                    <button key={n}
-                      onClick={() => setMergeNameInput(n)}
-                      className={`flex-1 rounded-lg py-1.5 text-xs font-medium border transition-colors ${
-                        mergeNameInput === n
-                          ? 'bg-indigo-600 border-indigo-500 text-white'
-                          : 'bg-gray-800 border-gray-600 text-gray-300 hover:border-indigo-400'
-                      }`}
-                    >
-                      {n}
-                    </button>
-                  ))}
+                <div className="flex gap-2 mb-2 flex-wrap">
+                  {persons
+                    .filter(p => namedSelected.has(p.id))
+                    .map(p => p.name)
+                    .filter((n): n is string => !!n)
+                    .filter((n, i, a) => a.indexOf(n) === i)
+                    .map(n => (
+                      <button key={n}
+                        onClick={() => setNamedMergeNameInput(n)}
+                        className={`rounded-lg py-1.5 px-3 text-xs font-medium border transition-colors ${
+                          namedMergeNameInput === n
+                            ? 'bg-indigo-600 border-indigo-500 text-white'
+                            : 'bg-gray-800 border-gray-600 text-gray-300 hover:border-indigo-400'
+                        }`}
+                      >
+                        {n}
+                      </button>
+                    ))}
                 </div>
                 <input
-                  value={mergeNameInput}
-                  onChange={e => setMergeNameInput(e.target.value)}
+                  value={namedMergeNameInput}
+                  onChange={e => setNamedMergeNameInput(e.target.value)}
                   placeholder="Custom name…"
                   className="w-full bg-gray-800 border border-gray-600 focus:border-indigo-500 rounded-lg px-3 py-2 text-sm text-white outline-none mb-5"
                 />
 
                 <div className="flex gap-3">
                   <button
-                    onClick={confirmMerge}
-                    disabled={mergeWorking || !mergeNameInput.trim()}
+                    onClick={handleNamedBulkMerge}
+                    disabled={namedBulkWorking || !namedMergeNameInput.trim()}
                     className="flex-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-xl py-2.5 text-sm font-semibold transition-colors"
                   >
-                    {mergeWorking ? 'Merging…' : 'Merge'}
+                    {namedBulkWorking ? 'Merging…' : 'Merge'}
                   </button>
                   <button
-                    onClick={cancelMerge}
-                    disabled={mergeWorking}
+                    onClick={() => { setNamedMergeOpen(false); setNamedMergeNameInput('') }}
+                    disabled={namedBulkWorking}
                     className="flex-1 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-gray-300 rounded-xl py-2.5 text-sm font-medium transition-colors"
                   >
                     Cancel
@@ -641,41 +714,68 @@ export default function PeoplePage({ onSelectPerson }: Props) {
 
       {clusters.length === 0 && persons.length === 0 && (
         <div className="text-gray-500 text-sm mt-12 text-center">
-          No people found yet. Run the pipeline first via the ⚙️ Pipeline tab.
+          No people found yet. Run the pipeline first via the Pipeline panel.
         </div>
       )}
 
-      {/* Unnamed clusters */}
-      {clusters.length > 0 && (
+      {activeTab === 'unnamed' && clusters.length === 0 && persons.length > 0 && (
+        <div className="text-gray-500 text-sm mt-12 text-center">
+          No unnamed clusters — all faces have been assigned.
+        </div>
+      )}
+
+      {activeTab === 'named' && persons.length === 0 && clusters.length > 0 && (
+        <div className="text-gray-500 text-sm mt-12 text-center">
+          No named persons yet. Switch to <button onClick={() => setActiveTab('unnamed')} className="text-indigo-400 hover:text-indigo-300 underline">Unnamed Faces</button> to name some.
+        </div>
+      )}
+
+      {/* ── Unnamed clusters tab ─────────────────────────────────────────── */}
+      {activeTab === 'unnamed' && clusters.length > 0 && (
         <section className="mb-8">
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
               Unnamed clusters ({clusters.length})
             </h2>
             <div className="flex items-center gap-2">
-              {selectMode && selected.size > 0 && (
-                <span className="text-xs text-gray-400">{selected.size} selected</span>
+              {selectMode && (
+                <>
+                  <button
+                    onClick={selectAll}
+                    className="text-xs px-2.5 py-1 rounded-lg border border-gray-600 bg-gray-800 text-gray-400 hover:text-white hover:border-gray-400 transition-colors"
+                  >All</button>
+                  {clusters.some(c => c.is_high_conf === 1) && (
+                    <button
+                      onClick={selectHighConf}
+                      className="text-xs px-2.5 py-1 rounded-lg border border-gray-600 bg-gray-800 text-gray-400 hover:text-white hover:border-gray-400 transition-colors"
+                    >✓ High-conf</button>
+                  )}
+                  <span className="text-xs text-gray-500">Click · Shift+click range</span>
+                  {selected.size > 0 && (
+                    <span className="text-xs text-gray-400">{selected.size} selected</span>
+                  )}
+                </>
               )}
               <button
-                onClick={() => { setSelectMode(s => !s); setSelected(new Set()) }}
+                onClick={() => { if (selectMode) exitSelectMode(); else setSelectMode(true) }}
                 className={`text-xs px-2.5 py-1 rounded-lg border transition-colors ${
                   selectMode
                     ? 'bg-indigo-700 border-indigo-500 text-white'
                     : 'bg-gray-800 border-gray-600 text-gray-400 hover:text-white hover:border-gray-400'
                 }`}
               >
-                {selectMode ? 'Cancel select' : 'Select'}
+                {selectMode ? 'Cancel' : 'Select'}
               </button>
             </div>
           </div>
           <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-4">
-            {clusters.map(c => (
+            {clusters.map((c, idx) => (
               <ClusterTile key={c.id} cluster={c}
                 isNaming={!selectMode && namingId === c.id} nameInput={nameInput} saving={saving}
                 personNames={persons.filter(p => p.name).map(p => p.name!)}
                 selectMode={selectMode}
                 isSelected={selected.has(c.id)}
-                onToggleSelect={() => toggleSelect(c.id)}
+                onToggleSelect={(shiftHeld) => rangeSelect(idx, shiftHeld)}
                 onStartNaming={() => { if (!selectMode) { setNamingId(c.id); setNameInput('') } }}
                 onNameInput={setNameInput}
                 onConfirm={() => handleName(c.id)}
@@ -782,63 +882,70 @@ export default function PeoplePage({ onSelectPerson }: Props) {
         </section>
       )}
 
-      {/* Named persons — sorted alphabetically */}
-      {persons.length > 0 && (
+      {/* ── Named persons tab ───────────────────────────────────────────── */}
+      {activeTab === 'named' && persons.length > 0 && (
         <section>
-          <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center justify-between mb-3">
             <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
               Named ({persons.length})
             </h2>
-            {mergingFrom && !mergeTarget && (
-              <div className="flex items-center gap-3">
-                <span className="text-xs text-indigo-300 font-medium animate-pulse">
-                  Select a person to merge with <span className="font-semibold">{mergingFrom.name}</span>
-                </span>
-                <button onClick={cancelMerge} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">
-                  ✕ Cancel
-                </button>
-              </div>
-            )}
+            <div className="flex items-center gap-2">
+              {namedSelectMode && namedSelected.size > 0 && (
+                <span className="text-xs text-gray-400">{namedSelected.size} selected</span>
+              )}
+              <button
+                onClick={() => { setNamedSelectMode(s => !s); setNamedSelected(new Set()) }}
+                className={`text-xs px-2.5 py-1 rounded-lg border transition-colors ${
+                  namedSelectMode
+                    ? 'bg-indigo-700 border-indigo-500 text-white'
+                    : 'bg-gray-800 border-gray-600 text-gray-400 hover:text-white hover:border-gray-400'
+                }`}
+              >
+                {namedSelectMode ? 'Cancel' : 'Select'}
+              </button>
+            </div>
           </div>
           <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-4">
             {[...persons].sort((a, b) => (a.name ?? '').localeCompare(b.name ?? '')).map(p => {
               const thumb = p.representative_thumbnail
               const thumbUrl = thumb ? '/thumbnails/' + thumb.split('/thumbnails/').pop() : null
               const isRenaming = renamingPersonId === p.id
-              const isMergingFrom = mergingFrom?.id === p.id
-              const isMergeMode = !!mergingFrom && !mergeTarget
+              const isNamedSelected = namedSelected.has(p.id)
               return (
                 <div key={p.id} className="flex flex-col items-center gap-2">
-                  {/* Main tile — click to view photos or select merge target */}
+                  {/* Main tile */}
                   <div className="relative group">
                     <button
                       onClick={() => {
-                        if (isMergeMode && !isMergingFrom) {
-                          selectMergeTarget(p)
-                        } else if (!isRenaming && !isMergeMode) {
+                        if (namedSelectMode) {
+                          toggleNamedSelect(p.id)
+                        } else if (!isRenaming) {
                           onSelectPerson?.(p.id, p.name ?? 'Unknown')
                         }
                       }}
-                      title={isMergeMode && !isMergingFrom ? `Merge with ${p.name}` : `View photos of ${p.name}`}
+                      title={namedSelectMode ? (isNamedSelected ? 'Deselect' : 'Select') : `View photos of ${p.name}`}
                       className={`w-20 h-20 rounded-xl bg-gray-800 border overflow-hidden flex items-center justify-center transition-colors ${
-                        isMergingFrom
+                        namedSelectMode && isNamedSelected
                           ? 'border-indigo-500 ring-2 ring-indigo-600'
-                          : isMergeMode
-                            ? 'border-indigo-400 hover:border-indigo-300 cursor-pointer'
+                          : namedSelectMode
+                            ? 'border-gray-700 hover:border-indigo-300 cursor-pointer'
                             : 'border-gray-700 hover:border-indigo-400'
                       }`}
                     >
                       {thumbUrl
                         ? <img src={thumbUrl} alt={p.name ?? 'person'} className="w-full h-full object-cover" />
                         : <span className="text-2xl">👤</span>}
-                      {isMergeMode && !isMergingFrom && (
-                        <span className="absolute inset-0 bg-indigo-900/30 flex items-center justify-center text-indigo-300 text-xs font-bold opacity-0 group-hover:opacity-100 transition-opacity">
-                          merge
+                      {/* Selection indicator overlay */}
+                      {namedSelectMode && (
+                        <span className={`absolute top-1 right-1 w-5 h-5 rounded-full border-2 flex items-center justify-center text-xs font-bold transition-colors ${
+                          isNamedSelected ? 'bg-indigo-500 border-indigo-400 text-white' : 'bg-black/40 border-gray-400'
+                        }`}>
+                          {isNamedSelected ? '✓' : ''}
                         </span>
                       )}
                     </button>
-                    {/* Rename icon — top-left on hover (hidden in merge mode) */}
-                    {!isRenaming && !isMergeMode && (
+                    {/* Rename icon — top-left on hover (hidden in select mode) */}
+                    {!isRenaming && !namedSelectMode && (
                       <button
                         onClick={() => { setRenamingPersonId(p.id); setRenameInput(p.name ?? '') }}
                         title="Rename"
@@ -847,8 +954,8 @@ export default function PeoplePage({ onSelectPerson }: Props) {
                         ✎
                       </button>
                     )}
-                    {/* Review icon — top-right on hover (hidden in merge mode) */}
-                    {!isMergeMode && (
+                    {/* Review icon — top-right on hover (hidden in select mode) */}
+                    {!namedSelectMode && (
                       <button
                         onClick={() => openReview(p)}
                         title="Review faces"
@@ -888,7 +995,6 @@ export default function PeoplePage({ onSelectPerson }: Props) {
                     </div>
                   ) : (
                     <span className="text-xs text-center truncate max-w-full px-1 flex items-center gap-1 justify-center">
-                      {/* Green = name written to file; Red = DB only, not yet written */}
                       <span
                         title={p.name_written ? 'Name written to photo file' : 'Name saved in database only (not yet written to file)'}
                         className={`inline-block w-1.5 h-1.5 rounded-full flex-shrink-0 ${p.name_written ? 'bg-green-400' : 'bg-red-400'}`}
@@ -900,33 +1006,50 @@ export default function PeoplePage({ onSelectPerson }: Props) {
                   {p.merge_sources_count > 0 && (
                     <span className="text-xs text-indigo-500">⇐ {p.merge_sources_count} merged</span>
                   )}
-                  {!isMergeMode && (
-                    <div className="flex gap-3">
-                      <button
-                        onClick={() => startSuggestions(p.id, p.name!)}
-                        title="Find similar faces"
-                        className="text-xs text-gray-600 hover:text-indigo-400 transition-colors"
-                      >
-                        ≈ similar
-                      </button>
-                      <button
-                        onClick={() => startMergeFrom(p)}
-                        title="Merge with another person"
-                        className="text-xs text-gray-600 hover:text-orange-400 transition-colors"
-                      >
-                        ⇔ merge
-                      </button>
-                    </div>
-                  )}
-                  {isMergingFrom && (
-                    <button onClick={cancelMerge} className="text-xs text-indigo-400 hover:text-gray-300 transition-colors">
-                      cancel merge
+                  {!namedSelectMode && (
+                    <button
+                      onClick={() => startSuggestions(p.id, p.name!)}
+                      title="Find similar faces"
+                      className="text-xs text-gray-600 hover:text-indigo-400 transition-colors"
+                    >
+                      ≈ similar
                     </button>
                   )}
                 </div>
               )
             })}
           </div>
+
+          {/* Bulk merge bar — floats at bottom when 2+ named persons are selected */}
+          {namedSelectMode && namedSelected.size >= 2 && (
+            <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 bg-gray-900 border border-gray-700 rounded-2xl px-5 py-3 shadow-2xl">
+              <div className="flex items-center gap-3">
+                <span className="text-sm text-gray-300 mr-1">
+                  {namedSelected.size} people
+                </span>
+                <button
+                  onClick={() => {
+                    const selectedPersons = persons.filter(p => namedSelected.has(p.id))
+                    const survivor = selectedPersons.reduce((a, b) => b.photo_count > a.photo_count ? b : a)
+                    setNamedMergeNameInput(survivor.name ?? '')
+                    setNamedMergeResult(null)
+                    setNamedMergeOpen(true)
+                  }}
+                  disabled={namedBulkWorking}
+                  className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white text-sm font-medium px-4 py-1.5 rounded-lg transition-colors"
+                >
+                  Merge
+                </button>
+                <button
+                  onClick={exitNamedSelectMode}
+                  disabled={namedBulkWorking}
+                  className="text-gray-500 hover:text-gray-300 text-sm transition-colors"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
         </section>
       )}
     </div>
@@ -936,7 +1059,7 @@ export default function PeoplePage({ onSelectPerson }: Props) {
 function ClusterTile({ cluster, isNaming, nameInput, saving, personNames, selectMode, isSelected, onToggleSelect, onStartNaming, onNameInput, onConfirm, onCancel, onDismiss }: {
   cluster: Cluster; isNaming: boolean; nameInput: string; saving: boolean
   personNames: string[]
-  selectMode: boolean; isSelected: boolean; onToggleSelect: () => void
+  selectMode: boolean; isSelected: boolean; onToggleSelect: (shiftHeld: boolean) => void
   onStartNaming: () => void; onNameInput: (v: string) => void; onConfirm: () => void; onCancel: () => void
   onDismiss: () => void
 }) {
@@ -952,7 +1075,7 @@ function ClusterTile({ cluster, isNaming, nameInput, saving, personNames, select
     <div className="flex flex-col items-center gap-2">
       <div className="relative group">
         <button
-          onClick={selectMode ? onToggleSelect : onStartNaming}
+          onClick={e => selectMode ? onToggleSelect(e.shiftKey) : onStartNaming()}
           className={'relative w-20 h-20 rounded-xl overflow-hidden bg-gray-800 border transition-colors ' +
             (selectMode
               ? isSelected

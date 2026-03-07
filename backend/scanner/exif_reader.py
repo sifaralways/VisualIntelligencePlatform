@@ -12,6 +12,7 @@ always terminates cleanly, and is far simpler to reason about.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import subprocess
@@ -25,7 +26,8 @@ logger = logging.getLogger(__name__)
 _PER_FILE_TIMEOUT = 30
 
 # Timeout for a single ExifTool call operating on a whole batch of files.
-# 500 files × ~200 ms each = 100 s on a local disk; double for NAS headroom.
+# Overridden at runtime by the admin setting 'exif_batch_timeout'.
+# This constant is the fallback used when called outside the pipeline.
 _BATCH_TIMEOUT = 300
 
 
@@ -86,7 +88,10 @@ def _run_exiftool(path: Path) -> dict[str, Any] | None:
         return None
 
 
-def _run_exiftool_batch(paths: list[Path]) -> dict[str, dict[str, Any]]:
+def _run_exiftool_batch(
+    paths: list[Path],
+    timeout: int = _BATCH_TIMEOUT,
+) -> dict[str, dict[str, Any]]:
     """
     Run ExifTool once for a list of files in a single subprocess.
 
@@ -112,12 +117,12 @@ def _run_exiftool_batch(paths: list[Path]) -> dict[str, dict[str, Any]]:
                 "-q",
             ] + [str(p) for p in paths],
             capture_output=True,
-            timeout=_BATCH_TIMEOUT,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired:
         logger.warning(
             "ExifTool batch timed out (%ds) for %d files — EXIF fields will be empty",
-            _BATCH_TIMEOUT, len(paths),
+            timeout, len(paths),
         )
         return {}
     except FileNotFoundError:
@@ -183,7 +188,11 @@ class ExifToolReader:
         )
         return normalised
 
-    async def read_batch(self, paths: list[Path]) -> dict[str, dict[str, Any]]:
+    async def read_batch(
+        self,
+        paths: list[Path],
+        timeout: int = _BATCH_TIMEOUT,
+    ) -> dict[str, dict[str, Any]]:
         """
         Read EXIF for many files in a single ExifTool subprocess call.
 
@@ -193,7 +202,9 @@ class ExifToolReader:
         if not paths:
             return {}
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _run_exiftool_batch, paths)
+        return await loop.run_in_executor(
+            None, functools.partial(_run_exiftool_batch, paths, timeout=timeout)
+        )
 
 
 def _parse_float(value: Any) -> float | None:

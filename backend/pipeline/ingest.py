@@ -67,7 +67,7 @@ def _ensure_models() -> None:
 # ---------------------------------------------------------------------------
 # Reprocess entry point (no filesystem scan — works on existing DB photos)
 # ---------------------------------------------------------------------------
-async def run_reprocess() -> None:
+async def run_reprocess(force_retag: bool = False) -> None:
     """
     Full reprocess of the existing library without a filesystem walk.
 
@@ -80,10 +80,20 @@ async def run_reprocess() -> None:
       5. Re-run quality signals (blur, closed-eyes) on stored thumbnails.
       6. Rebuild analysis documents so all changes appear in the UI.
     """
-    logger.info("=== Reprocess start ===")
+    logger.info("=== Reprocess start (force_retag=%s) ===", force_retag)
     await broadcast("pipeline_start", folder="[library reprocess]")
     await settings_store.load_cache()
     _ensure_models()
+
+    # When force_retag is requested, reset the tags_done flag on every
+    # non-stub file so Phase 4 re-runs YOLO/CLIP inference on the full library.
+    if force_retag:
+        async with get_db() as db:
+            await db.execute(
+                "UPDATE media_files SET tags_done = 0 WHERE is_stub = 0"
+            )
+        logger.info("force_retag: tags_done reset for all files")
+        await broadcast("phase_start", phase="force_retag_reset")
 
     # -------------------------------------------------------------------------
     # Step 1: Prepare files for face re-detection
@@ -171,6 +181,11 @@ async def run_reprocess() -> None:
     # Step 5: Restore VIP-history names for newly-detected faces in files
     # that VIP previously wrote XMP data to.
     await _phase_restore_vip_names()
+
+    # Step 5b: If the user requested a full re-tag, run Phase 4 now.
+    # (tags_done was already reset to 0 at the top of this function.)
+    if force_retag:
+        await _phase_tag()
 
     # Step 6: quality re-check on stored photo thumbnails
     await broadcast("phase_start", phase="quality_recheck")
@@ -335,7 +350,7 @@ async def run_ingest(folder: str) -> None:
 # ---------------------------------------------------------------------------
 # Phase 1 tuning — adjust to taste for your hardware / network
 # ---------------------------------------------------------------------------
-_SCAN_BATCH_SIZE  = 500   # files per ExifTool subprocess call
+_SCAN_BATCH_SIZE  = 500   # fallback default (overridden by admin setting 'exif_batch_size')
 _HASH_CONCURRENCY = 8     # simultaneous SHA-256 read streams
 _TAG_BATCH_SIZE   = 16    # images per YOLO GPU forward pass in Phase 4
 
@@ -357,7 +372,12 @@ async def _phase_scan(folder: Path) -> None:
         logger.info("Phase 1 complete: 0 scanned, 0 skipped")
         return
 
-    logger.info("Phase 1: %d files to process (batches of %d)", total_files, _SCAN_BATCH_SIZE)
+    scan_batch_size = int(settings_store.get("exif_batch_size") or _SCAN_BATCH_SIZE)
+    exif_timeout    = int(settings_store.get("exif_batch_timeout") or 300)
+    logger.info(
+        "Phase 1: %d files to process (batches of %d, timeout %ds)",
+        total_files, scan_batch_size, exif_timeout,
+    )
 
     scanned = 0
     skipped = 0
@@ -365,8 +385,8 @@ async def _phase_scan(folder: Path) -> None:
     hash_sem = asyncio.Semaphore(_HASH_CONCURRENCY)
     exif_reader = ExifToolReader()
 
-    for batch_start in range(0, total_files, _SCAN_BATCH_SIZE):
-        batch = all_paths[batch_start : batch_start + _SCAN_BATCH_SIZE]
+    for batch_start in range(0, total_files, scan_batch_size):
+        batch = all_paths[batch_start : batch_start + scan_batch_size]
 
         # ── 1a + 1b: ExifTool (one subprocess for the whole batch) and ────────
         # file hashing (up to _HASH_CONCURRENCY concurrent readers) run in
@@ -377,7 +397,7 @@ async def _phase_scan(folder: Path) -> None:
                 return path, h
 
         gather_result = await asyncio.gather(
-            exif_reader.read_batch(batch),
+            exif_reader.read_batch(batch, timeout=exif_timeout),
             *[_hash_one(p) for p in batch],
         )
         exif_map: dict[str, dict] = gather_result[0]          # str(path) → meta
@@ -1271,12 +1291,17 @@ async def _phase_tag() -> None:
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _tagger.load)
 
-    # Files that have been embedded/clustered but not yet tagged
+    # Files that have not been tagged yet (tags_done = 0) and are at least
+    # in the embedded/clustered/tagged state (i.e. past Phase 2).
+    # This skips files whose content has not changed since the last scan,
+    # avoiding redundant YOLO/CLIP inference on large libraries.
+    # Use force_retag (via Rescan All) to re-run on the full library.
     async with get_db() as db:
         rows = await db.execute_fetchall("""
             SELECT id, file_path, gps_lat, gps_lon
             FROM media_files
-            WHERE ingest_state IN ('embedded', 'clustered')
+            WHERE tags_done = 0
+              AND ingest_state IN ('embedded', 'clustered', 'tagged')
               AND is_stub = 0
         """)
 
@@ -1335,8 +1360,11 @@ async def _phase_tag() -> None:
                         VALUES (?,?,?,?,?)
                     """, tag_rows)
 
+                # Mark tagging complete and advance ingest_state.
+                # tags_done = 1 causes this file to be skipped on future
+                # pipeline runs (unless force_retag resets it).
                 await db.executemany(
-                    "UPDATE media_files SET ingest_state='tagged' WHERE id=?",
+                    "UPDATE media_files SET ingest_state='tagged', tags_done=1 WHERE id=?",
                     [(mid,) for mid in media_ids],
                 )
 

@@ -206,8 +206,7 @@ export default function AdminPage() {
 
   return (
     <div className="max-w-3xl">
-      <h1 className="text-xl font-semibold mb-1">Admin</h1>
-      <p className="text-sm text-gray-500 mb-8">Database stats and selective data reset.</p>
+      <p className="text-sm text-gray-500 mb-6">Database stats and selective data reset.</p>
 
       {/* ── Stats ─────────────────────────────────────────────── */}
       <section className="mb-10">

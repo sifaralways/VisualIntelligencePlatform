@@ -176,6 +176,28 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         ),
         "group": "System",
     },
+    "exif_batch_size": {
+        "value": 500, "type": "int", "min": 10, "max": 1000, "step": 10,
+        "label": "Phase 1 ExifTool batch size",
+        "description": (
+            "Number of files passed to ExifTool in a single subprocess call during Phase 1 (scan). "
+            "Larger batches are faster on local SSDs (fewer Perl start-ups). "
+            "Reduce to 50–100 if your library is on a NAS or if Phase 1 times out."
+        ),
+        "group": "System",
+    },
+    "exif_batch_timeout": {
+        "value": 300, "type": "int", "min": 30, "max": 3600, "step": 30,
+        "label": "Phase 1 ExifTool timeout (s)",
+        "description": (
+            "Maximum seconds ExifTool is allowed to run for a single batch before it is abandoned and "
+            "that batch's EXIF fields are left empty. "
+            "Increase if you see 'ExifTool batch timed out' warnings — typically needed for very large "
+            "RAW files (CR3, ARW) over a slow network. "
+            "A good rule of thumb: batch size × 1 s, doubled for NAS headroom."
+        ),
+        "group": "System",
+    },
 }
 
 # ---------------------------------------------------------------------------

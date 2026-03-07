@@ -24,6 +24,10 @@ class ScanRequest(BaseModel):
     force_reprocess: bool = False
 
 
+class RescanRequest(BaseModel):
+    force_retag: bool = False
+
+
 @router.post("/scan")
 async def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
     """Start the ingest pipeline on a given folder."""
@@ -58,7 +62,7 @@ async def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
 
 
 @router.post("/rescan")
-async def rescan_library(background_tasks: BackgroundTasks):
+async def rescan_library(req: RescanRequest, background_tasks: BackgroundTasks):
     """Full library reprocess without a filesystem walk.
 
     Re-detects faces on photos not owned by a named person (applies any
@@ -68,6 +72,9 @@ async def rescan_library(background_tasks: BackgroundTasks):
 
     Named-person assignments are preserved.  Always-ignored faces are
     never re-surfaced.
+
+    Pass force_retag=true to also re-run YOLO/CLIP object/scene/place
+    detection on every photo (slower — avoids the tags_done skip).
     """
     if _pipeline_state["status"] == "running":
         raise HTTPException(status_code=409, detail="Pipeline already running")
@@ -83,7 +90,7 @@ async def rescan_library(background_tasks: BackgroundTasks):
         """)
 
     _pipeline_state.update({"status": "running", "folder": "[library reprocess]", "error": None})
-    background_tasks.add_task(_run_reprocess)
+    background_tasks.add_task(_run_reprocess, req.force_retag)
     return {"status": "started"}
 
 
@@ -122,10 +129,10 @@ async def _run_pipeline(folder: str) -> None:
         _pipeline_state["error"] = str(e)
 
 
-async def _run_reprocess() -> None:
+async def _run_reprocess(force_retag: bool = False) -> None:
     from backend.pipeline.ingest import run_reprocess
     try:
-        await run_reprocess()
+        await run_reprocess(force_retag=force_retag)
         _pipeline_state["status"] = "idle"
     except Exception as e:
         logger.exception("Reprocess error")

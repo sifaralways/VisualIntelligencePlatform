@@ -21,8 +21,12 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ folder, force_reprocess: forceReprocess }),
       }),
-    rescan: () =>
-      request<{ status: string; folder: string }>('/pipeline/rescan', { method: 'POST' }),
+    rescan: (forceRetag = false) =>
+      request<{ status: string; folder: string }>('/pipeline/rescan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ force_retag: forceRetag }),
+      }),
     status: () => request<{ status: string; folder: string | null; error: string | null }>('/pipeline/status'),
   },
 

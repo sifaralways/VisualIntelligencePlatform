@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+
 from fastapi import APIRouter, HTTPException
 
 from backend.database.db import get_db
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -103,4 +107,46 @@ async def remove_folder_from_app(folder_id: int, force: bool = False):
         # Remove the scan_state row so the folder disappears from the sidebar
         await db.execute("DELETE FROM scan_state WHERE id=?", (folder_id,))
 
-    return {"status": "ok", "removed": result.rowcount}
+    # ── Delete derived files that will be recreated on next scan ─────────────
+    # photo_thumbs/{media_id}.jpg  — UI grid thumbnail, recreated in Phase 2
+    # previews/{stem}_{hash}.jpg   — temp preview, should already be gone but
+    #                                may be stranded if a scan was interrupted
+    # Face thumbnails (thumbnails/{face_id}.jpg) are intentionally kept:
+    # they are reused by existing face/cluster/person rows on re-scan.
+    from backend.config import settings
+
+    async with get_db() as db:
+        affected_media = await db.execute_fetchall(
+            "SELECT id, file_path FROM media_files WHERE file_path LIKE ? AND removed_from_app=1",
+            (path_prefix,),
+        )
+
+    deleted_thumbs = 0
+    deleted_previews = 0
+    for row in affected_media:
+        media_id = row["id"]
+        file_path = Path(row["file_path"])
+
+        # Photo grid thumbnail
+        photo_thumb = settings.photo_thumbs_dir / f"{media_id}.jpg"
+        if photo_thumb.exists():
+            photo_thumb.unlink(missing_ok=True)
+            deleted_thumbs += 1
+
+        # Stranded preview (name mirrors preview_extractor logic)
+        import hashlib
+        path_hash = hashlib.md5(str(file_path).encode()).hexdigest()[:8]
+        preview = settings.preview_dir / f"{file_path.stem}_{path_hash}.jpg"
+        if preview.exists():
+            preview.unlink(missing_ok=True)
+            deleted_previews += 1
+
+    if deleted_thumbs or deleted_previews:
+        logger.info(
+            "Folder %s removed: deleted %d photo thumbnails, %d stranded previews",
+            folder_path, deleted_thumbs, deleted_previews,
+        )
+
+    return {"status": "ok", "removed": result.rowcount,
+            "deleted_photo_thumbs": deleted_thumbs,
+            "deleted_previews": deleted_previews}
