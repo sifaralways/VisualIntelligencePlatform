@@ -275,7 +275,7 @@ async def _build_fields_batch(media_ids: list[int]) -> dict[int, dict]:
     for r in person_rows:
         persons_by_mid.setdefault(r["media_file_id"], []).append(r)
 
-    meta_by_mid: dict[int, dict] = {r["id"]: r for r in meta_rows}
+    meta_by_mid: dict[int, object] = {r["id"]: r for r in meta_rows}
 
     tags_by_mid: dict[int, list] = {}
     for r in tag_rows:
@@ -317,10 +317,10 @@ async def _build_fields_batch(media_ids: list[int]) -> dict[int, dict]:
             if r["bbox_x"] is not None
         ]
 
-        meta    = meta_by_mid.get(media_id, {})
-        gps_lat = meta.get("gps_lat")
-        gps_lon = meta.get("gps_lon")
-        vip_id  = meta.get("vip_id")
+        meta    = meta_by_mid.get(media_id)
+        gps_lat = meta["gps_lat"] if meta else None
+        gps_lon = meta["gps_lon"] if meta else None
+        vip_id  = meta["vip_id"]  if meta else None
 
         objects: list[str]   = []
         animals: list[str]   = []
