@@ -27,6 +27,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+# Prefixes used by VIP when writing keywords to XMP:Subject.
+# Used by the writeback engine to partition VIP-managed keywords
+# from externally-added keywords (Lightroom, Photos, etc.) during
+# merge-before-write so that external keywords are never wiped.
+VIP_SUBJECT_PREFIXES: tuple[str, ...] = ("obj:", "animal:", "geo:", "place:")
+
 
 @dataclass
 class FaceRegion:
