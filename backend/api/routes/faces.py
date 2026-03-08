@@ -5,6 +5,7 @@ from fastapi.responses import Response
 from pathlib import Path
 
 from backend.database.db import get_db
+from backend.pipeline.centroid import update_person_centroid
 
 router = APIRouter()
 
@@ -101,5 +102,11 @@ async def remove_face_from_person(face_id: int):
                 INSERT OR REPLACE INTO writeback_queue (media_file_id, status, queued_at)
                 VALUES (?, 'pending', datetime('now'))
             """, (row["media_file_id"],))
+
+        # Recompute the centroid so it no longer includes this face's embedding.
+        # Without this the stored centroid stays stale and future similarity
+        # comparisons remain biased toward the ejected face.
+        if row["person_id"]:
+            await update_person_centroid(db, row["person_id"])
 
     return {"status": "removed", "face_id": face_id}
