@@ -203,7 +203,7 @@ class ExifToolWriter:
             return True, self._format_dry_run(file_path, fields)
 
         if not file_path.exists():
-            msg = f"File not on disk (may be iCloud stub): {file_path}"
+            msg = self._diagnose_missing_file(file_path)
             logger.error(msg)
             return False, msg
 
@@ -235,6 +235,49 @@ class ExifToolWriter:
             msg = f"Unexpected write error: {e}"
             logger.error(msg)
             return False, msg
+
+    @staticmethod
+    def _diagnose_missing_file(file_path: Path) -> str:
+        """
+        Return a descriptive, actionable error message for a file that fails
+        Path.exists().  Distinguishes three common cases:
+
+        1. iCloud eviction stub — macOS stores a placeholder as
+           .filename.ext.icloud when the file is offloaded to iCloud.
+        2. Unmounted network volume — the /Volumes/<name> mount point is gone.
+        3. File missing on an accessible network volume — the mount is live but
+           the specific file cannot be found (moved / deleted on the server).
+        4. Generic missing file (local disk).
+        """
+        # Case 1 — iCloud stub
+        icloud_stub = file_path.parent / f".{file_path.name}.icloud"
+        if icloud_stub.exists():
+            return (
+                f"iCloud file not downloaded locally: {file_path.name}. "
+                "Open the file in Finder to trigger a download, or run "
+                f"'brctl download \"{file_path}\"' in Terminal, then retry writeback."
+            )
+
+        # Cases 2 & 3 — macOS /Volumes/ (SMB / AFP / NFS / external drive)
+        parts = file_path.parts
+        if len(parts) >= 3 and parts[1] == "Volumes":
+            volume_root = Path(parts[0]) / parts[1] / parts[2]
+            if not volume_root.exists():
+                return (
+                    f"Network volume not mounted: '{volume_root}'. "
+                    "Re-mount it in Finder (or via System Settings → General → "
+                    "Storage) then retry writeback. "
+                    "Tip: configure this volume as a Remote Server in VIP Admin "
+                    "to write via SSH even when not mounted locally."
+                )
+            return (
+                f"File not found on volume '{parts[2]}': {file_path.name}. "
+                "The file may have been moved, renamed, or deleted on the remote "
+                "server. Verify the file still exists at its recorded path."
+            )
+
+        # Case 4 — plain missing local file
+        return f"File not found on disk: {file_path}"
 
     def _format_dry_run(self, file_path: Path, fields: dict[str, Any]) -> str:
         lines = [f"DRY RUN — would write to: {file_path}"]

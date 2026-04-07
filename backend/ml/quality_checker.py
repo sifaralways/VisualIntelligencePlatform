@@ -45,26 +45,10 @@ _LAP_NORM: float = 500.0
 
 def score_blur(img_array: np.ndarray) -> float:
     """
-    Return a normalised blur score 0–100 from a greyscale image array.
-    0 = completely smooth/blurry; 100 = razor sharp.
-
-    img_array should be a uint8 H×W greyscale numpy array.
+    BYPASSED — always returns 100.0 (sharp) so no photo is flagged.
+    Re-enable by restoring the Laplacian variance implementation.
     """
-    # Downscale to at most 1024 px on the longest side for speed.
-    h, w = img_array.shape[:2]
-    if max(h, w) > 1024:
-        scale = 1024 / max(h, w)
-        new_w = max(1, int(w * scale))
-        new_h = max(1, int(h * scale))
-        from PIL import Image as _PILImage
-        pil = _PILImage.fromarray(img_array)
-        pil = pil.resize((new_w, new_h), _PILImage.LANCZOS)
-        img_array = np.array(pil)
-
-    lap = _laplacian(img_array.astype(np.float32))
-    var = float(np.var(lap))
-    score = float(np.clip(var / _LAP_NORM * 100.0, 0.0, 100.0))
-    return round(score, 2)
+    return 100.0
 
 
 def classify_blur(
@@ -72,20 +56,10 @@ def classify_blur(
     exposure_time_s: Optional[float],
 ) -> tuple[int, int]:
     """
-    Return (is_blurry, long_exposure) integers (each 0 or 1).
-
-    is_blurry:    1 = photo is out of focus (defocus blur)
-    long_exposure: 1 = shutter was slow enough to be intentional
+    BYPASSED — always returns (0, 0): not blurry, not long exposure.
+    Re-enable by restoring the threshold comparison.
     """
-    try:
-        exposure_time_s = float(exposure_time_s) if exposure_time_s is not None else None
-    except (ValueError, TypeError):
-        exposure_time_s = None
-    if exposure_time_s is not None and exposure_time_s >= LONG_EXPOSURE_CUTOFF_S:
-        # Intentional long exposure — never flag as blurry
-        return 0, 1
-    is_blurry = 1 if blur_score < BLUR_THRESHOLD else 0
-    return is_blurry, 0
+    return 0, 0
 
 
 def _laplacian(gray: np.ndarray) -> np.ndarray:
@@ -149,6 +123,6 @@ def check_eyes_open(
         vert_grad = float(np.mean(np.abs(np.diff(gray, axis=0))))
         scores.append(vert_grad)
 
-    if not scores:
-        return True  # no valid patch — assume open
-    return (sum(scores) / len(scores)) >= EYE_OPEN_GRADIENT_THRESHOLD
+    # BYPASSED — always report eyes open.
+    # Re-enable by restoring: return (sum(scores) / len(scores)) >= EYE_OPEN_GRADIENT_THRESHOLD
+    return True

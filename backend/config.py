@@ -158,13 +158,15 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     # Tagging models (Phase 4)
     # -------------------------------------------------------------------------
-    # yolo11s (21 MB) → yolo11m (40 MB): the medium model has significantly
-    # better precision on ambiguous detections; false positives drop sharply.
-    yolo_model: str = "yolo11m.pt"
-    # Raise from 0.40 → 0.50: eliminates most hallucinated detections that
-    # come from the small model's uncertainty at the decision boundary.
-    yolo_conf_threshold: float = 0.50    # YOLOv11 minimum detection confidence
-    landmark_threshold: float = 0.26     # CLIP minimum cosine similarity for landmarks
+    # yolov8n-oiv7.pt: Open Images V7, 600 object classes (vs COCO 80).
+    # Auto-downloads from Ultralytics Hub on first start (~6 MB).
+    # Override: VIP_YOLO_MODEL=yolov8s-oiv7.pt for higher accuracy.
+    yolo_model: str = "yolov8n-oiv7.pt"
+    yolo_conf_threshold: float = 0.50    # YOLO minimum detection confidence
+    # Landmark threshold:
+    #   CLIP ViT-L/14 (default): cosine similarity — 0.28 is a good starting point.
+    #   GLDv2 EfficientNet (if configured via env vars): softmax probability — use 0.05-0.15.
+    landmark_threshold: float = 0.28     # CLIP cosine-sim / GLDv2 softmax probability
     species_threshold: float = 0.30      # BioCLIP minimum cosine similarity for species
     places365_top_k: int = 5             # Places365 top-k scenes to evaluate
 

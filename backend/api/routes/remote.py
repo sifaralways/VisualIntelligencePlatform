@@ -325,12 +325,26 @@ async def check_write_access(server_id: int, body: dict = None) -> dict[str, Any
     check_path = (body or {}).get("path") or srv["remote_path_prefix"]
     safe = shlex.quote(check_path)
 
-    # Single compound command: test existence, readability, writability, and stat.
+    # Use a real I/O probe rather than [ -r ] / [ -w ] shell tests.
+    # macOS TCC blocks open() but NOT access()/faccessat(), so shell tests
+    # give false positives when sshd lacks Full Disk Access.
+    #
+    # For a directory: attempt to list it (dd read) and create+delete a temp file.
+    # For a file: attempt to read one byte and write its metadata via touch.
     probe = (
-        f"if [ ! -e {safe} ]; then echo notfound; "
-        f"elif [ ! -r {safe} ]; then echo noperm_read; "
-        f"elif [ ! -w {safe} ]; then echo noperm_write; "
-        f"else echo writable; fi; "
+        # Existence check
+        f"if [ ! -e {safe} ]; then echo notfound; exit 0; fi; "
+        # Determine if target is a file or directory
+        f"if [ -d {safe} ]; then "
+        #   Directory: real read = ls can list it (open+getdents), real write = touch a temp file
+        f"  ls {safe} > /dev/null 2>&1 || {{ echo noperm_read; exit 0; }}; "
+        f"  _t={safe}/.vip_write_probe_$$; "
+        f"  touch \"$_t\" 2>/dev/null && rm -f \"$_t\" && echo writable || echo noperm_write; "
+        f"else "
+        #   File: real read = dd reads 1 byte, real write = touch -m sets mtime
+        f"  dd if={safe} of=/dev/null bs=1 count=1 2>/dev/null || {{ echo noperm_read; exit 0; }}; "
+        f"  touch -m {safe} 2>/dev/null && echo writable || echo noperm_write; "
+        f"fi; "
         f"stat {safe} 2>&1 | head -5"
     )
     cmd = _ssh_base_args(srv["host"], srv["port"], srv["user"], srv["ssh_key_path"]) + [
@@ -347,8 +361,11 @@ async def check_write_access(server_id: int, body: dict = None) -> dict[str, Any
 
     messages = {
         "writable":      f"\u2705 Path is readable and writable: {check_path}",
-        "noperm_write":  f"\u274c Path exists and is readable but NOT writable (read-only mount or permissions): {check_path}",
-        "noperm_read":   f"\u274c Path exists but is NOT readable (permissions issue): {check_path}",
+        "noperm_write":  f"\u274c Path exists and is readable but NOT writable. "
+                         f"On macOS this usually means sshd lacks Full Disk Access — "
+                         f"grant it in System Settings \u2192 Privacy & Security \u2192 Full Disk Access: {check_path}",
+        "noperm_read":   f"\u274c Path exists but is NOT readable. "
+                         f"On macOS grant Full Disk Access to /usr/sbin/sshd in System Settings: {check_path}",
         "notfound":      f"\u274c Path does not exist on remote: {check_path}",
     }
     return {

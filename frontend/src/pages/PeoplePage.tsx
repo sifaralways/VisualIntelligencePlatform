@@ -1142,7 +1142,7 @@ export default function PeoplePage({ onSelectPerson }: Props) {
             </label>
             <div className="flex items-center gap-3 mb-2">
               <input
-                type="range" min={60} max={99} step={1}
+                type="range" min={50} max={99} step={1}
                 value={Math.round(findSimilarThreshold * 100)}
                 onChange={e => setFindSimilarThreshold(Number(e.target.value) / 100)}
                 className="flex-1 accent-indigo-500"
@@ -1152,7 +1152,7 @@ export default function PeoplePage({ onSelectPerson }: Props) {
               </span>
             </div>
             <p className="text-xs text-gray-600 mb-6">
-              Matches between 55% and {Math.round(findSimilarThreshold * 100)}% will be shown for manual review.
+              Matches between 50% and {Math.round(findSimilarThreshold * 100)}% will be shown for manual review.
             </p>
 
             <div className="flex gap-3">

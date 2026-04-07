@@ -14,7 +14,7 @@ from backend.database.models import Person
 from backend.pipeline.centroid import update_person_centroid
 
 # Minimum cosine similarity to surface a merge suggestion
-_SUGGEST_THRESHOLD = 0.55
+_SUGGEST_THRESHOLD = 0.50
 
 router = APIRouter()
 

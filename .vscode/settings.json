@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "xxd": true,
+        ".venv/bin/python": true,
+        "sqlite3": true,
+        "exiftool": true
+    }
+}

@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -61,6 +63,34 @@ def _translate_path(file_path_str: str, server: dict) -> str:
     local_prefix  = server["local_path_prefix"]
     remote_prefix = server["remote_path_prefix"]
     return remote_prefix + file_path_str[len(local_prefix):]
+
+
+def _try_icloud_download(file_path: Path, timeout_sec: int = 60) -> bool:
+    """
+    Trigger iCloud download for an evicted stub file and wait for it to
+    become locally available.
+
+    Uses the macOS ``brctl download`` command to request the file from iCloud,
+    then polls ``Path.exists()`` every 2 seconds until the file appears or
+    *timeout_sec* is exceeded.
+
+    Returns True when the file is accessible, False on timeout.
+    """
+    try:
+        subprocess.run(
+            ["brctl", "download", str(file_path)],
+            capture_output=True,
+            timeout=10,
+        )
+    except Exception as exc:
+        logger.debug("brctl download request failed for %s: %s", file_path.name, exc)
+
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        if file_path.exists():
+            return True
+        time.sleep(2)
+    return False
 
 
 def _merge_with_existing_xmp(
@@ -272,6 +302,51 @@ async def execute_writes(queue_ids: list[int] | None = None) -> dict:
                     logger.info("No fields to write for media_id=%d, skipping", media_id)
                     results.append((queue_id, media_id, True, "skipped"))
                     continue
+
+                # If the file is an iCloud eviction stub, try to trigger a
+                # download before handing it to ExifTool.  This avoids the
+                # common "not on disk" failure for Photos that were offloaded
+                # to iCloud while still indexed in VIP.
+                if not file_path.exists():
+                    icloud_stub = file_path.parent / f".{file_path.name}.icloud"
+                    if icloud_stub.exists():
+                        logger.info(
+                            "iCloud stub detected for %s — triggering download "
+                            "(timeout 60 s)", file_path.name,
+                        )
+                        if _try_icloud_download(file_path):
+                            logger.info(
+                                "iCloud download complete for %s", file_path.name
+                            )
+                        else:
+                            msg = (
+                                f"iCloud file did not download within 60 s: "
+                                f"{file_path.name}. Open the file in Finder first, "
+                                "then retry writeback."
+                            )
+                            logger.warning(msg)
+                            results.append((queue_id, media_id, False, msg))
+                            continue
+                    elif len(file_path.parts) >= 3 and file_path.parts[1] == "Volumes":
+                        # Mounted network volume — file is missing or volume is
+                        # not connected.  Emit a targeted warning so the user
+                        # knows this is a network-access issue, not a local one.
+                        volume_root = Path(
+                            file_path.parts[0], file_path.parts[1], file_path.parts[2]
+                        )
+                        if not volume_root.exists():
+                            logger.warning(
+                                "Skipping %s — network volume not mounted: %s. "
+                                "Re-mount the volume then retry, or configure it as a "
+                                "Remote Server in Admin to write via SSH.",
+                                file_path.name, volume_root,
+                            )
+                        else:
+                            logger.warning(
+                                "Skipping %s — file not found on volume '%s'. "
+                                "It may have been moved or deleted on the remote server.",
+                                file_path.name, file_path.parts[2],
+                            )
 
                 existing = existing_xmp.get(str(file_path), {})
                 fields = _merge_with_existing_xmp(vip_fields, existing, all_vip_names)
@@ -626,12 +701,29 @@ async def write_single_file(media_file_id: int) -> dict:
 
     if row is None:
         raise ValueError(f"Media file {media_file_id} not found")
-    if row["is_stub"]:
-        raise ValueError("File is an iCloud stub — download it first then retry")
 
     file_path = Path(row["file_path"])
+
+    # iCloud stub: either the DB flag is set, or there is a filesystem
+    # placeholder next to the expected path.  Attempt to trigger a download
+    # before giving up — this recovers the common "file evicted to iCloud"
+    # case without requiring manual intervention from the user.
+    icloud_stub = file_path.parent / f".{file_path.name}.icloud"
+    if row["is_stub"] or (not file_path.exists() and icloud_stub.exists()):
+        logger.info(
+            "write_single_file: iCloud stub detected for %s — triggering download",
+            file_path.name,
+        )
+        loop = asyncio.get_event_loop()
+        available = await loop.run_in_executor(None, _try_icloud_download, file_path)
+        if not available:
+            raise ValueError(
+                f"iCloud file did not download within 60 s: {file_path.name}. "
+                "Open the file in Finder first, then retry."
+            )
+
     if not file_path.exists():
-        raise ValueError(f"File not found on disk: {file_path.name}")
+        raise ValueError(ExifToolWriter._diagnose_missing_file(file_path))
 
     fields = await _build_fields_for_file(media_file_id)
     if not fields:

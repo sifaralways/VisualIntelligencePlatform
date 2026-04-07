@@ -1,16 +1,15 @@
-"""
-VIP ML — Object and animal detection via YOLOv11.
+"""VIP ML — Object and animal detection via YOLOv8 Open Images V7.
 
-Model: Ultralytics YOLOv11 small (yolo11s.pt, ~21MB)
-       Trained on COCO 80 classes
+Model: Ultralytics YOLOv8n-OIV7 (yolov8n-oiv7.pt, ~6 MB)
+       Trained on Open Images V7 — 600 object classes (vs COCO 80).
+       Auto-downloads to ~/.cache/ultralytics/ on first use.
 Backend: Apple Silicon MPS via PyTorch
 
 Outputs two lists:
-  objects  — non-person, non-animal detections  (Car, TV, Laptop …)
+  objects  — non-person, non-animal detections  (Car, Television, Laptop …)
   animals  — animal detections                  (Dog, Cat, Bird …)
 
-COCO animal class names (indices 14–23):
-  bird, cat, dog, horse, sheep, cow, elephant, bear, zebra, giraffe
+OIV7 uses Title Case class names (unlike COCO which uses lowercase).
 """
 
 from __future__ import annotations
@@ -24,14 +23,29 @@ from backend.database.settings_store import get as get_setting
 
 logger = logging.getLogger(__name__)
 
-# COCO classes that are animals — routed to the "animal" category
+# OIV7 classes that are animals — routed to the "animal" category.
+# OIV7 uses Title Case (unlike COCO's lowercase).
 _ANIMAL_CLASSES = frozenset({
-    "bird", "cat", "dog", "horse", "sheep",
-    "cow", "elephant", "bear", "zebra", "giraffe",
+    # Common pets & farm animals
+    "Bird", "Cat", "Dog", "Horse", "Sheep", "Cattle", "Goat", "Pig",
+    "Rabbit", "Hamster",
+    # Wild mammals
+    "Elephant", "Bear", "Zebra", "Giraffe", "Lion", "Tiger",
+    "Leopard", "Jaguar", "Cheetah", "Fox", "Deer", "Squirrel",
+    "Monkey", "Gorilla", "Panda", "Kangaroo", "Koala", "Raccoon",
+    "Otter", "Hedgehog", "Mule", "Camel",
+    # Aquatic / marine
+    "Whale", "Dolphin", "Shark", "Fish", "Seahorse", "Turtle",
+    "Crab", "Lobster", "Starfish",
+    # Birds (sub-types)
+    "Duck", "Owl", "Eagle", "Penguin", "Ostrich", "Parrot",
+    # Reptiles & insects
+    "Snake", "Lizard", "Crocodile", "Butterfly", "Bee", "Beetle", "Insect",
 })
 
 # Classes we don't want in output (detected but uninformative)
-_SKIP_CLASSES = frozenset({"person"})
+# OIV7 uses Title Case.
+_SKIP_CLASSES = frozenset({"Person", "Human body", "Human face", "Human hand", "Human leg", "Human arm", "Human foot", "Human hair"})
 
 
 @dataclass
@@ -60,10 +74,22 @@ class ObjectDetector:
             self._device = "mps" if torch.backends.mps.is_available() else "cpu"
             logger.info("Loading %s (device=%s) …", settings.yolo_model, self._device)
             # Model auto-downloads to ~/.cache/ultralytics/ on first use.
-            # Default: yolo11m.pt — medium model balances accuracy vs speed.
-            # Change VIP_YOLO_MODEL=yolo11l.pt for highest accuracy.
+            # Default: yolov8n-oiv7.pt — Open Images V7, 600 classes.
+            # Override with VIP_YOLO_MODEL env var.
             self._model = YOLO(settings.yolo_model)
-            logger.info("✅  %s ready", settings.yolo_model)
+
+            # Warmup: run one dummy inference so that the predictor is fully
+            # initialised (including Conv+BN fusion) before any concurrent
+            # detect_batch() calls can race on the unfused model layers.
+            # Without this, concurrent Phase-4 threads hit a TOCTOU race in
+            # ultralytics' fuse() loop: one thread's hasattr(m, 'bn') returns
+            # True just before another thread's delattr(m, 'bn') runs, causing
+            # "AttributeError: 'Conv' object has no attribute 'bn'".
+            import numpy as np
+            _dummy = np.zeros((8, 8, 3), dtype=np.uint8)
+            self._model(_dummy, device=self._device, verbose=False)
+
+            logger.info("✅  %s ready (%d classes)", settings.yolo_model, len(self._model.names))
         except ImportError as e:
             logger.warning("YOLOv11 unavailable — install ultralytics: %s", e)
         except Exception as e:

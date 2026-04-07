@@ -87,10 +87,10 @@ def build_field_map(
         all_keywords.extend(person_names)
 
     if face_regions:
-        # XMP-mwg-rs:RegionInfoRegionList is the correct ExifTool tag for MWG
-        # face region structs.  XMP-mwg-rs:Regions is not a recognised tag and
-        # produces a "not defined" warning while silently skipping the write.
-        fields["XMP-mwg-rs:RegionInfoRegionList"] = _build_mwg_regions(face_regions)
+        # XMP-mwg-rs:RegionList is the correct writable ExifTool 13.x tag for
+        # MWG face region structs.  RegionInfoRegionList is not recognised and
+        # produces a "not defined" warning; RegionInfoRegions is read-only.
+        fields["XMP-mwg-rs:RegionList"] = _build_mwg_regions(face_regions)
 
     # ── Object ──────────────────────────────────────────────────────────────
     if objects:
