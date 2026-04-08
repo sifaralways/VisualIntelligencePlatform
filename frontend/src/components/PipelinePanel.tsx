@@ -88,6 +88,23 @@ export default function PipelinePanel({ collapsed, onToggle, onPipelineComplete 
     }
   }
 
+  async function migrateModel() {
+    if (!window.confirm(
+      'This will re-embed all named faces with the new AI model and re-cluster all unnamed faces.\n\n' +
+      'Named person assignments are preserved.\n\n' +
+      'Only run this after restarting the server with the new model configured.\n\nContinue?'
+    )) return
+    setEvents([])
+    setStatus('running')
+    try {
+      await api.pipeline.migrateModel()
+    } catch (e: unknown) {
+      const err = e as { message?: string }
+      setStatus('error')
+      setEvents([{ event: 'error', message: err?.message ?? 'Model migration failed' }])
+    }
+  }
+
   const isRunning = status === 'running'
 
   // ── Collapsed strip ───────────────────────────────────────────────────────
@@ -158,6 +175,15 @@ export default function PipelinePanel({ collapsed, onToggle, onPipelineComplete 
             Rescan All
           </button>
         </div>
+
+        <button
+          onClick={migrateModel}
+          disabled={isRunning}
+          className="w-full bg-orange-800 hover:bg-orange-700 disabled:opacity-40 text-white text-xs font-medium rounded-lg px-2 py-1.5 transition-colors"
+          title="Re-embed all named faces with the current model and re-cluster unnamed faces"
+        >
+          Migrate AI Model
+        </button>
 
         {/* Force retag option */}
         <label className="flex items-start gap-2 cursor-pointer select-none">

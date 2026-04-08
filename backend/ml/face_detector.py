@@ -200,6 +200,37 @@ class FaceDetector:
             return self._run_session(self._app_accurate, img, img_w, img_h, image_path)
 
 
+    # ── Embedding from pre-loaded array (used by model migration) ───────────
+
+    def embed_from_array(self, img_arr: np.ndarray) -> "np.ndarray | None":
+        """
+        Extract a 512-D ArcFace embedding from a pre-loaded RGB numpy array.
+
+        Used by run_model_migration() to re-embed named faces from their saved
+        200×200 thumbnail JPEGs using the newly-loaded model.  Does not apply
+        the min_face_size or detection_threshold filters — the input is already
+        a face crop so any detected face is accepted.
+
+        Returns the L2-normalised embedding as float32, or None on failure.
+        """
+        app = self._app_accurate or self._app_fast
+        if app is None:
+            logger.error("embed_from_array: no detector session loaded — call load() first")
+            return None
+        try:
+            raw_faces = app.get(img_arr)
+            if not raw_faces:
+                return None
+            best = max(raw_faces, key=lambda f: f.det_score)
+            emb = getattr(best, "normed_embedding", None)
+            if emb is None:
+                return None
+            return emb.astype(np.float32)
+        except Exception as exc:
+            logger.error("embed_from_array failed: %s", exc)
+            return None
+
+
     # ── Intelligent mode ────────────────────────────────────────────────────
 
     def _detect_intelligent(

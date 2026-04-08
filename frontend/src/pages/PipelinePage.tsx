@@ -53,6 +53,22 @@ export default function PipelinePage() {
     }
   }
 
+  async function migrateModel() {
+    if (!window.confirm(
+      'This will re-embed all named faces with the new AI model and re-cluster all unnamed faces.\n\n' +
+      'Named person assignments are preserved.\n\n' +
+      'Only run this after restarting the server with the new model configured.\n\nContinue?'
+    )) return
+    setEvents([])
+    setStatus('running')
+    try {
+      await api.pipeline.migrateModel()
+    } catch (e: any) {
+      setStatus('error')
+      setEvents([{ event: 'error', message: e.message ?? 'Model migration failed' }])
+    }
+  }
+
   async function refreshStatus() {
     const s = await api.pipeline.status()
     setStatus(s.status)
@@ -100,6 +116,21 @@ export default function PipelinePage() {
           className="shrink-0 bg-yellow-700 hover:bg-yellow-600 disabled:opacity-40 text-white rounded-lg px-4 py-2 text-sm font-medium"
         >
           Rescan All
+        </button>
+      </div>
+
+      {/* Model migration — run once after switching to a new AI model */}
+      <div className="mb-4 p-3 bg-gray-900 border border-orange-900 rounded-lg flex items-center justify-between gap-4">
+        <div>
+          <p className="text-sm text-orange-300 font-medium">Migrate to New AI Model</p>
+          <p className="text-xs text-gray-500">Re-embeds named faces with the current model, recomputes face clusters. Run once after switching models and restarting the server.</p>
+        </div>
+        <button
+          onClick={migrateModel}
+          disabled={status === 'running'}
+          className="shrink-0 bg-orange-700 hover:bg-orange-600 disabled:opacity-40 text-white rounded-lg px-4 py-2 text-sm font-medium"
+        >
+          Migrate Model
         </button>
       </div>
 

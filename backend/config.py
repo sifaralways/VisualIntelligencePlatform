@@ -85,7 +85,7 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     # InsightFace / ML
     # -------------------------------------------------------------------------
-    insightface_model: str = "buffalo_l"
+    insightface_model: str = "antelopev2"
     embedding_dim: int = 512
     # Raise from 0.5 → 0.6: filter borderline face detections that degrade
     # gender/age accuracy and pollute clusters with unreliable embeddings.

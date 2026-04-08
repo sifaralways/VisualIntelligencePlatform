@@ -138,3 +138,31 @@ async def _run_reprocess(force_retag: bool = False) -> None:
         logger.exception("Reprocess error")
         _pipeline_state["status"] = "error"
         _pipeline_state["error"] = str(e)
+
+
+@router.post("/migrate_model")
+async def migrate_model(background_tasks: BackgroundTasks):
+    """
+    Re-embed all named faces with the currently configured model, recompute
+    centroids, clear unnamed faces and re-cluster.
+
+    Must be run after changing insightface_model in config and restarting
+    the server.  Named person assignments are preserved.
+    """
+    if _pipeline_state["status"] == "running":
+        raise HTTPException(status_code=409, detail="Pipeline already running")
+
+    _pipeline_state.update({"status": "running", "folder": "[model migration]", "error": None})
+    background_tasks.add_task(_run_model_migration)
+    return {"status": "started"}
+
+
+async def _run_model_migration() -> None:
+    from backend.pipeline.ingest import run_model_migration
+    try:
+        await run_model_migration()
+        _pipeline_state["status"] = "idle"
+    except Exception as e:
+        logger.exception("Model migration error")
+        _pipeline_state["status"] = "error"
+        _pipeline_state["error"] = str(e)

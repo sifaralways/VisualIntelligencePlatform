@@ -27,6 +27,8 @@ export const api = {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ force_retag: forceRetag }),
       }),
+    migrateModel: () =>
+      request<{ status: string }>('/pipeline/migrate_model', { method: 'POST' }),
     status: () => request<{ status: string; folder: string | null; error: string | null }>('/pipeline/status'),
   },
 

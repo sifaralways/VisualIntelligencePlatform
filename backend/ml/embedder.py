@@ -24,7 +24,7 @@ from backend.config import settings
 
 logger = logging.getLogger(__name__)
 
-MODEL_VERSION = "buffalo_l_v1"  # stored in DB — allows future model migrations
+MODEL_VERSION = "antelopev2_v1"  # stored in DB — allows future model migrations
 
 
 class FaceEmbedder:

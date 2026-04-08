@@ -273,6 +273,198 @@ async def run_reprocess(force_retag: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Model migration entry point
+# ---------------------------------------------------------------------------
+async def run_model_migration() -> None:
+    """
+    Re-embed all faces under the currently configured model and re-cluster.
+
+    Must be triggered AFTER changing insightface_model in config.py and
+    restarting the server so the new model files are loaded.
+
+    Steps:
+      1. Force-reload the detector with the current model config.
+      2. Re-embed every named face from its saved 200×200 thumbnail JPEG
+         using the new model.  Embeddings that cannot be re-embedded are
+         dropped to prevent vector-space mixing.
+      3. Recompute persisted centroids for all named persons.
+      4. Clear all unnamed face embeddings, face rows, and clusters.
+      5. Reset unnamed-only files to 'scanned' for fresh re-detection.
+      6. Re-run embed → cluster → auto-merge → name-restore pipeline.
+
+    Named person assignments are preserved throughout.
+    Note: unnamed faces in files that also contain named faces will be
+    absent from results until the next full folder scan (Run Scan).
+    """
+    from backend.pipeline.centroid import update_person_centroid
+
+    logger.info("=== Model migration start ===")
+    await broadcast("pipeline_start", folder="[model migration]")
+    await settings_store.load_cache()
+
+    # Force-reload the detector so it picks up the new insightface_model
+    # from config — even if it was already loaded with the old model in
+    # this process.
+    global _models_loaded
+    _models_loaded = False
+    _detector._loaded_mode = None
+    _ensure_models()
+
+    # ------------------------------------------------------------------
+    # Step 1: Re-embed named faces from saved thumbnails
+    # ------------------------------------------------------------------
+    await broadcast("phase_start", phase="migrate_named_faces")
+
+    async with get_db() as db:
+        named_face_rows = await db.execute_fetchall("""
+            SELECT f.id AS face_id, f.thumbnail_path
+            FROM faces f
+            JOIN persons p ON p.id = f.person_id
+            WHERE p.name IS NOT NULL AND p.is_ignored = 0
+              AND EXISTS (SELECT 1 FROM embeddings e WHERE e.face_id = f.id)
+        """)
+
+    loop = asyncio.get_event_loop()
+    remigrated = 0
+    failed_ids: list[int] = []
+
+    for row in named_face_rows:
+        face_id   = row["face_id"]
+        thumb_str = row["thumbnail_path"]
+
+        if not thumb_str or not Path(thumb_str).exists():
+            logger.warning(
+                "Migration: no thumbnail for named face %d — embedding dropped", face_id
+            )
+            failed_ids.append(face_id)
+            continue
+
+        try:
+            img_arr = await loop.run_in_executor(
+                None,
+                lambda p=thumb_str: np.array(_PILImage.open(p).convert("RGB")),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Migration: cannot open thumbnail for face %d: %s — embedding dropped",
+                face_id, exc,
+            )
+            failed_ids.append(face_id)
+            continue
+
+        vector = await loop.run_in_executor(None, _detector.embed_from_array, img_arr)
+
+        if vector is None:
+            logger.warning(
+                "Migration: no embedding from thumbnail for face %d — embedding dropped",
+                face_id,
+            )
+            failed_ids.append(face_id)
+            continue
+
+        async with get_db() as db:
+            await db.execute(
+                "UPDATE embeddings SET vector=?, model_version=? WHERE face_id=?",
+                (_embedder.vector_to_bytes(vector), _embedder.model_version, face_id),
+            )
+        remigrated += 1
+
+    # Delete embeddings that could not be re-embedded so no buffalo_l
+    # vectors remain mixed in with the new model's vectors.
+    if failed_ids:
+        async with get_db() as db:
+            ph = ",".join("?" * len(failed_ids))
+            await db.execute(
+                f"DELETE FROM embeddings WHERE face_id IN ({ph})", failed_ids
+            )
+        logger.warning(
+            "Migration: dropped %d named-face embedding(s) that could not be re-embedded",
+            len(failed_ids),
+        )
+
+    logger.info(
+        "Migration step 1: %d named face(s) re-embedded, %d dropped",
+        remigrated, len(failed_ids),
+    )
+    await broadcast("phase_complete", phase="migrate_named_faces", count=remigrated)
+
+    # ------------------------------------------------------------------
+    # Step 2: Recompute persisted centroids for all named persons
+    # ------------------------------------------------------------------
+    await broadcast("phase_start", phase="recompute_centroids")
+
+    async with get_db() as db:
+        named_persons = await db.execute_fetchall(
+            "SELECT id FROM persons WHERE name IS NOT NULL AND is_ignored = 0 AND is_merged = 0"
+        )
+        for p in named_persons:
+            await update_person_centroid(db, p["id"])
+
+    logger.info(
+        "Migration step 2: centroids recomputed for %d named person(s)", len(named_persons)
+    )
+    await broadcast("phase_complete", phase="recompute_centroids")
+
+    # ------------------------------------------------------------------
+    # Step 3: Clear all unnamed faces, their embeddings, and clusters
+    #
+    # Unlike run_reprocess(), we clear unnamed faces from ALL files
+    # (including mixed files) so no old-model vectors remain in the
+    # cluster pool.  Unnamed faces in mixed files will be re-detected
+    # on the next full folder scan.
+    # ------------------------------------------------------------------
+    await broadcast("phase_start", phase="redetect_prep")
+
+    async with get_db() as db:
+        # 3a. Drop embeddings for every face with no named-person assignment
+        await db.execute("""
+            DELETE FROM embeddings
+            WHERE face_id IN (
+                SELECT f.id FROM faces f WHERE f.person_id IS NULL
+            )
+        """)
+
+        # 3b. Drop the face rows themselves
+        await db.execute("DELETE FROM faces WHERE person_id IS NULL")
+
+        # 3c. Reset files that have no named faces → 'scanned' for re-detection
+        await db.execute("""
+            UPDATE media_files SET ingest_state = 'scanned'
+            WHERE is_stub = 0
+              AND id NOT IN (
+                  SELECT DISTINCT f.media_file_id FROM faces f
+                  JOIN persons p ON p.id = f.person_id
+                  WHERE p.name IS NOT NULL AND p.is_ignored = 0
+              )
+        """)
+
+    await broadcast("phase_complete", phase="redetect_prep")
+
+    # ------------------------------------------------------------------
+    # Step 4: Re-detect + embed → cluster → auto-merge → name-restore
+    # ------------------------------------------------------------------
+    await _phase_embed()
+    await _phase_cluster()
+    await _phase_auto_merge()
+    await _phase_restore_vip_names()
+
+    # Sync denormalised photo_count on all active persons
+    async with get_db() as db:
+        await db.execute("""
+            UPDATE persons
+            SET photo_count = (
+                SELECT COUNT(DISTINCT f.media_file_id)
+                FROM faces f
+                WHERE f.person_id = persons.id
+            )
+            WHERE is_merged = 0
+        """)
+
+    await broadcast("pipeline_complete", folder="[model migration]")
+    logger.info("=== Model migration complete ===")
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline entry point
 # ---------------------------------------------------------------------------
 async def run_ingest(folder: str) -> None:
