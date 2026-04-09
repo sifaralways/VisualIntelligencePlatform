@@ -140,6 +140,39 @@ async def _run_reprocess(force_retag: bool = False) -> None:
         _pipeline_state["error"] = str(e)
 
 
+@router.post("/reprocess/{media_id}")
+async def reprocess_photo(media_id: int, background_tasks: BackgroundTasks):
+    """
+    Re-detect faces in a single photo.
+
+    Clears unowned face data for the photo, resets it to 'scanned', then
+    runs the embed → cluster → auto-merge → name-restore phases.  Useful
+    when a face was missed on the initial scan.  Named-person assignments
+    for this photo are preserved.
+    """
+    if _pipeline_state["status"] == "running":
+        raise HTTPException(status_code=409, detail="Pipeline already running")
+
+    _pipeline_state.update({
+        "status": "running",
+        "folder": f"[reprocess photo {media_id}]",
+        "error": None,
+    })
+    background_tasks.add_task(_run_single_reprocess, media_id)
+    return {"status": "started", "media_id": media_id}
+
+
+async def _run_single_reprocess(media_id: int) -> None:
+    from backend.pipeline.ingest import run_single_reprocess
+    try:
+        await run_single_reprocess(media_id)
+        _pipeline_state["status"] = "idle"
+    except Exception as e:
+        logger.exception("Single-photo reprocess error for media_id=%d", media_id)
+        _pipeline_state["status"] = "error"
+        _pipeline_state["error"] = str(e)
+
+
 @router.post("/migrate_model")
 async def migrate_model(background_tasks: BackgroundTasks):
     """

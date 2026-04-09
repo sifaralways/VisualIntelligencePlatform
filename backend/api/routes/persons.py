@@ -212,6 +212,65 @@ async def ignore_cluster(cluster_id: int):
     return {"status": "ignored", "cluster_id": cluster_id, "person_id": person_id}
 
 
+@router.get("/ignored")
+async def list_ignored_persons():
+    """
+    Return all always-ignored persons.
+
+    Each entry has a representative face thumbnail so the user can see
+    which face they previously chose to hide.
+    """
+    async with get_db() as db:
+        rows = await db.execute_fetchall("""
+            SELECT p.id, p.uuid, p.created_at,
+                   COUNT(DISTINCT f.media_file_id) AS photo_count,
+                   COUNT(DISTINCT c.id)            AS cluster_count,
+                   MIN(f.thumbnail_path)           AS representative_thumbnail
+            FROM persons p
+            LEFT JOIN clusters c ON c.person_id = p.id
+            LEFT JOIN faces f ON f.person_id = p.id
+            WHERE p.is_ignored = 1 AND p.is_merged = 0
+            GROUP BY p.id
+            ORDER BY photo_count DESC
+        """)
+    return [dict(r) for r in rows]
+
+
+@router.post("/{person_id}/unignore")
+async def unignore_person(person_id: int):
+    """
+    Restore an always-ignored person back to the unnamed cluster pool.
+
+    Detaches all clusters and faces from the ignored person record, then
+    deletes it.  The freed clusters immediately appear in the Unnamed Faces
+    tab and will be re-evaluated normally on the next pipeline run.
+    """
+    async with get_db() as db:
+        row = await (
+            await db.execute(
+                "SELECT id FROM persons WHERE id=? AND is_ignored=1 AND is_merged=0",
+                (person_id,),
+            )
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Ignored person not found.")
+
+        # Detach faces → they go back to unowned pool
+        await db.execute(
+            "UPDATE faces SET person_id=NULL WHERE person_id=?", (person_id,)
+        )
+        # Detach clusters → they return to the unnamed cluster list
+        await db.execute(
+            "UPDATE clusters SET person_id=NULL WHERE person_id=?", (person_id,)
+        )
+        # Remove the hidden person record
+        await db.execute(
+            "DELETE FROM persons WHERE id=? AND is_ignored=1", (person_id,)
+        )
+
+    return {"status": "restored", "person_id": person_id}
+
+
 @router.patch("/{person_id}/name")
 async def name_person(person_id: int, req: NamePersonRequest):
     """Assign or update the name of a person."""

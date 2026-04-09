@@ -273,6 +273,82 @@ async def run_reprocess(force_retag: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Single-photo reprocess entry point
+# ---------------------------------------------------------------------------
+async def run_single_reprocess(media_id: int) -> None:
+    """
+    Re-detect faces in a single photo without scanning the full library.
+
+    Steps:
+      1. Delete unowned face embeddings and face rows for this photo.
+         Named-person assignments are preserved.
+      2. Reset this photo's ingest_state to 'scanned'.
+      3. Re-run _phase_embed (with force bypass of the idempotency guard),
+         _phase_cluster, _phase_auto_merge, and _phase_restore_vip_names.
+
+    Useful when a face covering ≥30% of the frame was missed on the initial
+    scan — triggering this avoids a full-library reprocess.
+    """
+    logger.info("=== Single-photo reprocess: media_id=%d ===", media_id)
+    await broadcast("pipeline_start", folder=f"[reprocess photo {media_id}]")
+    await settings_store.load_cache()
+    _ensure_models()
+
+    async with get_db() as db:
+        row = await (
+            await db.execute(
+                "SELECT id, file_path, is_stub FROM media_files "
+                "WHERE id=? AND removed_from_app=0",
+                (media_id,),
+            )
+        ).fetchone()
+
+    if not row:
+        logger.error("Single reprocess: media_id=%d not found or removed", media_id)
+        await broadcast("pipeline_complete", folder=f"[reprocess photo {media_id}]")
+        return
+
+    if row["is_stub"]:
+        logger.warning(
+            "Single reprocess: media_id=%d is an iCloud stub — skipping", media_id
+        )
+        await broadcast("pipeline_complete", folder=f"[reprocess photo {media_id}]")
+        return
+
+    async with get_db() as db:
+        # Drop embeddings for unowned faces on this file only
+        await db.execute("""
+            DELETE FROM embeddings
+            WHERE face_id IN (
+                SELECT id FROM faces
+                WHERE media_file_id = ? AND person_id IS NULL
+            )
+        """, (media_id,))
+        # Drop the unowned face rows
+        await db.execute(
+            "DELETE FROM faces WHERE media_file_id = ? AND person_id IS NULL",
+            (media_id,),
+        )
+        # Reset state so _phase_embed picks this file up
+        await db.execute(
+            "UPDATE media_files SET ingest_state = 'scanned' WHERE id = ?",
+            (media_id,),
+        )
+
+    logger.info("Single reprocess: cleared unowned faces for media_id=%d", media_id)
+
+    # Run with force_ids so the skip guard is bypassed even if named-person
+    # embeddings remain on this file (they keep their person assignments).
+    await _phase_embed(force_ids={media_id})
+    await _phase_cluster()
+    await _phase_auto_merge()
+    await _phase_restore_vip_names()
+
+    await broadcast("pipeline_complete", folder=f"[reprocess photo {media_id}]")
+    logger.info("=== Single-photo reprocess complete: media_id=%d ===", media_id)
+
+
+# ---------------------------------------------------------------------------
 # Model migration entry point
 # ---------------------------------------------------------------------------
 async def run_model_migration() -> None:
@@ -720,8 +796,15 @@ def _make_photo_thumb(src: Path, media_id: int) -> Path | None:
         return None
 
 
-async def _phase_embed() -> None:
-    logger.info("Phase 2: Embedding faces")
+async def _phase_embed(force_ids: set[int] | None = None) -> None:
+    """
+    Detect and embed faces in all 'scanned' files.
+
+    force_ids: when provided, bypass the idempotency skip-guard for these
+    specific media IDs.  Used by run_single_reprocess so that a file whose
+    named-person embeddings were deliberately kept can be fully re-detected.
+    """
+    logger.info("Phase 2: Embedding faces (force_ids=%s)", force_ids)
     await broadcast("phase_start", phase="embed")
 
     async with get_db() as db:
@@ -777,7 +860,7 @@ async def _phase_embed() -> None:
                        LIMIT 1""",
                     (media_id,),
                 )
-            if _emb_check:
+            if _emb_check and (force_ids is None or media_id not in force_ids):
                 async with get_db() as db:
                     await db.execute(
                         "UPDATE media_files SET ingest_state='embedded' WHERE id=?", (media_id,)

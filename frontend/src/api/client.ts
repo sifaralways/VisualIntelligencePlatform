@@ -29,6 +29,8 @@ export const api = {
       }),
     migrateModel: () =>
       request<{ status: string }>('/pipeline/migrate_model', { method: 'POST' }),
+    reprocessPhoto: (mediaId: number) =>
+      request<{ status: string; media_id: number }>(`/pipeline/reprocess/${mediaId}`, { method: 'POST' }),
     status: () => request<{ status: string; folder: string | null; error: string | null }>('/pipeline/status'),
   },
 
@@ -116,6 +118,9 @@ export const api = {
       request<MergeSuggestion[]>(`/persons/${personId}/merge-suggestions?limit=1`),
     rejectSuggestion: (personId: number, clusterId: number) =>
       request(`/persons/${personId}/reject-suggestion/${clusterId}`, { method: 'POST' }),
+    listIgnored: () => request<IgnoredPerson[]>('/persons/ignored'),
+    unignore: (personId: number) =>
+      request<{ status: string; person_id: number }>(`/persons/${personId}/unignore`, { method: 'POST' }),
     findSimilarAll: (autoThreshold: number) =>
       request<FindSimilarAllResult>('/persons/find-similar-all', {
         method: 'POST',
@@ -363,6 +368,15 @@ export interface Person {
   representative_thumbnail: string | null
   /** 1 if the person's name has been written to at least one photo file via ExifTool; 0 otherwise. */
   name_written: number
+}
+
+export interface IgnoredPerson {
+  id: number
+  uuid: string
+  created_at: string | null
+  photo_count: number
+  cluster_count: number
+  representative_thumbnail: string | null
 }
 
 export interface MergeSuggestion {

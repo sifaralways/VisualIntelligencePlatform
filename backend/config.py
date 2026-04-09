@@ -68,12 +68,27 @@ class Settings(BaseSettings):
         # Direct image formats
         ".jpg",   # JPEG
         ".jpeg",  # JPEG (alternate extension)
-        ".avif",  # AVIF (modern compressed format)
+        ".avif",  # AVIF — decoded via macOS sips
+        ".heic",  # HEIC — iPhone / macOS native, decoded via sips
+        ".heif",  # HEIF — HEIC variant
+        ".png",   # PNG — decoded via Pillow
+        ".webp",  # WebP — decoded via Pillow
+        ".tiff",  # TIFF — decoded via Pillow
+        ".tif",   # TIFF (alternate extension)
+        ".psd",   # Photoshop — decoded via sips
     })
 
     # Formats that are themselves the full image — no embedded preview extraction.
-    # Pillow is used directly to produce the normalised JPEG for ML inference.
-    direct_image_formats: frozenset = frozenset({".jpg", ".jpeg", ".avif"})
+    # Pillow or sips is used directly to produce the normalised JPEG for ML inference.
+    direct_image_formats: frozenset = frozenset({
+        ".jpg", ".jpeg",       # JPEG — Pillow
+        ".avif",               # AVIF — sips
+        ".heic", ".heif",      # HEIC/HEIF — sips
+        ".png",                # PNG — Pillow
+        ".webp",               # WebP — Pillow
+        ".tiff", ".tif",       # TIFF — Pillow
+        ".psd",                # Photoshop — sips
+    })
 
     # -------------------------------------------------------------------------
     # iCloud stub detection

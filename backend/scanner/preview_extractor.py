@@ -39,7 +39,15 @@ logger = logging.getLogger(__name__)
 
 # Formats that are themselves the full image (no embedded RAW preview needed).
 # Pillow opens these directly and saves a normalised JPEG to the preview dir.
-_DIRECT_IMAGE_SUFFIXES: frozenset[str] = frozenset({".jpg", ".jpeg", ".avif"})
+_DIRECT_IMAGE_SUFFIXES: frozenset[str] = frozenset({
+    ".jpg", ".jpeg",        # JPEG — Pillow
+    ".avif",               # AVIF — sips
+    ".heic", ".heif",      # HEIC/HEIF — sips
+    ".png",                # PNG — Pillow
+    ".webp",               # WebP — Pillow
+    ".tiff", ".tif",       # TIFF — Pillow
+    ".psd",                # Photoshop — sips
+})
 
 # Maps numeric EXIF Orientation tag value → PIL Transpose method name.
 # Identical to the mapping used internally by PIL.ImageOps.exif_transpose,
@@ -169,10 +177,13 @@ def _direct_image_to_jpeg(src: Path, dst: Path) -> bool:
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
 
-    if src.suffix.lower() == ".avif":
-        return _avif_to_jpeg_via_sips(src, dst)
+    # HEIC, HEIF, AVIF and PSD are decoded via macOS sips — Pillow has no
+    # native codec for these formats in standard pip wheels.
+    _SIPS_SUFFIXES = frozenset({".avif", ".heic", ".heif", ".psd"})
+    if src.suffix.lower() in _SIPS_SUFFIXES:
+        return _sips_to_jpeg(src, dst)
 
-    # --- JPEG (and any other format Pillow supports) ---
+    # PNG, WebP, TIFF, JPEG — Pillow handles all of these natively.
     try:
         from PIL import Image, ImageOps
         with Image.open(src) as img:
@@ -187,12 +198,13 @@ def _direct_image_to_jpeg(src: Path, dst: Path) -> bool:
         return False
 
 
-def _avif_to_jpeg_via_sips(src: Path, dst: Path) -> bool:
+def _sips_to_jpeg(src: Path, dst: Path) -> bool:
     """
-    Convert an AVIF file to JPEG using macOS `sips`.
+    Convert an image to JPEG using macOS `sips`.
 
-    `sips` is bundled with every macOS installation and supports AVIF via the
-    OS-native ImageIO framework.  No Homebrew packages or pip extras required.
+    Used for formats Pillow cannot decode natively in standard pip wheels:
+    AVIF, HEIC, HEIF, PSD.  `sips` is bundled with every macOS installation
+    and delegates to Apple's native ImageIO framework — no extra dependencies.
     """
     try:
         result = subprocess.run(
@@ -208,7 +220,7 @@ def _avif_to_jpeg_via_sips(src: Path, dst: Path) -> bool:
                 result.stderr.decode(errors="replace").strip(),
             )
             return False
-        logger.debug("AVIF → JPEG via sips: %s → %s", src.name, dst.name)
+        logger.debug("%s → JPEG via sips: %s → %s", src.suffix.upper(), src.name, dst.name)
         return True
     except subprocess.TimeoutExpired:
         logger.error("sips timed out converting: %s", src.name)
@@ -217,7 +229,7 @@ def _avif_to_jpeg_via_sips(src: Path, dst: Path) -> bool:
         logger.error("`sips` not found — should be present on every macOS installation")
         return False
     except Exception as e:
-        logger.error("AVIF conversion error for %s: %s", src.name, e)
+        logger.error("sips conversion error for %s: %s", src.name, e)
         return False
 
 
@@ -270,8 +282,20 @@ def _extract_sync(raw_path: Path, out_path: Path) -> bool:
                 break
 
         if not result.stdout:
-            logger.warning("No embedded JPEG found in: %s", raw_path)
-            return False
+            # No embedded JPEG in this RAW file (common with Google Photos DNG
+            # exports and some other camera-variant DNGs).  Fall back to sips
+            # which can decode RAW pixel data via Apple's native ImageIO.
+            logger.warning(
+                "No embedded JPEG found in %s — falling back to sips RAW decode",
+                raw_path.name,
+            )
+            sips_ok = _sips_to_jpeg(raw_path, out_path)
+            if not sips_ok:
+                logger.warning("sips fallback also failed for: %s", raw_path)
+                return False
+            # sips does not preserve RAW orientation — apply it now.
+            _correct_preview_orientation(out_path, orientation)
+            return True
 
         out_path.write_bytes(result.stdout)
 

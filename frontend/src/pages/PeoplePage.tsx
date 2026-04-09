@@ -8,7 +8,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api/client'
-import type { Cluster, Person, MergeSuggestion, FaceRow, SimilarCluster, MergePersonsResult, FindSimilarSuggestion, FindSimilarAllResult } from '../api/client'
+import type { Cluster, Person, MergeSuggestion, FaceRow, SimilarCluster, MergePersonsResult, FindSimilarSuggestion, FindSimilarAllResult, IgnoredPerson } from '../api/client'
 
 interface Props {
   /** Called when user clicks a named person tile to view their photos. */
@@ -19,7 +19,13 @@ export default function PeoplePage({ onSelectPerson }: Props) {
   const [clusters, setClusters] = useState<Cluster[]>([])
   const [persons, setPersons] = useState<Person[]>([])
   const [loading, setLoading] = useState(true)
-  const [activeTab, setActiveTab] = useState<'named' | 'unnamed'>('named')
+  const [activeTab, setActiveTab] = useState<'named' | 'unnamed' | 'ignored'>('named')
+
+  // ── Ignored faces tab ────────────────────────────────────────────────────
+  const [ignoredPersons, setIgnoredPersons] = useState<IgnoredPerson[]>([])
+  const [ignoredLoading, setIgnoredLoading] = useState(false)
+  const [ignoredLoaded, setIgnoredLoaded] = useState(false)
+  const [unignoringId, setUnignoringId] = useState<number | null>(null)
   const [namingId, setNamingId] = useState<number | null>(null)  // cluster id being named
   const [nameInput, setNameInput] = useState('')
   const [saving, setSaving] = useState(false)
@@ -314,7 +320,38 @@ export default function PeoplePage({ onSelectPerson }: Props) {
     }
   }
 
+  async function loadIgnored() {
+    setIgnoredLoading(true)
+    try {
+      const items = await api.persons.listIgnored()
+      setIgnoredPersons(items)
+      setIgnoredLoaded(true)
+    } finally {
+      setIgnoredLoading(false)
+    }
+  }
+
+  async function handleUnignore(personId: number) {
+    setUnignoringId(personId)
+    try {
+      await api.persons.unignore(personId)
+      setIgnoredPersons(prev => prev.filter(p => p.id !== personId))
+      // Reload unnamed clusters so the restored faces appear immediately
+      const fresh = await api.clusters.unnamed()
+      setClusters(fresh)
+    } finally {
+      setUnignoringId(null)
+    }
+  }
+
   useEffect(() => { load() }, [])
+
+  // Lazy-load ignored faces when tab is first activated
+  useEffect(() => {
+    if (activeTab === 'ignored' && !ignoredLoaded) {
+      loadIgnored()
+    }
+  }, [activeTab])
 
   async function openReview(person: Person) {
     setReviewPerson(person)
@@ -420,6 +457,23 @@ export default function PeoplePage({ onSelectPerson }: Props) {
               activeTab === 'unnamed' ? 'bg-indigo-600 text-white' : 'bg-gray-800 text-gray-500'
             }`}>
               {clusters.length}
+            </span>
+          )}
+        </button>
+        <button
+          onClick={() => setActiveTab('ignored')}
+          className={`px-4 py-2 text-sm font-medium rounded-t-lg transition-colors -mb-px border-b-2 ${
+            activeTab === 'ignored'
+              ? 'border-red-500 text-white'
+              : 'border-transparent text-gray-400 hover:text-white'
+          }`}
+        >
+          Ignored
+          {ignoredPersons.length > 0 && (
+            <span className={`ml-1.5 text-xs px-1.5 py-0.5 rounded-full ${
+              activeTab === 'ignored' ? 'bg-red-700 text-white' : 'bg-gray-800 text-gray-500'
+            }`}>
+              {ignoredPersons.length}
             </span>
           )}
         </button>
@@ -1247,6 +1301,59 @@ export default function PeoplePage({ onSelectPerson }: Props) {
           </div>
         )
       })()}
+
+      {/* ── Ignored faces tab ──────────────────────────────────────────── */}
+      {activeTab === 'ignored' && (
+        <section>
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
+              Always-ignored faces ({ignoredPersons.length})
+            </h2>
+          </div>
+
+          {ignoredLoading && (
+            <div className="text-gray-500 text-sm text-center py-10">Loading…</div>
+          )}
+
+          {!ignoredLoading && ignoredPersons.length === 0 && (
+            <div className="text-gray-500 text-sm text-center mt-12">
+              No ignored faces. Use "Always ignore" on an unnamed cluster to hide it permanently.
+            </div>
+          )}
+
+          {!ignoredLoading && ignoredPersons.length > 0 && (
+            <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-4">
+              {ignoredPersons.map(p => {
+                const thumbUrl = p.representative_thumbnail
+                  ? '/thumbnails/' + p.representative_thumbnail.split('/thumbnails/').pop()
+                  : null
+                const isRestoring = unignoringId === p.id
+                return (
+                  <div key={p.id} className="flex flex-col items-center gap-2">
+                    <div className="relative">
+                      <div className="w-20 h-20 rounded-xl overflow-hidden bg-gray-800 border border-red-900 opacity-60">
+                        {thumbUrl
+                          ? <img src={thumbUrl} alt="ignored face" className="w-full h-full object-cover" />
+                          : <span className="flex items-center justify-center h-full text-gray-600 text-2xl">👤</span>}
+                      </div>
+                      <span className="absolute bottom-0 right-0 bg-red-900 text-red-300 text-xs px-1 rounded-tl leading-tight">
+                        {p.photo_count}
+                      </span>
+                    </div>
+                    <button
+                      onClick={() => handleUnignore(p.id)}
+                      disabled={isRestoring}
+                      className="text-xs px-2.5 py-1 rounded-lg border border-gray-600 bg-gray-800 text-gray-400 hover:text-white hover:border-indigo-400 hover:bg-indigo-900/30 transition-colors disabled:opacity-40"
+                    >
+                      {isRestoring ? 'Restoring…' : 'Restore'}
+                    </button>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </section>
+      )}
     </div>
   )
 }

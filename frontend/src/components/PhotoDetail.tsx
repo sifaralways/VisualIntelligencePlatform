@@ -21,6 +21,8 @@ export default function PhotoDetail({ mediaId, filePath, onClose }: Props) {
   const [faces,   setFaces]   = useState<FaceRow[]>([])
   const [loading, setLoading] = useState(true)
   const [tab,     setTab]     = useState<Tab>('details')
+  const [reprocessing, setReprocessing] = useState(false)
+  const [reprocessDone, setReprocessDone] = useState(false)
 
   const filename = filePath.split('/').pop() ?? ''
   const thumbSrc = api.media.thumbnailUrl(mediaId)
@@ -36,6 +38,17 @@ export default function PhotoDetail({ mediaId, filePath, onClose }: Props) {
       setLoading(false)
     })
   }, [mediaId])
+
+  async function reprocessPhoto() {
+    setReprocessing(true)
+    setReprocessDone(false)
+    try {
+      await api.pipeline.reprocessPhoto(mediaId)
+      setReprocessDone(true)
+    } finally {
+      setReprocessing(false)
+    }
+  }
 
   // Close on Escape
   useEffect(() => {
@@ -160,6 +173,22 @@ export default function PhotoDetail({ mediaId, filePath, onClose }: Props) {
                         No tags yet — run the full pipeline to generate them.
                       </p>
                     )}
+
+                    {/* Reprocess */}
+                    <div className="pt-2 border-t border-gray-800">
+                      <button
+                        onClick={reprocessPhoto}
+                        disabled={reprocessing}
+                        className="w-full text-xs px-3 py-2 rounded-lg border border-gray-700 bg-gray-800 text-gray-400 hover:text-white hover:border-indigo-500 hover:bg-indigo-900/20 transition-colors disabled:opacity-40"
+                      >
+                        {reprocessing ? '⟳ Queued — re-detecting faces…' : reprocessDone ? '✓ Queued — check People page shortly' : '⟳ Reprocess this photo'}
+                      </button>
+                      {reprocessDone && (
+                        <p className="text-xs text-gray-600 text-center mt-1">
+                          Face detection is running in the background.
+                        </p>
+                      )}
+                    </div>
                   </>
                 )}
               </>
