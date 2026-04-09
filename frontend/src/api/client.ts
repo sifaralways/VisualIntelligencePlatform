@@ -31,6 +31,11 @@ export const api = {
       request<{ status: string }>('/pipeline/migrate_model', { method: 'POST' }),
     reprocessPhoto: (mediaId: number) =>
       request<{ status: string; media_id: number }>(`/pipeline/reprocess/${mediaId}`, { method: 'POST' }),
+    reprocessBatch: (mediaIds: number[]) =>
+      request<{ status: string; count: number }>('/pipeline/reprocess_batch', {
+        method: 'POST',
+        body: JSON.stringify({ media_ids: mediaIds }),
+      }),
     status: () => request<{ status: string; folder: string | null; error: string | null }>('/pipeline/status'),
   },
 

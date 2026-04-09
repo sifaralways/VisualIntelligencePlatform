@@ -114,6 +114,7 @@ export default function LibraryPage({ onScanStarted }: Props) {
       title="Library"
       headerSlot={FolderBar}
       selectable
+      enableReprocess
     />
   )
 }

@@ -349,6 +349,92 @@ async def run_single_reprocess(media_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Batch reprocess entry point
+# ---------------------------------------------------------------------------
+
+async def run_batch_reprocess(media_ids: list[int]) -> None:
+    """
+    Re-detect faces in a batch of photos without scanning the full library.
+
+    Runs the same steps as run_single_reprocess but batches the DB cleanup
+    and runs embed → cluster → auto-merge → name-restore once across all
+    selected photos, which is far more efficient than calling
+    run_single_reprocess sequentially.
+
+    Named-person assignments for all photos are preserved.
+    """
+    if not media_ids:
+        return
+
+    label = f"[reprocess {len(media_ids)} photo{'s' if len(media_ids) != 1 else ''}]"
+    logger.info("=== Batch reprocess start: %d photos ===", len(media_ids))
+    await broadcast("pipeline_start", folder=label)
+    await settings_store.load_cache()
+    _ensure_models()
+
+    placeholders = ",".join("?" * len(media_ids))
+
+    async with get_db() as db:
+        # Verify all requested IDs exist and are not stubs/removed
+        rows = await (
+            await db.execute(
+                f"SELECT id, is_stub FROM media_files "
+                f"WHERE id IN ({placeholders}) AND removed_from_app=0",
+                media_ids,
+            )
+        ).fetchall()
+
+    valid_ids = [r["id"] for r in rows if not r["is_stub"]]
+    skipped = len(media_ids) - len(valid_ids)
+    if skipped:
+        logger.warning(
+            "Batch reprocess: skipped %d media IDs (stubs or not found)", skipped
+        )
+
+    if not valid_ids:
+        logger.error("Batch reprocess: no valid media IDs to process")
+        await broadcast("pipeline_complete", folder=label)
+        return
+
+    placeholders = ",".join("?" * len(valid_ids))
+
+    async with get_db() as db:
+        # Drop embeddings for unowned faces on all selected files
+        await db.execute(f"""
+            DELETE FROM embeddings
+            WHERE face_id IN (
+                SELECT id FROM faces
+                WHERE media_file_id IN ({placeholders}) AND person_id IS NULL
+            )
+        """, valid_ids)
+        # Drop the unowned face rows
+        await db.execute(
+            f"DELETE FROM faces "
+            f"WHERE media_file_id IN ({placeholders}) AND person_id IS NULL",
+            valid_ids,
+        )
+        # Reset state so _phase_embed picks these files up
+        await db.execute(
+            f"UPDATE media_files SET ingest_state = 'scanned' "
+            f"WHERE id IN ({placeholders})",
+            valid_ids,
+        )
+
+    logger.info(
+        "Batch reprocess: cleared unowned faces for %d photos", len(valid_ids)
+    )
+
+    force_ids = set(valid_ids)
+    await _phase_embed(force_ids=force_ids)
+    await _phase_cluster()
+    await _phase_auto_merge()
+    await _phase_restore_vip_names()
+
+    await broadcast("pipeline_complete", folder=label)
+    logger.info("=== Batch reprocess complete: %d photos ===", len(valid_ids))
+
+
+# ---------------------------------------------------------------------------
 # Model migration entry point
 # ---------------------------------------------------------------------------
 async def run_model_migration() -> None:

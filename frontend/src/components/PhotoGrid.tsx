@@ -18,6 +18,8 @@ interface Props {
   headerSlot?: React.ReactNode
   /** Enable multi-select checkboxes + action bar */
   selectable?: boolean
+  /** Show a Reprocess button in the multi-select action bar (requires selectable=true) */
+  enableReprocess?: boolean
   /** Override the remove handler (ids, force) => RemoveResult; defaults to api.media.removeFromApp */
   onRemoveFromApp?: (ids: number[], force: boolean) => Promise<RemoveResult>
 }
@@ -27,6 +29,7 @@ export default function PhotoGrid({
   title,
   headerSlot,
   selectable = false,
+  enableReprocess = false,
   onRemoveFromApp,
 }: Props) {
   const [photos,   setPhotos]   = useState<MediaFile[]>([])
@@ -42,6 +45,10 @@ export default function PhotoGrid({
   const [removing,     setRemoving]     = useState(false)
   const [warning,      setWarning]      = useState<RemoveResult | null>(null)
   const [pendingForce, setPendingForce] = useState<number[]>([])
+
+  // Reprocess
+  const [reprocessing,     setReprocessing]     = useState(false)
+  const [reprocessQueued,  setReprocessQueued]  = useState(false)
 
   // Reset to page 0 when filter changes
   const filterKey = JSON.stringify(filter)
@@ -114,6 +121,22 @@ export default function PhotoGrid({
       setError(e instanceof Error ? e.message : 'Remove failed')
     } finally {
       setRemoving(false)
+    }
+  }
+
+  async function handleReprocess() {
+    const ids = Array.from(selectedIds)
+    if (ids.length === 0) return
+    setReprocessing(true)
+    setReprocessQueued(false)
+    try {
+      await api.pipeline.reprocessBatch(ids)
+      setReprocessQueued(true)
+      clearSelection()
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Reprocess failed — pipeline may already be running')
+    } finally {
+      setReprocessing(false)
     }
   }
 
@@ -237,6 +260,15 @@ export default function PhotoGrid({
             <button onClick={clearSelection} className="text-xs text-gray-400 hover:text-white transition-colors">
               Clear
             </button>
+            {enableReprocess && (
+              <button
+                onClick={handleReprocess}
+                disabled={reprocessing}
+                className="text-sm bg-indigo-700 hover:bg-indigo-600 disabled:opacity-40 text-white font-medium rounded-lg px-4 py-2 transition-colors"
+              >
+                {reprocessing ? 'Queuing…' : '⟳ Reprocess'}
+              </button>
+            )}
             <button
               onClick={() => handleRemove(false)}
               disabled={removing}
@@ -245,6 +277,19 @@ export default function PhotoGrid({
               {removing ? 'Removing…' : '🗑 Remove from app'}
             </button>
           </div>
+        </div>
+      )}
+
+      {/* ── Reprocess queued toast ── */}
+      {reprocessQueued && (
+        <div className="fixed bottom-20 right-4 z-50 flex items-center gap-3 bg-indigo-900 border border-indigo-600 rounded-xl px-4 py-3 shadow-2xl">
+          <span className="text-indigo-300 text-sm">⟳ Reprocess queued — check the Pipeline tab for progress</span>
+          <button
+            onClick={() => setReprocessQueued(false)}
+            className="text-indigo-400 hover:text-white text-xs transition-colors ml-2"
+          >
+            ✕
+          </button>
         </div>
       )}
 

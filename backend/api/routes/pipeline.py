@@ -173,6 +173,42 @@ async def _run_single_reprocess(media_id: int) -> None:
         _pipeline_state["error"] = str(e)
 
 
+class BatchReprocessRequest(BaseModel):
+    media_ids: list[int]
+
+
+@router.post("/reprocess_batch")
+async def reprocess_batch(req: BatchReprocessRequest, background_tasks: BackgroundTasks):
+    """
+    Re-detect faces in a batch of selected photos.
+
+    Accepts a list of media IDs, clears unowned face data for each, resets
+    them to 'scanned', then runs embed → cluster → auto-merge → name-restore
+    across all of them in a single efficient pass.  Named-person assignments
+    are preserved.
+    """
+    if not req.media_ids:
+        raise HTTPException(status_code=400, detail="media_ids must not be empty")
+    if _pipeline_state["status"] == "running":
+        raise HTTPException(status_code=409, detail="Pipeline already running")
+
+    label = f"[reprocess {len(req.media_ids)} photo{'s' if len(req.media_ids) != 1 else ''}]"
+    _pipeline_state.update({"status": "running", "folder": label, "error": None})
+    background_tasks.add_task(_run_batch_reprocess, list(req.media_ids))
+    return {"status": "started", "count": len(req.media_ids)}
+
+
+async def _run_batch_reprocess(media_ids: list[int]) -> None:
+    from backend.pipeline.ingest import run_batch_reprocess
+    try:
+        await run_batch_reprocess(media_ids)
+        _pipeline_state["status"] = "idle"
+    except Exception as e:
+        logger.exception("Batch reprocess error")
+        _pipeline_state["status"] = "error"
+        _pipeline_state["error"] = str(e)
+
+
 @router.post("/migrate_model")
 async def migrate_model(background_tasks: BackgroundTasks):
     """

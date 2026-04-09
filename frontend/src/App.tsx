@@ -166,7 +166,7 @@ export default function App() {
         >
           ← Back
         </button>
-        <PhotoGrid filter={filtered.filter} title={filtered.title} selectable />
+        <PhotoGrid filter={filtered.filter} title={filtered.title} selectable enableReprocess />
       </div>
     )
   } else {
