@@ -278,14 +278,16 @@ async def list_persons():
                    (SELECT COUNT(*) FROM persons p2
                     WHERE p2.merged_into_id = p.id
                       AND p2.is_merged = 1)                   AS merge_sources_count,
-                   MIN(f.thumbnail_path)                      AS representative_thumbnail,
+                   COALESCE(pf.thumbnail_path, MIN(f.thumbnail_path))
+                                                              AS representative_thumbnail,
                    CASE WHEN p.name IS NOT NULL AND EXISTS (
                        SELECT 1 FROM writeback_queue wq
                        JOIN faces f2 ON f2.media_file_id = wq.media_file_id
                        WHERE f2.person_id = p.id AND wq.status = 'written'
                    ) THEN 1 ELSE 0 END                        AS name_written
             FROM persons p
-            LEFT JOIN faces f ON f.person_id = p.id
+            LEFT JOIN faces f  ON f.person_id = p.id
+            LEFT JOIN faces pf ON pf.id = p.portrait_face_id
             WHERE p.is_merged = 0 AND p.is_ignored = 0
             GROUP BY p.id
             ORDER BY photo_count DESC
@@ -689,6 +691,62 @@ class NameClusterRequest(BaseModel):
     name: str
 
 
+@router.post("/assign-face/{face_id}")
+async def assign_lone_face_to_person(face_id: int, req: NameClusterRequest, background_tasks: BackgroundTasks):
+    """
+    Assign a lone face (cluster_id=NULL) directly to a named person.
+    Used when a face was ejected from its previous person/cluster and the user
+    now wants to label it correctly from the photo detail view.
+    Creates the person if no person with that name exists yet.
+    """
+    async with get_db() as db:
+        face_row = await (
+            await db.execute(
+                "SELECT id, media_file_id, cluster_id FROM faces WHERE id=?", (face_id,)
+            )
+        ).fetchone()
+        if not face_row:
+            raise HTTPException(status_code=404, detail="Face not found")
+
+        name = req.name.strip()
+
+        # Find or create person by name (case-insensitive)
+        existing = await (
+            await db.execute(
+                "SELECT id FROM persons WHERE lower(name)=lower(?) AND is_merged=0 AND is_ignored=0",
+                (name,)
+            )
+        ).fetchone()
+
+        if existing:
+            person_id = existing["id"]
+        else:
+            person_uuid = str(_uuid.uuid4())
+            cursor = await db.execute(
+                "INSERT INTO persons (uuid, name, named_at) VALUES (?, ?, datetime('now'))",
+                (person_uuid, name),
+            )
+            person_id = cursor.lastrowid
+
+        await db.execute(
+            "UPDATE faces SET person_id=? WHERE id=?", (person_id, face_id)
+        )
+
+        await _sync_photo_count(db, person_id)
+
+        if face_row["media_file_id"]:
+            await db.execute("""
+                INSERT OR REPLACE INTO writeback_queue (media_file_id, status, queued_at)
+                VALUES (?, 'pending', datetime('now'))
+            """, (face_row["media_file_id"],))
+
+        await update_person_centroid(db, person_id)
+
+    background_tasks.add_task(_rescore_after_person_update, person_id)
+    background_tasks.add_task(_update_cooccurrence_for_person, person_id)
+    return {"status": "assigned", "face_id": face_id, "person_id": person_id}
+
+
 @router.post("/from-cluster/{cluster_id}")
 async def create_person_from_cluster(cluster_id: int, req: NameClusterRequest, background_tasks: BackgroundTasks):
     """Create a named person from a cluster in one step."""
@@ -757,6 +815,31 @@ async def add_cluster_to_person(person_id: int, cluster_id: int, background_task
     background_tasks.add_task(_rescore_after_person_update, person_id)
     background_tasks.add_task(_update_cooccurrence_for_person, person_id)
     return {"status": "merged", "person_id": person_id}
+
+
+@router.post("/{person_id}/set-portrait/{face_id}")
+async def set_portrait_face(person_id: int, face_id: int):
+    """
+    Pin a specific face crop as the representative thumbnail for a person.
+    The chosen face must already belong to this person.
+    """
+    async with get_db() as db:
+        row = await (
+            await db.execute(
+                "SELECT id FROM faces WHERE id=? AND person_id=?",
+                (face_id, person_id),
+            )
+        ).fetchone()
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail="Face not found or does not belong to this person.",
+            )
+        await db.execute(
+            "UPDATE persons SET portrait_face_id=? WHERE id=?",
+            (face_id, person_id),
+        )
+    return {"status": "ok", "person_id": person_id, "portrait_face_id": face_id}
 
 
 # ---------------------------------------------------------------------------

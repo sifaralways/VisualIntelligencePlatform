@@ -137,6 +137,15 @@ export const api = {
       request<FrequentlyWithEntry[]>(`/persons/${personId}/frequently-with?limit=${limit}`),
     connectionsGraph: (personId: number, depth = 2) =>
       request<ConnectionGraph>(`/persons/${personId}/connections-graph?depth=${depth}`),
+    setPortrait: (personId: number, faceId: number) =>
+      request<{ status: string; person_id: number; portrait_face_id: number }>(
+        `/persons/${personId}/set-portrait/${faceId}`, { method: 'POST' }
+      ),
+    assignFace: (faceId: number, name: string) =>
+      request<{ status: string; face_id: number; person_id: number }>(
+        `/persons/assign-face/${faceId}`,
+        { method: 'POST', body: JSON.stringify({ name }) }
+      ),
   },
 
   // ─── Faces ────────────────────────────────────────────────────────────────

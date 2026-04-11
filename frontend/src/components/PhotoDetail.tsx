@@ -111,6 +111,9 @@ export default function PhotoDetail({ mediaId, filePath, onClose }: Props) {
         } else {
           await api.persons.fromCluster(face.cluster_id, name)
         }
+      } else if (editMode?.type === 'naming' && face.cluster_id == null) {
+        // Lone face (ejected from its previous person/cluster) — assign directly
+        await api.persons.assignFace(face.id, name)
       }
       cancelEdit()
       const refreshed = await loadFaces()
