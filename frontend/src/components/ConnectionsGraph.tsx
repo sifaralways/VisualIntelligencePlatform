@@ -12,7 +12,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../api/client'
-import type { ConnectionGraph, ConnectionGraphNode, ConnectionGraphEdge, Person } from '../api/client'
+import type { ConnectionGraph, ConnectionGraphNode, ConnectionGraphEdge, Person, MediaFile } from '../api/client'
 
 // ── Props ──────────────────────────────────────────────────────────────────
 
@@ -642,6 +642,23 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
     }
   }
 
+  // Cluster photo gallery
+  const [clusterGallery,  setClusterGallery]  = useState<{ id: number; label: string } | null>(null)
+  const [galleryPhotos,   setGalleryPhotos]   = useState<MediaFile[]>([])
+  const [galleryLoading,  setGalleryLoading]  = useState(false)
+
+  async function openClusterGallery(clusterId: number, label: string) {
+    setEditingNode(null)
+    setClusterGallery({ id: clusterId, label })
+    setGalleryLoading(true)
+    try {
+      const photos = await api.media.list({ cluster_id: clusterId, limit: 200 })
+      setGalleryPhotos(photos)
+    } finally {
+      setGalleryLoading(false)
+    }
+  }
+
   // Ignore: send unnamed cluster to Ignored Faces
   async function ignoreClusterNode() {
     if (!editingNode || editingNode.type !== 'cluster') return
@@ -1017,6 +1034,13 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
                       Cancel
                     </button>
                     {editingNode.type === 'cluster' && (
+                      <button
+                        onClick={() => openClusterGallery(editingNode.raw_id, editingNode.name ?? 'Unnamed face')}
+                        className="flex-1 bg-transparent border border-gray-700 hover:border-indigo-500 hover:text-indigo-400 text-gray-500 text-xs rounded-lg py-1.5 transition-colors">
+                        View photos
+                      </button>
+                    )}
+                    {editingNode.type === 'cluster' && (
                       <button onClick={ignoreClusterNode} disabled={editSaving}
                         className="flex-1 bg-transparent border border-gray-700 hover:border-red-700 hover:text-red-400 text-gray-600 text-xs rounded-lg py-1.5 transition-colors">
                         Ignore face
@@ -1028,6 +1052,63 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
             </div>
           )
         })()}
+
+        {/* Cluster photo gallery overlay */}
+        {clusterGallery && (
+          <div className="absolute inset-0 z-30 flex flex-col bg-gray-950/95 backdrop-blur-sm">
+            {/* Gallery header */}
+            <div className="flex items-center justify-between px-5 py-3 border-b border-gray-800 shrink-0">
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => setClusterGallery(null)}
+                  className="text-gray-500 hover:text-gray-200 transition-colors text-sm"
+                >
+                  ← Back
+                </button>
+                <span className="text-gray-500 text-xs">·</span>
+                <span className="text-white text-sm font-medium">Photos with this face</span>
+                {!galleryLoading && (
+                  <span className="text-gray-500 text-xs">({galleryPhotos.length})</span>
+                )}
+              </div>
+              <button
+                onClick={() => setClusterGallery(null)}
+                className="text-gray-600 hover:text-white transition-colors text-xl leading-none"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Gallery body */}
+            <div className="flex-1 overflow-y-auto p-5">
+              {galleryLoading && (
+                <div className="flex items-center justify-center h-full">
+                  <div className="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin" />
+                </div>
+              )}
+              {!galleryLoading && galleryPhotos.length === 0 && (
+                <p className="text-gray-500 text-sm text-center mt-12">No photos found.</p>
+              )}
+              {!galleryLoading && galleryPhotos.length > 0 && (
+                <div className="grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-3">
+                  {galleryPhotos.map(photo => (
+                    <div
+                      key={photo.id}
+                      className="aspect-square rounded-xl overflow-hidden bg-gray-900 border border-gray-800 hover:border-indigo-500 transition-colors"
+                    >
+                      <img
+                        src={api.media.thumbnailUrl(photo.id)}
+                        alt={photo.file_path.split('/').pop()}
+                        className="w-full h-full object-cover"
+                        loading="lazy"
+                      />
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* Stats panel — bottom-left */}
         {graph && graph.nodes.length > 1 && (
