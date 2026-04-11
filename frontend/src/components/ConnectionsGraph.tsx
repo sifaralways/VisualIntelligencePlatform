@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../api/client'
 import type { ConnectionGraph, ConnectionGraphNode, ConnectionGraphEdge, Person, MediaFile } from '../api/client'
+import PhotoDetail from './PhotoDetail'
 
 // ── Props ──────────────────────────────────────────────────────────────────
 
@@ -239,7 +240,7 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
   const [graph,       setGraph]       = useState<ConnectionGraph | null>(null)
   const [loading,     setLoading]     = useState(true)
   const [error,       setError]       = useState(false)
-  const [depthLevel,  setDepthLevel]  = useState(3)
+  const [depthLevel,  setDepthLevel]  = useState(2)
   const [layoutMode,  setLayoutMode]  = useState<LayoutMode>('force')
   const [currentPid,  setCurrentPid]  = useState(personId)
   const [currentName, setCurrentName] = useState(personName)
@@ -646,6 +647,7 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
   const [clusterGallery,  setClusterGallery]  = useState<{ id: number; label: string } | null>(null)
   const [galleryPhotos,   setGalleryPhotos]   = useState<MediaFile[]>([])
   const [galleryLoading,  setGalleryLoading]  = useState(false)
+  const [gallerySelected, setGallerySelected] = useState<MediaFile | null>(null)
 
   async function openClusterGallery(clusterId: number, label: string) {
     setEditingNode(null)
@@ -1094,7 +1096,8 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
                   {galleryPhotos.map(photo => (
                     <div
                       key={photo.id}
-                      className="aspect-square rounded-xl overflow-hidden bg-gray-900 border border-gray-800 hover:border-indigo-500 transition-colors"
+                      onClick={() => setGallerySelected(photo)}
+                      className="aspect-square rounded-xl overflow-hidden bg-gray-900 border border-gray-800 hover:border-indigo-500 transition-colors cursor-pointer"
                     >
                       <img
                         src={api.media.thumbnailUrl(photo.id)}
@@ -1108,6 +1111,15 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
               )}
             </div>
           </div>
+        )}
+
+        {/* PhotoDetail for gallery selection */}
+        {gallerySelected && (
+          <PhotoDetail
+            mediaId={gallerySelected.id}
+            filePath={gallerySelected.file_path}
+            onClose={() => setGallerySelected(null)}
+          />
         )}
 
         {/* Stats panel — bottom-left */}

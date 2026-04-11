@@ -48,6 +48,9 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   const [namedBulkWorking, setNamedBulkWorking] = useState(false)
   const [namedMergeOpen, setNamedMergeOpen] = useState(false)
   const [namedMergeNameInput, setNamedMergeNameInput] = useState('')
+
+  // ── Named faces search ────────────────────────────────────────────────────
+  const [nameSearch, setNameSearch] = useState('')
   const [namedMergeResult, setNamedMergeResult] = useState<MergePersonsResult | null>(null)
 
   function toggleNamedSelect(id: number) {
@@ -993,7 +996,9 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
         <section>
         <div className="flex items-center justify-between mb-3">
             <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
-              Named ({persons.length})
+              Named ({nameSearch.trim()
+                ? `${persons.filter(p => (p.name ?? '').toLowerCase().includes(nameSearch.toLowerCase())).length} of ${persons.length}`
+                : persons.length})
             </h2>
             <div className="flex items-center gap-2">
               {namedSelectMode && namedSelected.size > 0 && (
@@ -1040,8 +1045,28 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
             </div>
           )}
 
+          {/* Search box */}
+          <div className="relative mb-4 max-w-xs">
+            <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 text-sm pointer-events-none">🔍</span>
+            <input
+              type="text"
+              value={nameSearch}
+              onChange={e => setNameSearch(e.target.value)}
+              placeholder="Search by name…"
+              className="w-full bg-gray-900 border border-gray-700 rounded-lg pl-8 pr-8 py-1.5 text-sm text-white placeholder-gray-600 outline-none focus:border-indigo-500 transition-colors"
+            />
+            {nameSearch && (
+              <button
+                onClick={() => setNameSearch('')}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300 text-xs leading-none"
+              >✕</button>
+            )}
+          </div>
+
           <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-4">
-            {[...persons].sort((a, b) => (a.name ?? '').localeCompare(b.name ?? '')).map(p => {
+            {[...persons].sort((a, b) => (a.name ?? '').localeCompare(b.name ?? ''))
+              .filter(p => !nameSearch.trim() || (p.name ?? '').toLowerCase().includes(nameSearch.toLowerCase()))
+              .map(p => {
               const thumb = p.representative_thumbnail
               const thumbUrl = thumb ? '/thumbnails/' + thumb.split('/thumbnails/').pop() : null
               const isRenaming = renamingPersonId === p.id
