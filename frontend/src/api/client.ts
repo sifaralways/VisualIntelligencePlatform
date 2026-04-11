@@ -135,6 +135,8 @@ export const api = {
       }),
     frequentlyWith: (personId: number, limit = 5) =>
       request<FrequentlyWithEntry[]>(`/persons/${personId}/frequently-with?limit=${limit}`),
+    connectionsGraph: (personId: number, depth = 2) =>
+      request<ConnectionGraph>(`/persons/${personId}/connections-graph?depth=${depth}`),
   },
 
   // ─── Faces ────────────────────────────────────────────────────────────────
@@ -420,6 +422,28 @@ export interface MergePersonsResult {
   survivor_name: string
   absorbed_id: number
   photos_queued_for_writeback: number
+}
+
+export interface ConnectionGraphNode {
+  id: string
+  type: 'person' | 'cluster'
+  raw_id: number
+  name: string | null
+  photo_count: number
+  thumbnail: string | null
+  depth: number
+}
+
+export interface ConnectionGraphEdge {
+  source: string
+  target: string
+  weight: number
+}
+
+export interface ConnectionGraph {
+  center_id: string
+  nodes: ConnectionGraphNode[]
+  edges: ConnectionGraphEdge[]
 }
 
 export interface FrequentlyWithEntry {

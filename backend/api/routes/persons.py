@@ -760,8 +760,191 @@ async def add_cluster_to_person(person_id: int, cluster_id: int, background_task
 
 
 # ---------------------------------------------------------------------------
-# Co-occurrence: "frequently appears with"
+# Co-occurrence: "frequently appears with" + connection graph
 # ---------------------------------------------------------------------------
+
+@router.get("/{person_id}/connections-graph")
+async def connections_graph(person_id: int, depth: int = 2):
+    """
+    Return a social graph of persons and unnamed clusters that co-appear in
+    photos alongside person_id, up to `depth` hops (max 2).
+
+    Nodes: named persons + unnamed clusters (not ignored).
+    Edges: shared photo count between each pair.
+    The graph is used for the Connections visualisation in the People tab.
+    """
+    depth = min(max(depth, 1), 2)
+    async with get_db() as db:
+        # ── Verify center ──────────────────────────────────────────────────
+        center = await (await db.execute(
+            "SELECT id, name, photo_count FROM persons "
+            "WHERE id=? AND is_merged=0 AND is_ignored=0",
+            (person_id,),
+        )).fetchone()
+        if not center:
+            raise HTTPException(status_code=404, detail="Person not found")
+
+        center_thumb = await (await db.execute(
+            "SELECT thumbnail_path FROM faces "
+            "WHERE person_id=? AND thumbnail_path IS NOT NULL LIMIT 1",
+            (person_id,),
+        )).fetchone()
+
+        center_nid = f"p_{person_id}"
+        nodes: dict[str, dict] = {
+            center_nid: {
+                "id": center_nid,
+                "type": "person",
+                "raw_id": person_id,
+                "name": center["name"],
+                "photo_count": center["photo_count"],
+                "thumbnail": center_thumb["thumbnail_path"] if center_thumb else None,
+                "depth": 0,
+            }
+        }
+        edges: dict[tuple, int] = {}
+
+        # ── Depth-1 named: person_cooccurrence table ───────────────────────
+        named_d1 = await db.execute_fetchall("""
+            SELECT
+                p.id,
+                p.name,
+                p.photo_count,
+                pc.count AS shared_photos,
+                MIN(f.thumbnail_path) AS thumbnail
+            FROM person_cooccurrence pc
+            JOIN persons p
+              ON p.id = CASE
+                  WHEN pc.person_a_id = ? THEN pc.person_b_id
+                  ELSE pc.person_a_id
+                END
+            LEFT JOIN faces f
+              ON f.person_id = p.id AND f.thumbnail_path IS NOT NULL
+            WHERE (pc.person_a_id = ? OR pc.person_b_id = ?)
+              AND p.is_merged  = 0
+              AND p.is_ignored = 0
+            GROUP BY p.id
+            ORDER BY pc.count DESC
+            LIMIT 15
+        """, (person_id, person_id, person_id))
+
+        for row in named_d1:
+            nid = f"p_{row['id']}"
+            nodes[nid] = {
+                "id": nid,
+                "type": "person",
+                "raw_id": row["id"],
+                "name": row["name"],
+                "photo_count": row["photo_count"],
+                "thumbnail": row["thumbnail"],
+                "depth": 1,
+            }
+            eid = tuple(sorted([center_nid, nid]))
+            edges[eid] = row["shared_photos"]
+
+        # ── Depth-1 unnamed: clusters co-appearing in the same photos ──────
+        unnamed_d1 = await db.execute_fetchall("""
+            SELECT
+                f2.cluster_id,
+                COUNT(DISTINCT f2.media_file_id) AS shared_photos,
+                MIN(f2.thumbnail_path)            AS thumbnail,
+                c.member_count
+            FROM faces f1
+            JOIN faces f2
+              ON  f2.media_file_id = f1.media_file_id
+              AND f2.cluster_id IS NOT NULL
+              AND f2.person_id   IS NULL
+            JOIN clusters c ON c.id = f2.cluster_id
+            WHERE f1.person_id = ?
+            GROUP BY f2.cluster_id
+            ORDER BY shared_photos DESC
+            LIMIT 10
+        """, (person_id,))
+
+        for row in unnamed_d1:
+            nid = f"c_{row['cluster_id']}"
+            if nid not in nodes:
+                nodes[nid] = {
+                    "id": nid,
+                    "type": "cluster",
+                    "raw_id": row["cluster_id"],
+                    "name": None,
+                    "photo_count": row["member_count"],
+                    "thumbnail": row["thumbnail"],
+                    "depth": 1,
+                }
+                eid = tuple(sorted([center_nid, nid]))
+                edges[eid] = row["shared_photos"]
+
+        # ── Depth-2: connections of depth-1 named persons ──────────────────
+        d1_person_ids = [
+            nodes[nid]["raw_id"]
+            for nid in nodes
+            if nid.startswith("p_") and nid != center_nid
+        ]
+        if depth >= 2 and d1_person_ids:
+            ph = ",".join("?" * len(d1_person_ids))
+            # Fetch all cooccurrence edges touching any depth-1 person
+            cooc2 = await db.execute_fetchall(f"""
+                SELECT person_a_id, person_b_id, count AS shared_photos
+                FROM person_cooccurrence
+                WHERE (person_a_id IN ({ph}) OR person_b_id IN ({ph}))
+            """, (*d1_person_ids, *d1_person_ids))
+
+            d1_set = set(d1_person_ids)
+            new_person_ids: set[int] = set()
+            for row in cooc2:
+                pa, pb = row["person_a_id"], row["person_b_id"]
+                # Determine which side is the depth-1 source
+                src_raw = pa if pa in d1_set else pb
+                tgt_raw = pb if pa in d1_set else pa
+                if tgt_raw == person_id:
+                    continue  # edge to center already stored
+                src_nid = f"p_{src_raw}"
+                tgt_nid = f"p_{tgt_raw}"
+                eid = tuple(sorted([src_nid, tgt_nid]))
+                edges[eid] = max(edges.get(eid, 0), row["shared_photos"])
+                if tgt_nid not in nodes:
+                    new_person_ids.add(tgt_raw)
+
+            # Fetch person info for discovered depth-2 nodes
+            if new_person_ids:
+                ph2 = ",".join("?" * len(new_person_ids))
+                new_ids_list = list(new_person_ids)
+                p2_rows = await db.execute_fetchall(f"""
+                    SELECT p.id, p.name, p.photo_count,
+                           MIN(f.thumbnail_path) AS thumbnail
+                    FROM persons p
+                    LEFT JOIN faces f
+                      ON f.person_id = p.id AND f.thumbnail_path IS NOT NULL
+                    WHERE p.id IN ({ph2})
+                      AND p.is_merged  = 0
+                      AND p.is_ignored = 0
+                    GROUP BY p.id
+                """, new_ids_list)
+                for row in p2_rows:
+                    nid = f"p_{row['id']}"
+                    if nid not in nodes:
+                        nodes[nid] = {
+                            "id": nid,
+                            "type": "person",
+                            "raw_id": row["id"],
+                            "name": row["name"],
+                            "photo_count": row["photo_count"],
+                            "thumbnail": row["thumbnail"],
+                            "depth": 2,
+                        }
+
+    return {
+        "center_id": center_nid,
+        "nodes": list(nodes.values()),
+        "edges": [
+            {"source": e[0], "target": e[1], "weight": w}
+            for e, w in edges.items()
+            if e[0] in nodes and e[1] in nodes
+        ],
+    }
+
 
 @router.get("/{person_id}/frequently-with")
 async def frequently_with(person_id: int, limit: int = 10):
