@@ -10,6 +10,33 @@ from backend.pipeline.centroid import update_person_centroid
 router = APIRouter()
 
 
+async def _requeue_as_singleton(db, face_id: int) -> None:
+    """
+    Create a new 1-member cluster from the face's own embedding and assign
+    the face to it, so the face immediately reappears in the unnamed-faces
+    list rather than disappearing until the next pipeline run.
+
+    If the face has no stored embedding (edge case), leaves cluster_id NULL —
+    the next clustering phase will handle it.
+    """
+    emb_row = await (
+        await db.execute("SELECT vector FROM embeddings WHERE face_id=?", (face_id,))
+    ).fetchone()
+
+    if emb_row and emb_row["vector"]:
+        cursor = await db.execute(
+            """
+            INSERT INTO clusters (centroid, member_count, intra_similarity, is_high_conf)
+            VALUES (?, 1, 1.0, 0)
+            """,
+            (emb_row["vector"],),
+        )
+        new_cluster_id = cursor.lastrowid
+        await db.execute(
+            "UPDATE faces SET cluster_id=? WHERE id=?", (new_cluster_id, face_id)
+        )
+
+
 @router.get("/{face_id}/thumbnail")
 async def get_face_thumbnail(face_id: int):
     """Serve the face crop thumbnail JPEG."""
@@ -64,12 +91,17 @@ async def get_faces_for_media(media_id: int):
 
 @router.delete("/{face_id}/from-cluster")
 async def remove_face_from_cluster(face_id: int):
-    """Detach a face from its cluster (user flagged it as incorrect)."""
+    """Detach a face from its cluster (user flagged it as incorrect).
+
+    The face is immediately placed in a new 1-member cluster so it reappears
+    in the unnamed faces list rather than disappearing until the next pipeline.
+    """
     async with get_db() as db:
         await db.execute(
             "UPDATE faces SET cluster_id=NULL, person_id=NULL WHERE id=?",
             (face_id,),
         )
+        await _requeue_as_singleton(db, face_id)
     return {"status": "removed", "face_id": face_id}
 
 
@@ -108,5 +140,9 @@ async def remove_face_from_person(face_id: int):
         # comparisons remain biased toward the ejected face.
         if row["person_id"]:
             await update_person_centroid(db, row["person_id"])
+
+        # Place the face in a new 1-member cluster so it immediately reappears
+        # in the unnamed-faces list rather than being lost until re-clustering.
+        await _requeue_as_singleton(db, face_id)
 
     return {"status": "removed", "face_id": face_id}

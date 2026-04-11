@@ -46,13 +46,20 @@ def _build_filter_clauses(
     state: str | None,
     folder_id: int | None = None,
     cluster_id: int | None = None,
+    path_prefix: str | None = None,
 ) -> tuple[list[str], list[str], list]:
     joins: list[str] = []
     # Always hide soft-removed photos from every query
     conditions: list[str] = ["mf.removed_from_app = 0"]
     params: list = []
 
-    if folder_id is not None:
+    if path_prefix is not None:
+        # Subfolder click — filter by a literal path prefix.
+        # Append '/' so that /Volumes/Photos/2023 doesn't accidentally match
+        # /Volumes/Photos/20230101.jpg.
+        conditions.append("mf.file_path LIKE ?")
+        params.append(path_prefix + "/%")
+    elif folder_id is not None:
         # Use a subquery — avoids a cross-product JOIN and handles nested paths cleanly
         conditions.append(
             "mf.file_path LIKE (SELECT folder_path || '/%' FROM scan_state WHERE id=?)"
@@ -99,6 +106,7 @@ async def count_media(
     state: str | None = None,
     folder_id: int | None = None,
     cluster_id: int | None = None,
+    path_prefix: str | None = None,
 ):
     """Return total count of media files matching the given filters."""
     joins, conditions, params = _build_filter_clauses(
@@ -108,6 +116,7 @@ async def count_media(
         state=state,
         folder_id=folder_id,
         cluster_id=cluster_id,
+        path_prefix=path_prefix,
     )
     sql = f"""
         SELECT COUNT(DISTINCT mf.id) AS n
@@ -134,6 +143,7 @@ async def list_media(
     tag_label: str | None = None,
     folder_id: int | None = None,
     cluster_id: int | None = None,
+    path_prefix: str | None = None,
 ):
     """
     List media files. All filters are combinable:
@@ -142,6 +152,7 @@ async def list_media(
       - tag_category + tag_label — photos with a specific ML tag
       - folder_id    — photos from a specific scanned folder
       - cluster_id   — photos that contain a face from this unnamed cluster
+      - path_prefix  — photos whose file_path starts with this directory path
     """
     joins, conditions, params = _build_filter_clauses(
         person_id=person_id,
@@ -150,6 +161,7 @@ async def list_media(
         state=state,
         folder_id=folder_id,
         cluster_id=cluster_id,
+        path_prefix=path_prefix,
     )
     params.extend([limit, offset])
     sql = f"""

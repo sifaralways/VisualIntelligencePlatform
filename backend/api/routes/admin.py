@@ -62,6 +62,29 @@ async def get_stats():
         )
         result["media_by_state"] = {r["ingest_state"]: r["n"] for r in rows}
 
+        # Geo-resolution breakdown: how many place tags came from each backend.
+        geo_rows = await db.execute_fetchall("""
+            SELECT model, COUNT(*) as n
+            FROM media_tags
+            WHERE category = 'place'
+              AND model IN ('mapkit', 'nominatim')
+            GROUP BY model
+        """)
+        result["geo_by_source"] = {r["model"]: r["n"] for r in geo_rows}
+
+        # Photos with a GPS-resolved place label vs. total photos with GPS coords.
+        gps_total = await db.execute_fetchall(
+            "SELECT COUNT(*) as n FROM media_files WHERE gps_lat IS NOT NULL AND gps_lon IS NOT NULL"
+        )
+        result["photos_with_gps"] = gps_total[0]["n"]
+
+        geo_resolved = await db.execute_fetchall("""
+            SELECT COUNT(DISTINCT media_file_id) as n
+            FROM media_tags
+            WHERE category = 'place' AND model IN ('mapkit', 'nominatim')
+        """)
+        result["photos_geo_resolved"] = geo_resolved[0]["n"]
+
         thumb_count = sum(1 for _ in settings.thumbnail_dir.glob("*.jpg"))
         result["thumbnail_files"] = thumb_count
 
@@ -117,8 +140,11 @@ async def reset(scope: str):
         async with get_db() as db:
             # Delete in FK dependency order:
             # writeback_queue → embeddings → faces → clusters → persons → media_files
+            # persons.portrait_face_id references faces(id) — must NULL it before
+            # deleting faces or SQLite raises a FOREIGN KEY constraint error.
             await db.execute("DELETE FROM writeback_queue")
             await db.execute("DELETE FROM embeddings")
+            await db.execute("UPDATE persons SET portrait_face_id=NULL")
             await db.execute("DELETE FROM faces")
             await db.execute("UPDATE clusters SET person_id=NULL")
             await db.execute("DELETE FROM clusters")
@@ -134,6 +160,7 @@ async def reset(scope: str):
         async with get_db() as db:
             await db.execute("DELETE FROM writeback_queue")
             await db.execute("DELETE FROM embeddings")
+            await db.execute("UPDATE persons SET portrait_face_id=NULL")
             await db.execute("DELETE FROM faces")
             await db.execute("UPDATE clusters SET person_id=NULL")
             await db.execute("DELETE FROM clusters")

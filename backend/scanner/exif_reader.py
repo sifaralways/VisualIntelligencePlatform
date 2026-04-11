@@ -220,6 +220,46 @@ def _parse_float(value: Any) -> float | None:
         return None
 
 
+import re as _re
+
+_GPS_DMS_RE = _re.compile(
+    r"""^\s*
+    (?P<deg>\d+(?:\.\d+)?)\s*deg\s+
+    (?P<min>\d+(?:\.\d+)?)['']\s+
+    (?P<sec>\d+(?:\.\d+)?)"\s*
+    (?P<hemi>[NSEWnsew])?
+    \s*$""",
+    _re.VERBOSE,
+)
+
+
+def _parse_gps_coord(value: Any) -> float | None:
+    """
+    Parse a GPS coordinate that ExifTool may return as either:
+      - A decimal number already (fast path): 33.808444
+      - A DMS string from -fast2 mode:        '33 deg 48' 30.40" S'
+
+    Returns a signed decimal degrees float, or None on failure.
+    South and West hemispheres produce negative values.
+    """
+    if value is None:
+        return None
+    # Fast path: already a number
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        pass
+    # Slow path: DMS string
+    m = _GPS_DMS_RE.match(str(value))
+    if not m:
+        return None
+    decimal = float(m.group("deg")) + float(m.group("min")) / 60.0 + float(m.group("sec")) / 3600.0
+    hemi = (m.group("hemi") or "").upper()
+    if hemi in ("S", "W"):
+        decimal = -decimal
+    return decimal
+
+
 def _parse_exposure_time(value: Any) -> float | None:
     """
     Convert ExifTool's ExposureTime to a float (seconds).
@@ -290,8 +330,8 @@ def _normalise(raw: dict[str, Any]) -> dict[str, Any]:
         "camera_make":     _get("Make"),
         "camera_model":    _get("Model"),
         "date_taken":      _get("DateTimeOriginal", "CreateDate", "ModifyDate"),
-        "gps_lat":         _parse_float(_get("GPSLatitude")),
-        "gps_lon":         _parse_float(_get("GPSLongitude")),
+        "gps_lat":         _parse_gps_coord(_get("GPSLatitude")),
+        "gps_lon":         _parse_gps_coord(_get("GPSLongitude")),
         "width":           _get("ImageWidth", "ExifImageWidth"),
         "height":          _get("ImageHeight", "ExifImageHeight"),
         # Shutter speed in seconds (e.g. 0.005 for 1/200 s, 2.0 for 2 s).

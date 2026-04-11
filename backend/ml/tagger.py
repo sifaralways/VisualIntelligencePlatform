@@ -40,6 +40,7 @@ class TagResult:
     animals: list[str]   = field(default_factory=list)
     geography: list[str] = field(default_factory=list)
     places: list[str]    = field(default_factory=list)
+    geo_source: str | None = None  # "mapkit" | "nominatim" | None (no GPS place)
 
     def is_empty(self) -> bool:
         return not any([self.objects, self.animals, self.geography, self.places])
@@ -144,7 +145,7 @@ class Tagger:
         except Exception as e:
             logger.warning("Landmark recognition failed for %s: %s", image_path.name, e)
 
-        # ── GPS → Place name (Nominatim) ────────────────────────────────────
+        # ── GPS → Place name (GeoResolver) ───────────────────────────────
         if gps_lat is not None and gps_lon is not None:
             try:
                 geo = self._geo.resolve(gps_lat, gps_lon)
@@ -152,6 +153,7 @@ class Tagger:
                     # Prepend GPS-derived place (highest priority)
                     if geo.label and geo.label not in result.places:
                         result.places.insert(0, geo.label)
+                    result.geo_source = geo.source
             except Exception as e:
                 logger.warning("Geo resolution failed: %s", e)
 
@@ -250,6 +252,7 @@ class Tagger:
                     geo = self._geo.resolve(gps_lat, gps_lon)
                     if geo and geo.label and geo.label not in result.places:
                         result.places.insert(0, geo.label)
+                        result.geo_source = geo.source
                 except Exception as e:
                     logger.warning("Geo resolution failed: %s", e)
 

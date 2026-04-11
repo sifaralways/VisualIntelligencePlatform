@@ -21,6 +21,9 @@ interface Stats {
   writeback_queue: number
   thumbnail_files: number
   media_by_state: Record<string, number>
+  geo_by_source: Record<string, number>
+  photos_with_gps: number
+  photos_geo_resolved: number
 }
 
 // ─── Reset actions available to the user ───────────────────────────────────
@@ -535,6 +538,33 @@ export default function AdminPage() {
                 ))}
               </div>
             )}
+
+            {/* ── Geo-resolution stats ─────────────────────────── */}
+            <div className="mt-4 bg-gray-900 border border-gray-800 rounded-xl px-4 py-3">
+              <p className="text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">Location resolution</p>
+              <div className="flex flex-wrap gap-6 text-sm">
+                <span className="text-gray-400">
+                  GPS photos: <span className="text-white font-medium">{stats.photos_with_gps ?? 0}</span>
+                </span>
+                <span className="text-gray-400">
+                  Resolved: <span className="text-white font-medium">{stats.photos_geo_resolved ?? 0}</span>
+                  {stats.photos_with_gps > 0 && (
+                    <span className="text-gray-600 ml-1">
+                      ({Math.round(((stats.photos_geo_resolved ?? 0) / stats.photos_with_gps) * 100)}%)
+                    </span>
+                  )}
+                </span>
+                {['mapkit', 'nominatim'].map(src => (
+                  <span key={src} className="text-gray-400">
+                    {src === 'mapkit' ? 'MapKit' : 'Nominatim'}:
+                    {' '}<span className={`font-medium ${src === 'mapkit' ? 'text-green-400' : 'text-yellow-400'}`}>
+                      {stats.geo_by_source?.[src] ?? 0}
+                    </span>
+                    <span className="text-gray-600 ml-1">place tags</span>
+                  </span>
+                ))}
+              </div>
+            </div>
           </>
         ) : (
           <p className="text-red-400 text-sm">Failed to load stats.</p>

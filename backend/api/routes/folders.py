@@ -51,6 +51,59 @@ async def list_folders():
 
 
 # ---------------------------------------------------------------------------
+# Subfolder tree — flat list of all directories inside a scanned folder
+# ---------------------------------------------------------------------------
+
+@router.get("/{folder_id}/subfolders")
+async def list_subfolders(folder_id: int):
+    """
+    Return every unique directory path that exists below a scanned folder's
+    root, together with the recursive photo count for each.
+
+    The frontend builds a tree from this flat list.  A path like
+    /Volumes/Photos/2023/January will appear as one entry; clicking it
+    filters by path_prefix=/Volumes/Photos/2023/January (all photos whose
+    file_path starts with that prefix).
+    """
+    async with get_db() as db:
+        folder_row = await (await db.execute(
+            "SELECT folder_path FROM scan_state WHERE id=?", (folder_id,)
+        )).fetchone()
+        if not folder_row:
+            raise HTTPException(status_code=404, detail="Folder not found")
+
+        root: str = folder_row["folder_path"]
+
+        # Fetch all active file paths under the root in one query.
+        rows = await db.execute_fetchall(
+            "SELECT file_path FROM media_files WHERE file_path LIKE ? AND removed_from_app=0",
+            (root + "/%",),
+        )
+
+    # Build a set of all ancestor directory paths that lie strictly between
+    # the root and each file.  Count each file once for every ancestor dir.
+    from collections import defaultdict
+    counts: dict[str, int] = defaultdict(int)
+
+    root_prefix = root + "/"
+    for row in rows:
+        rel = row["file_path"][len(root_prefix):]   # e.g. "2023/January/IMG.jpg"
+        parts = rel.split("/")
+        # parts[-1] is the file name; parts[:-1] are the directory segments
+        for depth in range(1, len(parts)):
+            sub = root_prefix + "/".join(parts[:depth])
+            counts[sub] += 1
+
+    # Sort so that parents always precede their children (lexicographic on path
+    # works because we use full absolute paths).
+    results = [
+        {"path": p, "name": p.split("/")[-1], "photo_count": c}
+        for p, c in sorted(counts.items())
+    ]
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Remove an entire folder from the app (soft-remove all its media)
 # ---------------------------------------------------------------------------
 

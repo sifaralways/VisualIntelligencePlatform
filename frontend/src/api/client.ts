@@ -51,6 +51,7 @@ export const api = {
       if (params.tag_category)        q.set('tag_category', params.tag_category)
       if (params.tag_label)           q.set('tag_label',    params.tag_label)
       if (params.folder_id != null)   q.set('folder_id',    String(params.folder_id))
+      if (params.path_prefix)         q.set('path_prefix',  params.path_prefix)
       return request<MediaFile[]>(`/media?${q}`)
     },
     count: (params: Omit<MediaFilter, 'limit' | 'offset'> = {}) => {
@@ -61,6 +62,7 @@ export const api = {
       if (params.tag_category)        q.set('tag_category', params.tag_category)
       if (params.tag_label)           q.set('tag_label',    params.tag_label)
       if (params.folder_id != null)   q.set('folder_id',    String(params.folder_id))
+      if (params.path_prefix)         q.set('path_prefix',  params.path_prefix)
       return request<{ count: number }>(`/media/count?${q}`)
     },
     get: (id: number) => request<MediaFile>(`/media/${id}`),
@@ -83,8 +85,8 @@ export const api = {
 
   // ─── Folders ──────────────────────────────────────────────────────────────
   folders: {
-    list: () => request<FolderItem[]>('/folders'),
-    removeFromApp: (folderId: number, force = false) =>
+    list: () => request<FolderItem[]>('/folders'),    subfolders: (folderId: number) =>
+      request<SubfolderItem[]>(`/folders/${folderId}/subfolders`),    removeFromApp: (folderId: number, force = false) =>
       request<RemoveResult>(`/folders/${folderId}/remove-from-app?force=${force}`, {
         method: 'POST',
       }),
@@ -295,6 +297,7 @@ export interface MediaFilter {
   tag_category?: string
   tag_label?: string
   folder_id?: number
+  path_prefix?: string
 }
 
 export interface FolderItem {
@@ -305,6 +308,12 @@ export interface FolderItem {
   status: string
   active_count: number
   pending_writeback_count: number
+}
+
+export interface SubfolderItem {
+  path: string
+  name: string
+  photo_count: number
 }
 
 export interface RemoveResult {

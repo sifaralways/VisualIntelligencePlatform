@@ -2049,7 +2049,20 @@ async def _phase_tag() -> None:
 
             # Batch-persist all tags and state transitions in one DB write.
             async with get_db() as db:
+                # Clear stale place tags before re-inserting so that a
+                # force_retag run doesn't leave old Nominatim labels alongside
+                # new MapKit-resolved labels (UNIQUE is on (file, category,
+                # label) so differing strings would both survive INSERT OR IGNORE).
+                if media_ids:
+                    placeholders = ",".join("?" * len(media_ids))
+                    await db.execute(
+                        f"DELETE FROM media_tags WHERE category='place' "
+                        f"AND media_file_id IN ({placeholders})",
+                        media_ids,
+                    )
+
                 tag_rows: list[tuple] = []
+                gps_resolved_ids: list[int] = []   # files that got a GPS-resolved place label
                 for media_id, result, (gps_lat, gps_lon) in zip(
                     media_ids, tag_results, gps_data
                 ):
@@ -2060,12 +2073,14 @@ async def _phase_tag() -> None:
                     for label in result.geography:
                         tag_rows.append((media_id, "geography", label, None, "places365"))
                     for label in result.places:
-                        model = (
-                            "nominatim"
-                            if gps_lat is not None and label == result.places[0]
-                            else "clip"
-                        )
+                        # First place label is the GPS-derived one when geo_source is set.
+                        # Use the actual resolver name (mapkit/nominatim) so we can
+                        # track source provenance in the DB; fall back to "clip".
+                        is_geo_place = result.geo_source is not None and label == result.places[0]
+                        model = result.geo_source if is_geo_place else "clip"
                         tag_rows.append((media_id, "place", label, None, model))
+                        if is_geo_place:
+                            gps_resolved_ids.append(media_id)
 
                 if tag_rows:
                     await db.executemany("""
@@ -2073,6 +2088,14 @@ async def _phase_tag() -> None:
                             (media_file_id, category, label, confidence, model)
                         VALUES (?,?,?,?,?)
                     """, tag_rows)
+
+                # Queue files that received a GPS-resolved place label for
+                # writeback so the location name reaches EXIF/XMP automatically.
+                if gps_resolved_ids:
+                    await db.executemany(
+                        "INSERT OR REPLACE INTO writeback_queue (media_file_id) VALUES (?)",
+                        [(mid,) for mid in gps_resolved_ids],
+                    )
 
                 # Mark tagging complete and advance ingest_state.
                 # tags_done = 1 causes this file to be skipped on future

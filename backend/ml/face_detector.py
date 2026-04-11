@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 from backend.config import settings
 from backend.database.settings_store import get as get_setting
@@ -182,7 +182,17 @@ class FaceDetector:
 
         try:
             pil_img = Image.open(image_path)
+            # Capture raw EXIF before transpose (used for focal-length signal in
+            # Intelligent mode).  The _getexif() call must happen on the original
+            # opened image; after exif_transpose the attribute may be missing.
             exif_data = pil_img._getexif() if hasattr(pil_img, '_getexif') else None  # type: ignore[attr-defined]
+            # Apply EXIF orientation so the numpy array always has physically upright
+            # pixels regardless of how the preview JPEG was generated.  For previews
+            # that were already correctly oriented (Orientation=1 or no tag) this is
+            # a no-op.  For any preview with a residual orientation tag (e.g. stale
+            # cached preview from before the orientation-correction code was added),
+            # this ensures the face crop and its saved thumbnail are correctly oriented.
+            pil_img = ImageOps.exif_transpose(pil_img)
             img = np.array(pil_img.convert("RGB"))
         except Exception as e:
             logger.warning("Cannot open image %s: %s", image_path, e)
