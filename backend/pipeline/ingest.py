@@ -173,6 +173,9 @@ async def run_reprocess(force_retag: bool = False) -> None:
     # embeddings from mixed files (some named, some unnamed).
     await _phase_cluster()
 
+    # Step 3a: Absorb HDBSCAN noise singletons into nearby clusters.
+    await _phase_recover_singletons()
+
     # Step 4: Auto-merge + suppress.
     # Matches new clusters → named persons (auto-name or suggestion).
     # Matches new clusters → ignored persons (silently suppressed).
@@ -344,6 +347,7 @@ async def run_single_reprocess(media_id: int) -> None:
     # guard in _phase_embed sees no existing embeddings and processes normally.
     await _phase_embed()
     await _phase_cluster()
+    await _phase_recover_singletons()
     await _phase_auto_merge()
     await _phase_restore_vip_names()
 
@@ -436,6 +440,7 @@ async def run_batch_reprocess(media_ids: list[int]) -> None:
     # guard in _phase_embed sees no existing embeddings and processes normally.
     await _phase_embed()
     await _phase_cluster()
+    await _phase_recover_singletons()
     await _phase_auto_merge()
     await _phase_restore_vip_names()
 
@@ -612,10 +617,11 @@ async def run_model_migration() -> None:
     await broadcast("phase_complete", phase="redetect_prep")
 
     # ------------------------------------------------------------------
-    # Step 4: Re-detect + embed → cluster → auto-merge → name-restore
+    # Step 4: Re-detect + embed → cluster → singleton-recovery → auto-merge → name-restore
     # ------------------------------------------------------------------
     await _phase_embed()
     await _phase_cluster()
+    await _phase_recover_singletons()
     await _phase_auto_merge()
     await _phase_restore_vip_names()
 
@@ -672,6 +678,9 @@ async def run_ingest(folder: str) -> None:
 
     # -- Phase 3: Cluster ---------------------------------------------------
     await _phase_cluster()
+
+    # -- Phase 3a: Singleton recovery — FAISS nearest-neighbour pass --------
+    await _phase_recover_singletons()
 
     # -- Phase 3b: Auto-merge high-conf + surface borderline suggestions ----
     await _phase_auto_merge()
@@ -1214,6 +1223,219 @@ async def _phase_cluster() -> None:
 
     await broadcast("phase_complete", phase="cluster", clusters=len(results))
     logger.info("Phase 3 complete: %d clusters", len(results))
+
+
+# ---------------------------------------------------------------------------
+# Phase 3a: Singleton recovery — FAISS nearest-neighbour pass
+# ---------------------------------------------------------------------------
+
+async def _phase_recover_singletons() -> None:
+    """Absorb HDBSCAN noise singletons into existing clusters using FAISS.
+
+    Problem: HDBSCAN labels low-density faces as noise (label=-1).  VIP
+    promotes each noise face to its own singleton cluster so it appears in
+    the UI.  The same person may appear twice in the same album yet end up
+    as a real cluster (5 photos) + 2 singletons (bad angle, dark photo).
+
+    Fix: After clustering, query FAISS with each singleton's centroid and
+    find the k nearest face embeddings.  If the closest match belongs to
+    an existing multi-face cluster (or a named person), absorb the singleton:
+
+    - similarity >= singleton_auto_merge  → silent merge into cluster/person
+    - similarity >= merge_suggest_threshold → surface as a suggestion card
+
+    Only singletons are considered as the query side; any non-singleton can
+    already appear as a neighbor.  Named-person clusters are valid targets
+    (a singleton may be a known person photographed in an unusual situation).
+
+    The FAISS index built by _phase_cluster() is reused in memory — no
+    rebuild needed.  This phase is O(S × k) in FAISS lookups where S is the
+    number of singletons and k is small (default 20).
+    """
+    from backend.database.settings_store import get as get_setting
+    from backend.pipeline.centroid import update_person_centroid, load_centroid
+
+    if _faiss.total == 0:
+        logger.info("Phase 3a: FAISS index empty — skipping singleton recovery")
+        return
+
+    auto_th    = float(get_setting("auto_name_threshold"))   # default 0.98
+    suggest_th = float(get_setting("merge_suggest_threshold"))  # default 0.63
+
+    # Singleton recovery uses a slightly lower auto-threshold than person
+    # auto-naming.  Two near-identical embeddings that both ended up as
+    # HDBSCAN singletons almost certainly belong together.
+    singleton_auto_th = max(suggest_th, min(auto_th, 0.88))
+
+    logger.info(
+        "Phase 3a: Singleton recovery (auto≥%.2f, suggest≥%.2f)",
+        singleton_auto_th, suggest_th,
+    )
+    await broadcast("phase_start", phase="singleton_recovery")
+
+    # -- Load singleton clusters (member_count == 1, person_id IS NULL) -----
+    async with get_db() as db:
+        singleton_rows = await db.execute_fetchall("""
+            SELECT c.id AS cluster_id, c.centroid,
+                   MIN(f.id) AS face_id
+            FROM clusters c
+            JOIN faces f ON f.cluster_id = c.id
+            WHERE c.member_count = 1
+              AND c.person_id IS NULL
+            GROUP BY c.id
+        """)
+
+        # Build face_id → cluster_id map for all non-singleton unnamed clusters
+        # (needed to find which cluster a FAISS hit belongs to)
+        face_to_cluster_rows = await db.execute_fetchall("""
+            SELECT f.id AS face_id, f.cluster_id, c.member_count,
+                   f.person_id,
+                   c.person_id AS cluster_person_id
+            FROM faces f
+            JOIN clusters c ON c.id = f.cluster_id
+            WHERE f.cluster_id IS NOT NULL
+        """)
+
+    face_to_cluster: dict[int, dict] = {
+        r["face_id"]: {
+            "cluster_id":        r["cluster_id"],
+            "member_count":      r["member_count"],
+            "person_id":         r["cluster_person_id"],
+        }
+        for r in face_to_cluster_rows
+    }
+
+    if not singleton_rows:
+        logger.info("Phase 3a: No singleton clusters to recover")
+        await broadcast("phase_complete", phase="singleton_recovery", merged=0)
+        return
+
+    auto_merged   = 0
+    suggestions: list[dict] = []
+    # Track clusters we've already absorbed a singleton into this run
+    # to prevent the same target being suggested multiple times in one pass
+    already_targeted: set[int] = set()
+
+    for row in singleton_rows:
+        singleton_cluster_id = row["cluster_id"]
+        if not row["centroid"]:
+            continue
+        centroid = load_centroid(row["centroid"])
+
+        # Query FAISS — exclude the singleton's own face from hits (it's in
+        # the index too; subtract 1 from k so we always get real neighbours)
+        hits = _faiss.search(centroid, k=21, threshold=suggest_th)
+        # Filter out the singleton's own face
+        own_face_id = row["face_id"]
+        hits = [(fid, sim) for fid, sim in hits if fid != own_face_id]
+
+        if not hits:
+            continue
+
+        best_face_id, best_sim = hits[0]
+        target = face_to_cluster.get(best_face_id)
+        if target is None:
+            continue
+
+        target_cluster_id = target["cluster_id"]
+        target_person_id  = target["person_id"]
+
+        if target_cluster_id == singleton_cluster_id:
+            continue   # hit itself somehow
+
+        if best_sim >= singleton_auto_th:
+            # ── Silent auto-merge: move singleton faces into target cluster ─
+            if target_cluster_id in already_targeted:
+                continue
+            async with get_db() as db:
+                # Move the singleton's face(s) into the target cluster
+                await db.execute(
+                    "UPDATE faces SET cluster_id=?, person_id=? WHERE cluster_id=?",
+                    (target_cluster_id, target_person_id, singleton_cluster_id),
+                )
+                # Delete the now-empty singleton cluster row
+                await db.execute(
+                    "DELETE FROM clusters WHERE id=?", (singleton_cluster_id,)
+                )
+                # Update target cluster member count
+                await db.execute("""
+                    UPDATE clusters SET member_count = (
+                        SELECT COUNT(*) FROM faces WHERE cluster_id = ?
+                    ) WHERE id = ?
+                """, (target_cluster_id, target_cluster_id))
+                # Also update centroid of the target cluster by recomputing
+                # from its embeddings (now includes the absorbed singleton)
+                emb_rows = await db.execute_fetchall("""
+                    SELECT e.vector FROM embeddings e
+                    JOIN faces f ON f.id = e.face_id
+                    WHERE f.cluster_id = ?
+                """, (target_cluster_id,))
+                if emb_rows:
+                    vecs = np.stack([
+                        np.frombuffer(r["vector"], dtype=np.float32)
+                        for r in emb_rows
+                    ])
+                    new_centroid = vecs.mean(axis=0)
+                    norm = np.linalg.norm(new_centroid)
+                    if norm > 0:
+                        new_centroid /= norm
+                    await db.execute(
+                        "UPDATE clusters SET centroid=? WHERE id=?",
+                        (new_centroid.tobytes(), target_cluster_id),
+                    )
+                # If the target cluster belongs to a named person, refresh
+                # the person's centroid and queue photos for writeback.
+                if target_person_id is not None:
+                    await update_person_centroid(db, target_person_id)
+                    await db.execute("""
+                        INSERT OR REPLACE INTO writeback_queue (media_file_id)
+                        SELECT DISTINCT media_file_id FROM faces WHERE cluster_id=?
+                    """, (target_cluster_id,))
+
+            already_targeted.add(target_cluster_id)
+            auto_merged += 1
+            logger.debug(
+                "Singleton %d absorbed into cluster %d (sim=%.3f)",
+                singleton_cluster_id, target_cluster_id, best_sim,
+            )
+
+        else:
+            # ── Suggestion (between suggest_th and singleton_auto_th) ───────
+            # Look up the representative thumbnail for the target cluster
+            async with get_db() as db:
+                rep = await (await db.execute("""
+                    SELECT MIN(f.thumbnail_path) AS thumb, c.member_count
+                    FROM clusters c
+                    JOIN faces f ON f.cluster_id = c.id AND f.thumbnail_path IS NOT NULL
+                    WHERE c.id = ?
+                    GROUP BY c.id
+                """, (target_cluster_id,))).fetchone()
+                s_rep = await (await db.execute("""
+                    SELECT MIN(f.thumbnail_path) AS thumb
+                    FROM faces f WHERE f.cluster_id = ?
+                """, (singleton_cluster_id,))).fetchone()
+
+            suggestions.append({
+                "singleton_cluster_id": singleton_cluster_id,
+                "singleton_thumb": s_rep["thumb"] if s_rep else None,
+                "target_cluster_id": target_cluster_id,
+                "target_person_id":  target_person_id,
+                "target_member_count": rep["member_count"] if rep else 1,
+                "target_thumb": rep["thumb"] if rep else None,
+                "similarity": round(best_sim, 3),
+            })
+
+    # Broadcast a summary so the frontend can refresh the People tab
+    await broadcast(
+        "phase_complete",
+        phase="singleton_recovery",
+        merged=auto_merged,
+        suggestions=len(suggestions),
+    )
+    logger.info(
+        "Phase 3a: %d singletons absorbed, %d suggestions",
+        auto_merged, len(suggestions),
+    )
 
 
 # ---------------------------------------------------------------------------

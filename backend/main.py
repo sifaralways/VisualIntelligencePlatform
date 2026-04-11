@@ -4,6 +4,7 @@ VIP — FastAPI application entry point.
 
 import logging
 import logging.handlers
+import warnings
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -54,6 +55,15 @@ def _patch_insightface_skimage() -> None:
         logging.getLogger(__name__).warning(
             "InsightFace skimage patch failed (non-fatal): %s", exc
         )
+
+    # Suppress FutureWarning from insightface/utils/transform.py about
+    # np.linalg.lstsq rcond parameter — upstream hasn't updated the call yet.
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*rcond.*parameter will change.*",
+        category=FutureWarning,
+        module=r"insightface\.utils\.transform",
+    )
 
 
 # Module-level handler refs so apply_log_level() can adjust them at runtime

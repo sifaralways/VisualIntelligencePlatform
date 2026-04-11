@@ -163,6 +163,24 @@ async def _preview_from_direct_image(image_path: Path) -> Optional[Path]:
     return out_path if success else None
 
 
+def _is_ftyp_container(src: Path) -> bool:
+    """
+    Return True if the file is an ISO Base Media container (HEIC, AVIF, MP4, …)
+    regardless of its file extension.
+
+    Google Photos and some cloud services export iPhone HEIC photos with a .jpg
+    extension. macOS Preview handles them fine via ImageIO, but Pillow reads the
+    magic bytes and throws "cannot identify image file" on the HEIC `ftyp` box.
+    Detecting the actual format lets us route these files to `sips`.
+    """
+    try:
+        with open(src, "rb") as f:
+            header = f.read(12)
+        return len(header) >= 8 and header[4:8] == b"ftyp"
+    except OSError:
+        return False
+
+
 def _direct_image_to_jpeg(src: Path, dst: Path) -> bool:
     """
     Convert a direct image (JPEG or AVIF) to a normalised JPEG in the preview
@@ -177,10 +195,18 @@ def _direct_image_to_jpeg(src: Path, dst: Path) -> bool:
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
 
+    # Guard: ensure the file is readable (triggers iCloud materialisation on
+    # evicted stubs, and catches transient network-volume unavailability).
+    if not materialise_file(src):
+        logger.error("Cannot access %s — skipping preview generation", src.name)
+        return False
+
     # HEIC, HEIF, AVIF and PSD are decoded via macOS sips — Pillow has no
     # native codec for these formats in standard pip wheels.
+    # Also catch HEIC/AVIF files that carry a .jpg extension (common in Google
+    # Photos and iCloud exports — their `ftyp` box reveals the true format).
     _SIPS_SUFFIXES = frozenset({".avif", ".heic", ".heif", ".psd"})
-    if src.suffix.lower() in _SIPS_SUFFIXES:
+    if src.suffix.lower() in _SIPS_SUFFIXES or _is_ftyp_container(src):
         return _sips_to_jpeg(src, dst)
 
     # PNG, WebP, TIFF, JPEG — Pillow handles all of these natively.

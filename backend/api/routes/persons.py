@@ -2,21 +2,179 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import uuid as _uuid
 from typing import Optional
 
 import numpy as np
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
 from backend.database.db import get_db
 from backend.database.models import Person
-from backend.pipeline.centroid import update_person_centroid
+from backend.pipeline.centroid import update_person_centroid, load_centroid
+from backend.api.websocket import broadcast
 
 # Minimum cosine similarity to surface a merge suggestion
 _SUGGEST_THRESHOLD = 0.50
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Post-merge FAISS re-score
+# ---------------------------------------------------------------------------
+
+async def _rescore_after_person_update(person_id: int) -> None:
+    """Query FAISS with the updated person centroid and surface new suggestions.
+
+    Called after any user action that changes a person's face membership
+    (name, merge, add-cluster).  The updated centroid is already written to
+    the DB before this is called.
+
+    Steps:
+    1. Load the person's stored centroid from DB.
+    2. Query the in-memory FAISS index for the k nearest face embeddings.
+    3. For each hit that belongs to an unnamed cluster:
+       - sim >= auto_name_threshold  → auto-assign silently (same as Phase 3b)
+       - sim >= merge_suggest_threshold → broadcast as a suggestion card
+    4. Broadcast the suggestions via WebSocket so the frontend can show cards.
+
+    This runs as a fire-and-forget background task so the API response is
+    instant — the WebSocket event arrives shortly after.
+    """
+    try:
+        from backend.pipeline.ingest import _faiss
+        from backend.database.settings_store import get as get_setting
+
+        auto_th    = float(get_setting("auto_name_threshold"))
+        suggest_th = float(get_setting("merge_suggest_threshold"))
+
+        if _faiss.total == 0:
+            return
+
+        # Load the person's current centroid
+        async with get_db() as db:
+            p_row = await (await db.execute(
+                "SELECT name, centroid FROM persons WHERE id=? AND is_merged=0",
+                (person_id,),
+            )).fetchone()
+        if not p_row or not p_row["centroid"]:
+            return
+
+        person_name = p_row["name"]
+        person_centroid = load_centroid(p_row["centroid"])
+
+        # FAISS NN search — get the 30 closest face embeddings
+        hits = _faiss.search(person_centroid, k=30, threshold=suggest_th)
+        if not hits:
+            return
+
+        # Map hit face_ids → cluster info in one DB query
+        hit_face_ids = [fid for fid, _ in hits]
+        ph = ",".join("?" * len(hit_face_ids))
+        async with get_db() as db:
+            rows = await db.execute_fetchall(f"""
+                SELECT f.id AS face_id,
+                       f.cluster_id,
+                       f.person_id,
+                       f.thumbnail_path,
+                       c.member_count,
+                       c.person_id AS cluster_person_id,
+                       MIN(f2.thumbnail_path) AS cluster_thumb
+                FROM faces f
+                LEFT JOIN clusters c ON c.id = f.cluster_id
+                LEFT JOIN faces f2 ON f2.cluster_id = f.cluster_id
+                    AND f2.thumbnail_path IS NOT NULL
+                WHERE f.id IN ({ph})
+                  AND f.cluster_id IS NOT NULL
+                GROUP BY f.id
+            """, hit_face_ids)
+
+            rejected_rows = await db.execute_fetchall(
+                "SELECT cluster_id FROM rejected_suggestions WHERE person_id=?",
+                (person_id,),
+            )
+
+        rejected_cluster_ids = {r["cluster_id"] for r in rejected_rows}
+
+        hit_map: dict[int, dict] = {r["face_id"]: dict(r) for r in rows}
+
+        suggestions: list[dict] = []
+        auto_named = 0
+        seen_clusters: set[int] = set()
+
+        for face_id, sim in hits:
+            info = hit_map.get(face_id)
+            if info is None:
+                continue
+            cluster_id = info["cluster_id"]
+            if cluster_id in seen_clusters:
+                continue
+            # Skip faces that already belong to this person or another named person
+            if info["cluster_person_id"] is not None:
+                # Allow if it belongs to THIS person (already named, skip)
+                # Skip if it belongs to a DIFFERENT person
+                seen_clusters.add(cluster_id)
+                continue
+            if cluster_id in rejected_cluster_ids:
+                seen_clusters.add(cluster_id)
+                continue
+
+            seen_clusters.add(cluster_id)
+
+            if sim >= auto_th:
+                # Auto-assign this unnamed cluster to the person
+                async with get_db() as db:
+                    await db.execute(
+                        "UPDATE clusters SET person_id=? WHERE id=?",
+                        (person_id, cluster_id),
+                    )
+                    await db.execute(
+                        "UPDATE faces SET person_id=? WHERE cluster_id=?",
+                        (person_id, cluster_id),
+                    )
+                    await db.execute("""
+                        UPDATE persons SET photo_count=(
+                            SELECT COUNT(DISTINCT media_file_id) FROM faces WHERE person_id=?
+                        ) WHERE id=?
+                    """, (person_id, person_id))
+                    await db.execute("""
+                        INSERT OR REPLACE INTO writeback_queue (media_file_id)
+                        SELECT DISTINCT media_file_id FROM faces WHERE cluster_id=?
+                    """, (cluster_id,))
+                    await update_person_centroid(db, person_id)
+                auto_named += 1
+                logger.info(
+                    "Post-merge FAISS: auto-named cluster %d → '%s' (sim=%.3f)",
+                    cluster_id, person_name, sim,
+                )
+
+            elif sim >= suggest_th:
+                suggestions.append({
+                    "person_id":       person_id,
+                    "person_name":     person_name,
+                    "person_face_id":  None,
+                    "cluster_id":      cluster_id,
+                    "cluster_face_id": face_id,
+                    "similarity":      round(sim, 3),
+                    "member_count":    info["member_count"] or 1,
+                })
+
+        if suggestions:
+            # Deduplicate and cap at 5 — don't flood the UI
+            suggestions.sort(key=lambda s: s["similarity"], reverse=True)
+            await broadcast("merge_suggestions", suggestions=suggestions[:5])
+            logger.info(
+                "Post-merge FAISS: %d auto-named, %d suggestions for '%s'",
+                auto_named, len(suggestions), person_name,
+            )
+
+    except Exception as exc:
+        # Non-fatal — log and continue; the user action already succeeded
+        logger.warning("_rescore_after_person_update failed (non-fatal): %s", exc)
 
 
 class NamePersonRequest(BaseModel):
@@ -272,7 +430,7 @@ async def unignore_person(person_id: int):
 
 
 @router.patch("/{person_id}/name")
-async def name_person(person_id: int, req: NamePersonRequest):
+async def name_person(person_id: int, req: NamePersonRequest, background_tasks: BackgroundTasks):
     """Assign or update the name of a person."""
     async with get_db() as db:
         existing = await (
@@ -298,6 +456,7 @@ async def name_person(person_id: int, req: NamePersonRequest):
         # Persist centroid so this person is recognisable in future scans
         await update_person_centroid(db, person_id)
 
+    background_tasks.add_task(_rescore_after_person_update, person_id)
     return {"status": "ok", "name": req.name}
 
 
@@ -323,6 +482,7 @@ async def merge_named_persons(
     person_a_id: int,
     person_b_id: int,
     req: MergeNamedPersonsRequest,
+    background_tasks: BackgroundTasks,
 ):
     """
     Merge two named persons into a single record end-to-end.
@@ -439,6 +599,7 @@ async def merge_named_persons(
         # 8. Recompute centroid from all merged embeddings.
         await update_person_centroid(db, survivor_id)
 
+    background_tasks.add_task(_rescore_after_person_update, survivor_id)
     return {
         "status": "merged",
         "survivor_id": survivor_id,
@@ -453,7 +614,7 @@ class NameClusterRequest(BaseModel):
 
 
 @router.post("/from-cluster/{cluster_id}")
-async def create_person_from_cluster(cluster_id: int, req: NameClusterRequest):
+async def create_person_from_cluster(cluster_id: int, req: NameClusterRequest, background_tasks: BackgroundTasks):
     """Create a named person from a cluster in one step."""
     async with get_db() as db:
         person_uuid = str(_uuid.uuid4())
@@ -479,11 +640,12 @@ async def create_person_from_cluster(cluster_id: int, req: NameClusterRequest):
         # Persist centroid — this person now has embeddings to match against
         await update_person_centroid(db, person_id)
 
+    background_tasks.add_task(_rescore_after_person_update, person_id)
     return {"status": "created", "person_id": person_id, "uuid": person_uuid}
 
 
 @router.post("/{person_id}/add-cluster/{cluster_id}")
-async def add_cluster_to_person(person_id: int, cluster_id: int):
+async def add_cluster_to_person(person_id: int, cluster_id: int, background_tasks: BackgroundTasks):
     """Assign an existing cluster to an existing person (merge path)."""
     async with get_db() as db:
         existing = await (
@@ -515,6 +677,7 @@ async def add_cluster_to_person(person_id: int, cluster_id: int):
         # Refresh centroid with the newly-added cluster's embeddings
         await update_person_centroid(db, person_id)
 
+    background_tasks.add_task(_rescore_after_person_update, person_id)
     return {"status": "merged", "person_id": person_id}
 
 
