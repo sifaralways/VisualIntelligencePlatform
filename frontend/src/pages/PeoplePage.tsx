@@ -13,9 +13,11 @@ import type { Cluster, Person, MergeSuggestion, FaceRow, SimilarCluster, MergePe
 interface Props {
   /** Called when user clicks a named person tile to view their photos. */
   onSelectPerson?: (personId: number, name: string) => void
+  /** Called when user clicks an unnamed cluster tile to view its photos. */
+  onSelectCluster?: (clusterId: number) => void
 }
 
-export default function PeoplePage({ onSelectPerson }: Props) {
+export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   const [clusters, setClusters] = useState<Cluster[]>([])
   const [persons, setPersons] = useState<Person[]>([])
   const [loading, setLoading] = useState(true)
@@ -874,6 +876,7 @@ export default function PeoplePage({ onSelectPerson }: Props) {
                 selectMode={selectMode}
                 isSelected={selected.has(c.id)}
                 onToggleSelect={(shiftHeld) => rangeSelect(idx, shiftHeld)}
+                onViewPhotos={() => onSelectCluster?.(c.id)}
                 onStartNaming={() => { if (!selectMode) { setNamingId(c.id); setNameInput('') } }}
                 onNameInput={setNameInput}
                 onConfirm={() => handleName(c.id)}
@@ -1331,11 +1334,15 @@ export default function PeoplePage({ onSelectPerson }: Props) {
                 return (
                   <div key={p.id} className="flex flex-col items-center gap-2">
                     <div className="relative">
-                      <div className="w-20 h-20 rounded-xl overflow-hidden bg-gray-800 border border-red-900 opacity-60">
+                      <button
+                        onClick={() => onSelectPerson?.(p.id, 'Ignored face')}
+                        title="View photos"
+                        className="w-20 h-20 rounded-xl overflow-hidden bg-gray-800 border border-red-900 opacity-60 hover:opacity-90 hover:border-indigo-500 transition-all"
+                      >
                         {thumbUrl
                           ? <img src={thumbUrl} alt="ignored face" className="w-full h-full object-cover" />
                           : <span className="flex items-center justify-center h-full text-gray-600 text-2xl">👤</span>}
-                      </div>
+                      </button>
                       <span className="absolute bottom-0 right-0 bg-red-900 text-red-300 text-xs px-1 rounded-tl leading-tight">
                         {p.photo_count}
                       </span>
@@ -1358,10 +1365,11 @@ export default function PeoplePage({ onSelectPerson }: Props) {
   )
 }
 
-function ClusterTile({ cluster, isNaming, nameInput, saving, personNames, selectMode, isSelected, onToggleSelect, onStartNaming, onNameInput, onConfirm, onCancel, onDismiss }: {
+function ClusterTile({ cluster, isNaming, nameInput, saving, personNames, selectMode, isSelected, onToggleSelect, onViewPhotos, onStartNaming, onNameInput, onConfirm, onCancel, onDismiss }: {
   cluster: Cluster; isNaming: boolean; nameInput: string; saving: boolean
   personNames: string[]
   selectMode: boolean; isSelected: boolean; onToggleSelect: (shiftHeld: boolean) => void
+  onViewPhotos: () => void
   onStartNaming: () => void; onNameInput: (v: string) => void; onConfirm: () => void; onCancel: () => void
   onDismiss: () => void
 }) {
@@ -1377,7 +1385,8 @@ function ClusterTile({ cluster, isNaming, nameInput, saving, personNames, select
     <div className="flex flex-col items-center gap-2">
       <div className="relative group">
         <button
-          onClick={e => selectMode ? onToggleSelect(e.shiftKey) : onStartNaming()}
+          onClick={e => selectMode ? onToggleSelect(e.shiftKey) : onViewPhotos()}
+          title={selectMode ? (isSelected ? 'Deselect' : 'Select') : `View photos`}
           className={'relative w-20 h-20 rounded-xl overflow-hidden bg-gray-800 border transition-colors ' +
             (selectMode
               ? isSelected
@@ -1402,6 +1411,16 @@ function ClusterTile({ cluster, isNaming, nameInput, saving, personNames, select
             </span>
           )}
         </button>
+        {/* Name icon — shown on hover, hidden in select mode */}
+        {!selectMode && !isNaming && (
+          <button
+            onClick={e => { e.stopPropagation(); onStartNaming() }}
+            title="Name this face"
+            className="absolute -top-1 -left-1 bg-gray-700 hover:bg-indigo-700 border border-gray-600 rounded-full w-5 h-5 text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+          >
+            ✎
+          </button>
+        )}
         {/* Dismiss button — shown on hover, hidden in select mode */}
         {!selectMode && (
           <button
@@ -1453,7 +1472,7 @@ function ClusterTile({ cluster, isNaming, nameInput, saving, personNames, select
           </button>
         </div>
       ) : (
-        <span className="text-xs text-gray-500 italic">tap to name</span>
+        <span className="text-xs text-gray-500 italic">✎ to name</span>
       )}
     </div>
   )

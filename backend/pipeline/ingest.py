@@ -316,17 +316,20 @@ async def run_single_reprocess(media_id: int) -> None:
         return
 
     async with get_db() as db:
-        # Drop embeddings for unowned faces on this file only
+        # Drop ALL embeddings for every face on this file (named and unnamed).
+        # Keeping named-person face rows while force-re-detecting inserts a
+        # second identical row for every already-named face, creating duplicates.
+        # person centroids are persisted in the persons table so _phase_auto_merge
+        # will re-assign names to the new clusters at high confidence (≥0.98).
         await db.execute("""
             DELETE FROM embeddings
             WHERE face_id IN (
-                SELECT id FROM faces
-                WHERE media_file_id = ? AND person_id IS NULL
+                SELECT id FROM faces WHERE media_file_id = ?
             )
         """, (media_id,))
-        # Drop the unowned face rows
+        # Drop ALL face rows for this file
         await db.execute(
-            "DELETE FROM faces WHERE media_file_id = ? AND person_id IS NULL",
+            "DELETE FROM faces WHERE media_file_id = ?",
             (media_id,),
         )
         # Reset state so _phase_embed picks this file up
@@ -335,11 +338,11 @@ async def run_single_reprocess(media_id: int) -> None:
             (media_id,),
         )
 
-    logger.info("Single reprocess: cleared unowned faces for media_id=%d", media_id)
+    logger.info("Single reprocess: cleared all faces for media_id=%d", media_id)
 
-    # Run with force_ids so the skip guard is bypassed even if named-person
-    # embeddings remain on this file (they keep their person assignments).
-    await _phase_embed(force_ids={media_id})
+    # No force_ids needed — all face rows were deleted so the idempotency
+    # guard in _phase_embed sees no existing embeddings and processes normally.
+    await _phase_embed()
     await _phase_cluster()
     await _phase_auto_merge()
     await _phase_restore_vip_names()
@@ -361,7 +364,8 @@ async def run_batch_reprocess(media_ids: list[int]) -> None:
     selected photos, which is far more efficient than calling
     run_single_reprocess sequentially.
 
-    Named-person assignments for all photos are preserved.
+    Named-person assignments are restored via _phase_auto_merge, which
+    compares new unnamed clusters against persisted person centroids.
     """
     if not media_ids:
         return
@@ -399,18 +403,22 @@ async def run_batch_reprocess(media_ids: list[int]) -> None:
     placeholders = ",".join("?" * len(valid_ids))
 
     async with get_db() as db:
-        # Drop embeddings for unowned faces on all selected files
+        # Drop ALL embeddings and face rows for selected files (named + unnamed).
+        # Keeping named-face rows while force-re-detecting creates a second
+        # identical row for every already-named face (duplicate person bug).
+        # Named assignments are restored by _phase_auto_merge which compares
+        # new unnamed clusters against persisted person centroids at ≥0.98 sim.
         await db.execute(f"""
             DELETE FROM embeddings
             WHERE face_id IN (
                 SELECT id FROM faces
-                WHERE media_file_id IN ({placeholders}) AND person_id IS NULL
+                WHERE media_file_id IN ({placeholders})
             )
         """, valid_ids)
-        # Drop the unowned face rows
+        # Drop ALL face rows for the selected files
         await db.execute(
             f"DELETE FROM faces "
-            f"WHERE media_file_id IN ({placeholders}) AND person_id IS NULL",
+            f"WHERE media_file_id IN ({placeholders})",
             valid_ids,
         )
         # Reset state so _phase_embed picks these files up
@@ -421,11 +429,12 @@ async def run_batch_reprocess(media_ids: list[int]) -> None:
         )
 
     logger.info(
-        "Batch reprocess: cleared unowned faces for %d photos", len(valid_ids)
+        "Batch reprocess: cleared all faces for %d photos", len(valid_ids)
     )
 
-    force_ids = set(valid_ids)
-    await _phase_embed(force_ids=force_ids)
+    # No force_ids needed — all face rows were deleted so the idempotency
+    # guard in _phase_embed sees no existing embeddings and processes normally.
+    await _phase_embed()
     await _phase_cluster()
     await _phase_auto_merge()
     await _phase_restore_vip_names()

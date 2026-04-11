@@ -45,6 +45,7 @@ def _build_filter_clauses(
     tag_label: str | None,
     state: str | None,
     folder_id: int | None = None,
+    cluster_id: int | None = None,
 ) -> tuple[list[str], list[str], list]:
     joins: list[str] = []
     # Always hide soft-removed photos from every query
@@ -58,10 +59,17 @@ def _build_filter_clauses(
         )
         params.append(folder_id)
 
+    # Faces-table join (shared by person_id and cluster_id filters)
+    face_conditions: list[str] = []
     if person_id is not None:
-        joins.append("JOIN faces _f ON _f.media_file_id = mf.id")
-        conditions.append("_f.person_id = ?")
+        face_conditions.append("_f.person_id = ?")
         params.append(person_id)
+    if cluster_id is not None:
+        face_conditions.append("_f.cluster_id = ?")
+        params.append(cluster_id)
+    if face_conditions:
+        joins.append("JOIN faces _f ON _f.media_file_id = mf.id")
+        conditions.extend(face_conditions)
 
     if tag_category and tag_label:
         joins.append("JOIN media_tags _mt ON _mt.media_file_id = mf.id")
@@ -90,6 +98,7 @@ async def count_media(
     tag_label: str | None = None,
     state: str | None = None,
     folder_id: int | None = None,
+    cluster_id: int | None = None,
 ):
     """Return total count of media files matching the given filters."""
     joins, conditions, params = _build_filter_clauses(
@@ -98,6 +107,7 @@ async def count_media(
         tag_label=tag_label,
         state=state,
         folder_id=folder_id,
+        cluster_id=cluster_id,
     )
     sql = f"""
         SELECT COUNT(DISTINCT mf.id) AS n
@@ -123,6 +133,7 @@ async def list_media(
     tag_category: str | None = None,
     tag_label: str | None = None,
     folder_id: int | None = None,
+    cluster_id: int | None = None,
 ):
     """
     List media files. All filters are combinable:
@@ -130,6 +141,7 @@ async def list_media(
       - person_id    — photos that contain this person (via faces table)
       - tag_category + tag_label — photos with a specific ML tag
       - folder_id    — photos from a specific scanned folder
+      - cluster_id   — photos that contain a face from this unnamed cluster
     """
     joins, conditions, params = _build_filter_clauses(
         person_id=person_id,
@@ -137,6 +149,7 @@ async def list_media(
         tag_label=tag_label,
         state=state,
         folder_id=folder_id,
+        cluster_id=cluster_id,
     )
     params.extend([limit, offset])
     sql = f"""

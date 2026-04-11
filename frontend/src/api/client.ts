@@ -46,19 +46,21 @@ export const api = {
       if (params.limit)             q.set('limit',        String(params.limit))
       if (params.offset)            q.set('offset',       String(params.offset))
       if (params.state)             q.set('state',        params.state)
-      if (params.person_id != null) q.set('person_id',    String(params.person_id))
-      if (params.tag_category)      q.set('tag_category', params.tag_category)
-      if (params.tag_label)         q.set('tag_label',    params.tag_label)
-      if (params.folder_id != null) q.set('folder_id',    String(params.folder_id))
+      if (params.person_id != null)  q.set('person_id',    String(params.person_id))
+      if (params.cluster_id != null)  q.set('cluster_id',   String(params.cluster_id))
+      if (params.tag_category)        q.set('tag_category', params.tag_category)
+      if (params.tag_label)           q.set('tag_label',    params.tag_label)
+      if (params.folder_id != null)   q.set('folder_id',    String(params.folder_id))
       return request<MediaFile[]>(`/media?${q}`)
     },
     count: (params: Omit<MediaFilter, 'limit' | 'offset'> = {}) => {
       const q = new URLSearchParams()
-      if (params.state)             q.set('state',        params.state)
-      if (params.person_id != null) q.set('person_id',    String(params.person_id))
-      if (params.tag_category)      q.set('tag_category', params.tag_category)
-      if (params.tag_label)         q.set('tag_label',    params.tag_label)
-      if (params.folder_id != null) q.set('folder_id',    String(params.folder_id))
+      if (params.state)               q.set('state',        params.state)
+      if (params.person_id != null)   q.set('person_id',    String(params.person_id))
+      if (params.cluster_id != null)  q.set('cluster_id',   String(params.cluster_id))
+      if (params.tag_category)        q.set('tag_category', params.tag_category)
+      if (params.tag_label)           q.set('tag_label',    params.tag_label)
+      if (params.folder_id != null)   q.set('folder_id',    String(params.folder_id))
       return request<{ count: number }>(`/media/count?${q}`)
     },
     get: (id: number) => request<MediaFile>(`/media/${id}`),
@@ -271,6 +273,7 @@ export interface MediaFilter {
   offset?: number
   state?: string
   person_id?: number
+  cluster_id?: number
   tag_category?: string
   tag_label?: string
   folder_id?: number

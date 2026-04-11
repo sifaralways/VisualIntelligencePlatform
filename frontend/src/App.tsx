@@ -180,6 +180,9 @@ export default function App() {
             onSelectPerson={(id, name) =>
               openFiltered({ person_id: id }, `👤 ${name}`, 'people')
             }
+            onSelectCluster={(id) =>
+              openFiltered({ cluster_id: id }, '👤 Unnamed cluster', 'people')
+            }
           />
         )
         break

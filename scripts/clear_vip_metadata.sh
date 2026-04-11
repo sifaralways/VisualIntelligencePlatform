@@ -127,13 +127,78 @@ else
     fi
     echo ""
 
+    # ── First pass: run exiftool on all files normally ────────────────────
+    # Tee stderr to both the terminal (live) and a temp log so we can parse
+    # format-mismatch errors for the second pass without silencing output.
+    ERRLOG=$(mktemp)
     exiftool -r \
         "${CLEAR_ARGS[@]}" \
         -overwrite_original \
         -preserve \
-        "$FOLDER"
+        "$FOLDER" 2> >(tee "$ERRLOG" >&2)
+
+    # ── Second pass: handle extension/content mismatches ─────────────────
+    # Google Photos Takeout sometimes keeps the original extension (e.g. .DNG)
+    # but exports the file as a different format (e.g. JPEG).  ExifTool refuses
+    # to write to these files because the extension implies one parser but the
+    # magic bytes imply another.
+    # Fix: create a temp symlink with the correct extension so ExifTool uses
+    # the right parser, process via the symlink, then remove it.
+    #
+    # Error line format:
+    #   Error: Not a valid FOO (looks more like a BAR) - /path/to/file
+    mismatch_count=0
+    mismatch_errors=0
+    while IFS= read -r errline; do
+        # Match the format-mismatch error line
+        if [[ "$errline" =~ ^[[:space:]]*Error:[[:space:]]*Not\ a\ valid\ [A-Za-z0-9]+\ \(looks\ more\ like\ a\ ([A-Za-z0-9]+)\)\ -\ (.+)$ ]]; then
+            actual_fmt="${BASH_REMATCH[1]}"
+            filepath="${BASH_REMATCH[2]}"
+
+            # Map ExifTool format name → file extension
+            case "${actual_fmt^^}" in
+                JPEG|JPG) ext="jpg" ;;
+                PNG)      ext="png" ;;
+                TIFF|TIF) ext="tif" ;;
+                WEBP)     ext="webp" ;;
+                HEIC)     ext="heic" ;;
+                CR2)      ext="cr2" ;;
+                CR3)      ext="cr3" ;;
+                ARW)      ext="arw" ;;
+                NEF)      ext="nef" ;;
+                *)        ext="${actual_fmt,,}" ;;
+            esac
+
+            # Create a temp directory + symlink with the correct extension
+            tmpdir=$(mktemp -d)
+            tmplink="$tmpdir/vip_reprocess.$ext"
+            ln -s "$filepath" "$tmplink"
+
+            echo "  ↻  Re-processing as $actual_fmt: $filepath"
+            if exiftool \
+                "${CLEAR_ARGS[@]}" \
+                -overwrite_original \
+                -preserve \
+                "$tmplink" 2>&1; then
+                mismatch_count=$((mismatch_count + 1))
+            else
+                echo "  ⚠️  Could not process: $filepath"
+                mismatch_errors=$((mismatch_errors + 1))
+            fi
+
+            rm -rf "$tmpdir"
+        fi
+    done < <(grep -E "Not a valid .+ \(looks more like" "$ERRLOG" || true)
+
+    rm -f "$ERRLOG"
 
     echo ""
+    if [[ $mismatch_count -gt 0 ]]; then
+        echo "  ↻  $mismatch_count format-mismatched file(s) re-processed successfully."
+    fi
+    if [[ $mismatch_errors -gt 0 ]]; then
+        echo "  ⚠️  $mismatch_errors format-mismatched file(s) could not be processed."
+    fi
     echo "  ✅  Done. All VIP metadata cleared in: $FOLDER"
 fi
 echo ""
