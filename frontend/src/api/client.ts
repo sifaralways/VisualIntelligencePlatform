@@ -211,6 +211,11 @@ export const api = {
       request<{ status: string; scope: string; detail: string }>(`/admin/reset/${scope}`, {
         method: 'DELETE',
       }),
+    contactsMatch: (threshold: number) =>
+      request<ContactsMatchResult>('/admin/contacts-match', {
+        method: 'POST',
+        body: JSON.stringify({ threshold }),
+      }),
   },
 
   // ─── Settings ────────────────────────────────────────────────────────────
@@ -636,4 +641,28 @@ export interface RemoteServerConfig {
   remote_path_prefix: string
   writeback_concurrency: number
   enabled: boolean
+}
+
+// ─── Contacts Face Match ─────────────────────────────────────────────────────
+
+export interface ContactsMatchSuggestion {
+  contact_name: string
+  cluster_id: number
+  cluster_size: number
+  similarity_pct: number
+  auto_name: boolean
+  /** Absolute path stored in DB — convert via '/thumbnails/' + path.split('/thumbnails/').pop() */
+  thumbnail_path: string | null
+}
+
+export interface ContactsMatchStats {
+  total_contacts: number
+  contacts_with_face: number
+  unnamed_clusters: number
+  elapsed_seconds: number
+}
+
+export interface ContactsMatchResult {
+  matches: ContactsMatchSuggestion[]
+  stats: ContactsMatchStats
 }
