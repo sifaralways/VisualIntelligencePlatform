@@ -682,6 +682,55 @@ async def add_cluster_to_person(person_id: int, cluster_id: int, background_task
 
 
 # ---------------------------------------------------------------------------
+# Co-occurrence: "frequently appears with"
+# ---------------------------------------------------------------------------
+
+@router.get("/{person_id}/frequently-with")
+async def frequently_with(person_id: int, limit: int = 10):
+    """
+    Return up to `limit` named persons that most often appear in the same
+    photos as `person_id`, ordered by shared photo count descending.
+
+    Uses the person_cooccurrence table which is rebuilt after every ingest /
+    reprocess cycle.  Returns an empty list if the table has no edges yet.
+    """
+    async with get_db() as db:
+        person = await (
+            await db.execute(
+                "SELECT id FROM persons WHERE id=? AND is_merged=0 AND is_ignored=0",
+                (person_id,),
+            )
+        ).fetchone()
+        if not person:
+            raise HTTPException(status_code=404, detail="Person not found")
+
+        rows = await db.execute_fetchall("""
+            SELECT
+                p.id,
+                p.name,
+                pc.count          AS shared_photos,
+                pc.last_seen_at,
+                MIN(f.thumbnail_path) AS representative_thumbnail
+            FROM person_cooccurrence pc
+            JOIN persons p
+              ON  p.id = CASE
+                    WHEN pc.person_a_id = ? THEN pc.person_b_id
+                    ELSE pc.person_a_id
+                  END
+            LEFT JOIN faces f ON f.person_id = p.id
+            WHERE (pc.person_a_id = ? OR pc.person_b_id = ?)
+              AND p.name IS NOT NULL
+              AND p.is_merged  = 0
+              AND p.is_ignored = 0
+            GROUP BY p.id
+            ORDER BY pc.count DESC
+            LIMIT ?
+        """, (person_id, person_id, person_id, limit))
+
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
 # Proactive merge suggestions
 # ---------------------------------------------------------------------------
 

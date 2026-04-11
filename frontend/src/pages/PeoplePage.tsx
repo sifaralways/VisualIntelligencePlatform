@@ -8,7 +8,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api/client'
-import type { Cluster, Person, MergeSuggestion, FaceRow, SimilarCluster, MergePersonsResult, FindSimilarSuggestion, FindSimilarAllResult, IgnoredPerson } from '../api/client'
+import type { Cluster, Person, MergeSuggestion, FaceRow, SimilarCluster, MergePersonsResult, FindSimilarSuggestion, FindSimilarAllResult, IgnoredPerson, FrequentlyWithEntry } from '../api/client'
 
 interface Props {
   /** Called when user clicks a named person tile to view their photos. */
@@ -180,6 +180,11 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   const [similarClusters, setSimilarClusters] = useState<SimilarCluster[]>([])
   const [similarLoading, setSimilarLoading] = useState(false)
 
+  // ── "Frequently appears with" hover panel ────────────────────────────────
+  const [frequentlyWithPersonId, setFrequentlyWithPersonId] = useState<number | null>(null)
+  const [frequentlyWithData, setFrequentlyWithData] = useState<FrequentlyWithEntry[]>([])
+  const fetchFrequentlyWithRef = useRef<number>(0)
+
   // ── Multi-select for unnamed clusters ────────────────────────────────────
   const [selectMode, setSelectMode] = useState(false)
   const [selected, setSelected] = useState<Set<number>>(new Set())
@@ -289,6 +294,22 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     } finally {
       setSimilarLoading(false)
     }
+  }
+
+  async function loadFrequentlyWith(personId: number) {
+    const token = ++fetchFrequentlyWithRef.current
+    setFrequentlyWithPersonId(personId)
+    setFrequentlyWithData([])
+    try {
+      const data = await api.persons.frequentlyWith(personId, 5)
+      if (fetchFrequentlyWithRef.current === token) setFrequentlyWithData(data)
+    } catch { /* non-fatal */ }
+  }
+
+  function clearFrequentlyWith() {
+    fetchFrequentlyWithRef.current++
+    setFrequentlyWithPersonId(null)
+    setFrequentlyWithData([])
   }
 
   async function handleDeleteCluster(clusterId: number) {
@@ -1144,6 +1165,44 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
                     >
                       ≈ similar
                     </button>
+                  )}
+                  {/* ── Frequently appears with ───────────────────────── */}
+                  {!namedSelectMode && (
+                    <button
+                      onClick={() => frequentlyWithPersonId === p.id ? clearFrequentlyWith() : loadFrequentlyWith(p.id)}
+                      title="Show people often in photos together"
+                      className="text-xs text-gray-600 hover:text-purple-400 transition-colors"
+                    >
+                      {frequentlyWithPersonId === p.id ? '▴ with' : '▾ with'}
+                    </button>
+                  )}
+                  {frequentlyWithPersonId === p.id && (
+                    <div className="w-full mt-1">
+                      {frequentlyWithData.length === 0 ? (
+                        <span className="text-[10px] text-gray-600">No co-occurrence data yet</span>
+                      ) : (
+                        <div className="flex flex-wrap gap-1 justify-center">
+                          {frequentlyWithData.map(fw => {
+                            const url = fw.representative_thumbnail
+                              ? '/thumbnails/' + fw.representative_thumbnail.split('/thumbnails/').pop()
+                              : null
+                            return (
+                              <div key={fw.id} title={`${fw.name} · ${fw.shared_photos} shared photo${fw.shared_photos !== 1 ? 's' : ''}`}
+                                className="flex flex-col items-center gap-0.5 cursor-pointer"
+                                onClick={() => onSelectPerson?.(fw.id, fw.name)}
+                              >
+                                <div className="w-8 h-8 rounded-lg overflow-hidden bg-gray-700 border border-purple-800">
+                                  {url
+                                    ? <img src={url} alt={fw.name} className="w-full h-full object-cover" />
+                                    : <span className="flex items-center justify-center h-full text-gray-500 text-xs">👤</span>}
+                                </div>
+                                <span className="text-[9px] text-purple-400 max-w-[32px] truncate">{fw.name.split(' ')[0]}</span>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
+                    </div>
                   )}
                 </div>
               )

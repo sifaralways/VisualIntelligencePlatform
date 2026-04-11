@@ -181,6 +181,9 @@ async def run_reprocess(force_retag: bool = False) -> None:
     # Matches new clusters → ignored persons (silently suppressed).
     await _phase_auto_merge()
 
+    # Step 4b: Rebuild person co-occurrence graph.
+    await _phase_build_cooccurrence()
+
     # Step 5: Restore VIP-history names for newly-detected faces in files
     # that VIP previously wrote XMP data to.
     await _phase_restore_vip_names()
@@ -349,6 +352,7 @@ async def run_single_reprocess(media_id: int) -> None:
     await _phase_cluster()
     await _phase_recover_singletons()
     await _phase_auto_merge()
+    await _phase_build_cooccurrence()
     await _phase_restore_vip_names()
 
     await broadcast("pipeline_complete", folder=f"[reprocess photo {media_id}]")
@@ -442,6 +446,7 @@ async def run_batch_reprocess(media_ids: list[int]) -> None:
     await _phase_cluster()
     await _phase_recover_singletons()
     await _phase_auto_merge()
+    await _phase_build_cooccurrence()
     await _phase_restore_vip_names()
 
     await broadcast("pipeline_complete", folder=label)
@@ -623,6 +628,7 @@ async def run_model_migration() -> None:
     await _phase_cluster()
     await _phase_recover_singletons()
     await _phase_auto_merge()
+    await _phase_build_cooccurrence()
     await _phase_restore_vip_names()
 
     # Sync denormalised photo_count on all active persons
@@ -684,6 +690,9 @@ async def run_ingest(folder: str) -> None:
 
     # -- Phase 3b: Auto-merge high-conf + surface borderline suggestions ----
     await _phase_auto_merge()
+
+    # -- Phase 3b-ii: Rebuild person co-occurrence graph -------------------
+    await _phase_build_cooccurrence()
 
     # -- Phase 3c: Restore person names from VIP History -------------------
     # When ExifTool has previously written named face regions to a photo,
@@ -1343,7 +1352,37 @@ async def _phase_recover_singletons() -> None:
         if target_cluster_id == singleton_cluster_id:
             continue   # hit itself somehow
 
-        if best_sim >= singleton_auto_th:
+        # ── Social-context boost ───────────────────────────────────────────
+        # If the singleton's photo also contains companions who have
+        # previously appeared alongside the proposed target_person_id, we
+        # credit extra confidence (up to +0.10).  This mirrors the temporal
+        # co-occurrence signal Apple Photos uses to disambiguate look-alikes.
+        # Only applicable when the target cluster already belongs to a known
+        # named person; anonymous clusters don't have historical co-occurrence.
+        boost = 0.0
+        if target_person_id is not None:
+            async with get_db() as _bdb:
+                _br = await (await _bdb.execute("""
+                    SELECT COUNT(DISTINCT companion.person_id) AS colocated
+                    FROM faces s
+                    JOIN faces companion
+                      ON  companion.media_file_id = s.media_file_id
+                      AND companion.person_id IS NOT NULL
+                    WHERE s.cluster_id = ?
+                      AND EXISTS (
+                          SELECT 1 FROM faces f1
+                          JOIN faces f2
+                            ON  f2.media_file_id = f1.media_file_id
+                            AND f2.person_id = ?
+                          WHERE f1.person_id = companion.person_id
+                      )
+                """, (singleton_cluster_id, target_person_id))).fetchone()
+            colocated = _br["colocated"] if _br else 0
+            boost = min(0.10, colocated * 0.05)
+
+        effective_sim = min(1.0, best_sim + boost)
+
+        if effective_sim >= singleton_auto_th:
             # ── Silent auto-merge: move singleton faces into target cluster ─
             if target_cluster_id in already_targeted:
                 continue
@@ -1395,12 +1434,16 @@ async def _phase_recover_singletons() -> None:
             already_targeted.add(target_cluster_id)
             auto_merged += 1
             logger.debug(
-                "Singleton %d absorbed into cluster %d (sim=%.3f)",
-                singleton_cluster_id, target_cluster_id, best_sim,
+                "Singleton %d absorbed into cluster %d (sim=%.3f boost=%.2f eff=%.3f)",
+                singleton_cluster_id, target_cluster_id, best_sim, boost, effective_sim,
             )
 
         else:
             # ── Suggestion (between suggest_th and singleton_auto_th) ───────
+            # Only surface if the raw sim clears the suggest_th (effective_sim
+            # may push borderline cases through to auto-merge above).
+            if best_sim < suggest_th:
+                continue
             # Look up the representative thumbnail for the target cluster
             async with get_db() as db:
                 rep = await (await db.execute("""
@@ -1659,6 +1702,65 @@ async def _phase_auto_merge() -> None:
     logger.info(
         "Phase 3b: %d auto-named, %d suggestions surfaced", auto_named, len(suggestions)
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3b-ii: Rebuild person co-occurrence graph
+# ---------------------------------------------------------------------------
+
+async def _phase_build_cooccurrence() -> None:
+    """
+    Rebuild the person_cooccurrence table from the current face assignments.
+
+    Each row = (person_a_id, person_b_id, count, last_seen_at) where:
+      - person_a_id < person_b_id   (canonical ordering, no duplicate pairs)
+      - count = number of distinct photos both persons appear in together
+      - last_seen_at = MAX(date_taken) of shared photos (falls back to now())
+
+    Strategy: full recompute rather than incremental, so the table is always
+    consistent with the current face→person assignment even after merges or
+    manual corrections.  At typical library sizes (<100 K photos) the query
+    runs in <1 s with the indexes on faces.person_id and
+    media_files.date_taken.
+    """
+    logger.info("Phase 3b-ii: rebuilding person co-occurrence graph …")
+    async with get_db() as db:
+        # Wipe stale edges — we rebuild fully every time for consistency.
+        await db.execute("DELETE FROM person_cooccurrence")
+
+        # Self-join faces on same media_file to find co-occurring persons.
+        # The MIN/MAX trick avoids storing both (A,B) and (B,A).
+        await db.execute("""
+            INSERT INTO person_cooccurrence
+                (person_a_id, person_b_id, count, last_seen_at)
+            SELECT
+                MIN(f1.person_id)                        AS person_a_id,
+                MAX(f1.person_id)                        AS person_b_id,
+                COUNT(DISTINCT f1.media_file_id)         AS count,
+                COALESCE(
+                    MAX(m.date_taken),
+                    datetime('now')
+                )                                        AS last_seen_at
+            FROM faces f1
+            JOIN faces f2
+              ON  f2.media_file_id = f1.media_file_id
+              AND f2.person_id     != f1.person_id
+              AND f2.person_id     IS NOT NULL
+            JOIN media_files m ON m.id = f1.media_file_id
+            JOIN persons pa ON pa.id = MIN(f1.person_id, f2.person_id)
+                           AND pa.is_merged = 0 AND pa.is_ignored = 0
+            JOIN persons pb ON pb.id = MAX(f1.person_id, f2.person_id)
+                           AND pb.is_merged = 0 AND pb.is_ignored = 0
+            WHERE f1.person_id IS NOT NULL
+            GROUP BY MIN(f1.person_id), MAX(f1.person_id)
+            HAVING COUNT(DISTINCT f1.media_file_id) >= 1
+        """)
+
+        row = await (await db.execute("SELECT COUNT(*) AS n FROM person_cooccurrence")).fetchone()
+        edge_count = row["n"] if row else 0
+
+    logger.info("Phase 3b-ii: %d co-occurrence edges written", edge_count)
+    await broadcast("phase_complete", phase="cooccurrence", edges=edge_count)
 
 
 # ---------------------------------------------------------------------------

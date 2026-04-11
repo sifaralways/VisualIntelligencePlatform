@@ -133,6 +133,8 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ auto_threshold: autoThreshold }),
       }),
+    frequentlyWith: (personId: number, limit = 5) =>
+      request<FrequentlyWithEntry[]>(`/persons/${personId}/frequently-with?limit=${limit}`),
   },
 
   // ─── Faces ────────────────────────────────────────────────────────────────
@@ -418,6 +420,13 @@ export interface MergePersonsResult {
   survivor_name: string
   absorbed_id: number
   photos_queued_for_writeback: number
+}
+
+export interface FrequentlyWithEntry {
+  id: number
+  name: string
+  shared_photos: number
+  representative_thumbnail: string | null
 }
 
 export interface SimilarCluster {
