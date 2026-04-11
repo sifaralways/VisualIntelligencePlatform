@@ -4,11 +4,17 @@
  * Tabs: Details (faces + quick tag chips) | Analysis (editable analysis document)
  */
 
-import { useEffect, useState } from 'react'
-import { api, type TagsByCategory, type FaceRow } from '../api/client'
+import { useEffect, useRef, useState } from 'react'
+import { api, type TagsByCategory, type FaceRow, type Person } from '../api/client'
 import AnalysisPanel from './AnalysisPanel'
 
 type Tab = 'details' | 'analysis'
+
+// What edit action is in progress for a given face
+type EditMode =
+  | { type: 'naming';  faceId: number }   // naming an unnamed face
+  | { type: 'renaming'; faceId: number }  // renaming a named face
+  | null
 
 interface Props {
   mediaId: number
@@ -19,25 +25,39 @@ interface Props {
 export default function PhotoDetail({ mediaId, filePath, onClose }: Props) {
   const [tags,    setTags]    = useState<TagsByCategory | null>(null)
   const [faces,   setFaces]   = useState<FaceRow[]>([])
+  const [persons, setPersons] = useState<Person[]>([])
   const [loading, setLoading] = useState(true)
   const [tab,     setTab]     = useState<Tab>('details')
   const [reprocessing, setReprocessing] = useState(false)
   const [reprocessDone, setReprocessDone] = useState(false)
 
+  // Face edit state
+  const [editMode,    setEditMode]    = useState<EditMode>(null)
+  const [nameInput,   setNameInput]   = useState('')
+  const [savingFace,  setSavingFace]  = useState<number | null>(null) // face id being saved
+  const [removingFace, setRemovingFace] = useState<number | null>(null)
+  const [showSuggestions, setShowSuggestions] = useState(false)
+  const nameInputRef = useRef<HTMLInputElement>(null)
+
   const filename = filePath.split('/').pop() ?? ''
   const thumbSrc = api.media.thumbnailUrl(mediaId)
+
+  const loadFaces = () =>
+    api.faces.byMedia(mediaId).catch(() => [] as FaceRow[])
 
   useEffect(() => {
     setLoading(true)
     Promise.all([
       api.media.tags(mediaId).catch(() => ({} as TagsByCategory)),
-      api.faces.byMedia(mediaId).catch(() => [] as FaceRow[]),
-    ]).then(([t, f]) => {
+      loadFaces(),
+      api.persons.list().catch(() => [] as Person[]),
+    ]).then(([t, f, p]) => {
       setTags(t)
       setFaces(f)
+      setPersons(p)
       setLoading(false)
     })
-  }, [mediaId])
+  }, [mediaId]) // eslint-disable-line react-hooks/exhaustive-deps
 
   async function reprocessPhoto() {
     setReprocessing(true)
@@ -50,12 +70,80 @@ export default function PhotoDetail({ mediaId, filePath, onClose }: Props) {
     }
   }
 
-  // Close on Escape
+  function startNaming(faceId: number) {
+    setEditMode({ type: 'naming', faceId })
+    setNameInput('')
+    setShowSuggestions(false)
+    setTimeout(() => nameInputRef.current?.focus(), 50)
+  }
+
+  function startRenaming(face: FaceRow) {
+    setEditMode({ type: 'renaming', faceId: face.id })
+    setNameInput(face.person_name ?? '')
+    setShowSuggestions(false)
+    setTimeout(() => nameInputRef.current?.focus(), 50)
+  }
+
+  function cancelEdit() {
+    setEditMode(null)
+    setNameInput('')
+    setShowSuggestions(false)
+  }
+
+  async function saveName(face: FaceRow) {
+    const name = nameInput.trim()
+    if (!name) return
+    setSavingFace(face.id)
+    try {
+      if (editMode?.type === 'renaming' && face.person_id != null) {
+        // Rename the person record
+        await api.persons.namePerson(face.person_id, name)
+      } else if (editMode?.type === 'naming' && face.cluster_id != null) {
+        // Assign to existing person if name matches, else create new
+        const match = persons.find(p => p.name?.toLowerCase() === name.toLowerCase())
+        if (match) {
+          await api.persons.addCluster(match.id, face.cluster_id)
+        } else {
+          await api.persons.fromCluster(face.cluster_id, name)
+        }
+      }
+      cancelEdit()
+      const refreshed = await loadFaces()
+      setFaces(refreshed)
+      // Refresh persons list so autocomplete stays current
+      api.persons.list().then(setPersons).catch(() => {})
+    } finally {
+      setSavingFace(null)
+    }
+  }
+
+  async function removeName(face: FaceRow) {
+    setRemovingFace(face.id)
+    try {
+      await api.faces.removeFromPerson(face.id)
+      const refreshed = await loadFaces()
+      setFaces(refreshed)
+    } finally {
+      setRemovingFace(null)
+    }
+  }
+
+  // Close on Escape — but only if no edit is in progress
   useEffect(() => {
-    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (editMode) { cancelEdit(); return }
+        onClose()
+      }
+    }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [onClose])
+  }, [onClose, editMode]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Autocomplete: persons whose name includes the current input
+  const nameSuggestions = nameInput.trim().length > 0
+    ? persons.filter(p => p.name && p.name.toLowerCase().includes(nameInput.toLowerCase()))
+    : []
 
   return (
     <div
@@ -115,28 +203,130 @@ export default function PhotoDetail({ mediaId, filePath, onClose }: Props) {
 
                 {!loading && (
                   <>
-                    {/* People in this photo */}
+                    {/* ── People in this photo ── */}
                     {faces.length > 0 && (
                       <Section title="People" icon="👤">
-                        <div className="flex flex-wrap gap-2">
-                          {faces.map(f => (
-                            <div key={f.id} className="flex flex-col items-center gap-1">
-                              <div className="w-12 h-12 rounded-full overflow-hidden bg-gray-800 border border-gray-700">
-                                {f.thumbnail_path ? (
-                                  <img
-                                    src={api.faces.thumbnailUrl(f.id)}
-                                    alt={f.person_name ?? 'Unknown'}
-                                    className="w-full h-full object-cover"
-                                  />
+                        <div className="flex flex-wrap gap-3">
+                          {faces.map(f => {
+                            const isEditing = editMode?.faceId === f.id
+                            const isSaving  = savingFace === f.id
+                            const isRemoving = removingFace === f.id
+                            const named = f.person_name != null
+
+                            return (
+                              <div key={f.id} className="flex flex-col items-center gap-1 group/face relative">
+                                {/* Face thumbnail */}
+                                <div className="relative">
+                                  <div
+                                    className={`w-16 h-16 rounded-xl overflow-hidden bg-gray-800 border transition-colors ${
+                                      named ? 'border-indigo-700' : 'border-gray-700'
+                                    } ${isRemoving ? 'opacity-40' : ''}`}
+                                  >
+                                    {f.thumbnail_path ? (
+                                      <img
+                                        src={api.faces.thumbnailUrl(f.id)}
+                                        alt={f.person_name ?? 'Unknown'}
+                                        className="w-full h-full object-cover"
+                                      />
+                                    ) : (
+                                      <span className="flex items-center justify-center h-full text-2xl">👤</span>
+                                    )}
+                                  </div>
+
+                                  {/* Action buttons — shown on hover when not editing */}
+                                  {!isEditing && !isSaving && !isRemoving && (
+                                    <div className="absolute -top-1 -right-1 flex gap-0.5 opacity-0 group-hover/face:opacity-100 transition-opacity">
+                                      {/* Edit / Name button */}
+                                      <button
+                                        onClick={() => named ? startRenaming(f) : startNaming(f.id)}
+                                        title={named ? 'Rename person' : 'Name this face'}
+                                        className="w-5 h-5 rounded-full bg-gray-700 hover:bg-indigo-600 border border-gray-600 text-xs flex items-center justify-center text-gray-300 hover:text-white transition-colors leading-none"
+                                      >
+                                        ✎
+                                      </button>
+                                      {/* Remove button — only for named faces */}
+                                      {named && (
+                                        <button
+                                          onClick={() => removeName(f)}
+                                          title="Remove person assignment"
+                                          className="w-5 h-5 rounded-full bg-gray-700 hover:bg-red-700 border border-gray-600 text-xs flex items-center justify-center text-gray-300 hover:text-white transition-colors leading-none"
+                                        >
+                                          ✕
+                                        </button>
+                                      )}
+                                    </div>
+                                  )}
+
+                                  {/* Saving / removing spinner overlay */}
+                                  {(isSaving || isRemoving) && (
+                                    <div className="absolute inset-0 flex items-center justify-center bg-black/50 rounded-xl">
+                                      <span className="text-white text-xs animate-pulse">…</span>
+                                    </div>
+                                  )}
+                                </div>
+
+                                {/* Name label or inline edit */}
+                                {isEditing ? (
+                                  <div className="w-20 flex flex-col gap-1 relative">
+                                    <input
+                                      ref={nameInputRef}
+                                      value={nameInput}
+                                      onChange={e => { setNameInput(e.target.value); setShowSuggestions(true) }}
+                                      onFocus={() => setShowSuggestions(true)}
+                                      onBlur={() => setTimeout(() => setShowSuggestions(false), 150)}
+                                      onKeyDown={e => {
+                                        if (e.key === 'Enter') saveName(f)
+                                        if (e.key === 'Escape') cancelEdit()
+                                      }}
+                                      placeholder="Name…"
+                                      className="w-full bg-gray-800 border border-indigo-500 rounded px-1.5 py-0.5 text-[10px] text-white outline-none text-center"
+                                    />
+                                    {/* Autocomplete dropdown */}
+                                    {showSuggestions && nameSuggestions.length > 0 && (
+                                      <ul className="absolute top-full left-0 right-0 mt-0.5 bg-gray-900 border border-gray-700 rounded shadow-xl z-50 max-h-32 overflow-y-auto">
+                                        {nameSuggestions.map(p => (
+                                          <li
+                                            key={p.id}
+                                            onMouseDown={e => e.preventDefault()}
+                                            onClick={() => { setNameInput(p.name!); setShowSuggestions(false) }}
+                                            className="px-2 py-1 text-[10px] text-gray-200 hover:bg-indigo-700 hover:text-white cursor-pointer truncate"
+                                          >
+                                            {p.name}
+                                          </li>
+                                        ))}
+                                      </ul>
+                                    )}
+                                    <div className="flex gap-1">
+                                      <button
+                                        onMouseDown={e => e.preventDefault()}
+                                        onClick={() => saveName(f)}
+                                        disabled={!nameInput.trim() || isSaving}
+                                        className="flex-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded px-1 py-0.5 text-[9px] transition-colors"
+                                      >
+                                        Save
+                                      </button>
+                                      <button
+                                        onMouseDown={e => e.preventDefault()}
+                                        onClick={cancelEdit}
+                                        className="flex-1 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded px-1 py-0.5 text-[9px] transition-colors"
+                                      >
+                                        ✕
+                                      </button>
+                                    </div>
+                                  </div>
                                 ) : (
-                                  <span className="flex items-center justify-center h-full text-xl">👤</span>
+                                  <span
+                                    className={`text-[10px] text-center max-w-[4rem] truncate ${
+                                      named ? 'text-gray-200' : 'text-gray-500 italic'
+                                    }`}
+                                    title={f.person_name ?? undefined}
+                                  >
+                                    {named ? f.person_name : (f.cluster_id != null ? 'tap ✎ to name' : '?')}
+                                  </span>
                                 )}
                               </div>
-                              <span className="text-gray-300 text-[10px] text-center max-w-12 truncate">
-                                {f.person_name ?? '?'}
-                              </span>
-                            </div>
-                          ))}
+                            )
+                          })}
                         </div>
                       </Section>
                     )}

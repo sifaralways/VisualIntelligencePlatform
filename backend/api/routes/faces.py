@@ -53,7 +53,7 @@ async def get_faces_for_media(media_id: int):
     async with get_db() as db:
         rows = await db.execute_fetchall("""
             SELECT f.id, f.thumbnail_path, f.detection_conf,
-                   f.person_id, p.name AS person_name
+                   f.cluster_id, f.person_id, p.name AS person_name
             FROM faces f
             LEFT JOIN persons p ON p.id = f.person_id AND p.is_merged = 0
             WHERE f.media_file_id = ?
