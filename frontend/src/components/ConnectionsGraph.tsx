@@ -245,6 +245,7 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
   const [currentName, setCurrentName] = useState(personName)
   const [history,     setHistory]     = useState<HistoryEntry[]>([])
   const [hoveredId,   setHoveredId]   = useState<string | null>(null)
+  const [nodeFilter,  setNodeFilter]  = useState<'all' | 'named' | 'unnamed'>('all')
 
   // Edit panel
   const [editingNode,        setEditingNode]        = useState<SimNode | null>(null)
@@ -270,10 +271,12 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
   const [, setFrameCount] = useState(0)
 
   // Mirror of layoutMode/depthLevel as refs so loadGraph (stable useCallback) can read live values
-  const layoutModeRef = useRef<LayoutMode>(layoutMode)
-  const depthLevelRef = useRef<number>(depthLevel)
+  const layoutModeRef  = useRef<LayoutMode>(layoutMode)
+  const depthLevelRef  = useRef<number>(depthLevel)
+  const nodeFilterRef  = useRef<'all' | 'named' | 'unnamed'>(nodeFilter)
   useEffect(() => { layoutModeRef.current = layoutMode }, [layoutMode])
   useEffect(() => { depthLevelRef.current = depthLevel }, [depthLevel])
+  useEffect(() => { nodeFilterRef.current = nodeFilter }, [nodeFilter])
 
   // DOM refs
   const svgRef       = useRef<SVGSVGElement>(null)
@@ -356,10 +359,17 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
         alphaRef.current = 1.0
         kickSimulation(1.0)
       } else {
-        // Apply the current static layout immediately using live depth
+        // Apply the current static layout immediately using live depth + filter
         alphaRef.current = 0
+        const filter = nodeFilterRef.current
         const visibleIds   = computeVisibleNodeIds(g, depth)
-        const visibleNodes = g.nodes.filter(n => visibleIds.has(n.id))
+        const visibleNodes = g.nodes.filter(n => {
+          if (!visibleIds.has(n.id)) return false
+          if (n.id === g.center_id) return true
+          if (filter === 'named')   return n.type === 'person'
+          if (filter === 'unnamed') return n.type === 'cluster'
+          return true
+        })
         let posMap: Map<string, {x: number; y: number}>
         if (mode === 'tree-h')      posMap = computeTreeHPositions(visibleNodes, g.center_id)
         else if (mode === 'tree-v') posMap = computeTreeVPositions(visibleNodes, g.center_id)
@@ -406,15 +416,27 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
   }, [])
 
   // Apply a static layout (tree/circular) by directly setting node positions.
-  // depth must be passed explicitly — do NOT read depthLevel state here (stale closure).
-  function applyStaticLayout(mode: LayoutMode, g: ConnectionGraph, depth: number) {
-    if (mode === 'force') return // force layout handled by physics
+  // All three control values (mode, depth, filter) must be passed explicitly to
+  // avoid stale closures — state setters are async, refs are always current.
+  function applyStaticLayout(
+    mode: LayoutMode,
+    g: ConnectionGraph,
+    depth: number,
+    filter: 'all' | 'named' | 'unnamed' = 'all'
+  ) {
+    if (mode === 'force') return
+    const visibleIds   = computeVisibleNodeIds(g, depth)
+    const visibleNodes = g.nodes.filter(n => {
+      if (!visibleIds.has(n.id)) return false
+      if (n.id === g.center_id) return true // centre always included in layout
+      if (filter === 'named')   return n.type === 'person'
+      if (filter === 'unnamed') return n.type === 'cluster'
+      return true
+    })
     let posMap: Map<string, {x: number; y: number}>
-    const visibleIds = computeVisibleNodeIds(g, depth)
-    const visibleNodes = g.nodes.filter(n => visibleIds.has(n.id))
-    if (mode === 'tree-h')   posMap = computeTreeHPositions(visibleNodes, g.center_id)
+    if (mode === 'tree-h')      posMap = computeTreeHPositions(visibleNodes, g.center_id)
     else if (mode === 'tree-v') posMap = computeTreeVPositions(visibleNodes, g.center_id)
-    else                     posMap = computeCircularPositions(visibleNodes, g.center_id)
+    else                        posMap = computeCircularPositions(visibleNodes, g.center_id)
     simNodes.current.forEach(n => {
       const p = posMap.get(n.id)
       if (p) { n.x = p.x; n.y = p.y; n.vx = 0; n.vy = 0 }
@@ -430,7 +452,7 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
       cancelAnimationFrame(rafRef.current)
       loopRunning.current = false
       alphaRef.current = 0
-      applyStaticLayout(mode, graph, depthLevel)
+      applyStaticLayout(mode, graph, depthLevel, nodeFilter)
     }
   }
 
@@ -507,8 +529,18 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
     if (layoutMode === 'force') {
       kickSimulation(0.55)
     } else if (graph) {
-      // Pass `level` directly — setDepthLevel is async and depthLevel is still the old value here
-      applyStaticLayout(layoutMode, graph, level)
+      applyStaticLayout(layoutMode, graph, level, nodeFilter)
+    }
+  }
+
+  // Filter change: re-draw with current depth and layout
+  function changeFilter(f: 'all' | 'named' | 'unnamed') {
+    setNodeFilter(f)
+    nodeFilterRef.current = f // update immediately (setNodeFilter is async)
+    if (layoutMode === 'force') {
+      kickSimulation(0.45)
+    } else if (graph) {
+      applyStaticLayout(layoutMode, graph, depthLevel, f)
     }
   }
 
@@ -610,13 +642,35 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
     }
   }
 
+  // Ignore: send unnamed cluster to Ignored Faces
+  async function ignoreClusterNode() {
+    if (!editingNode || editingNode.type !== 'cluster') return
+    setEditSaving(true); setEditError('')
+    try {
+      await api.clusters.ignore(editingNode.raw_id)
+      setEditingNode(null)
+      loadGraph(currentPid)
+    } catch {
+      setEditError('Could not ignore — please try again.')
+    } finally {
+      setEditSaving(false)
+    }
+  }
+
   // ── Derived visible set ────────────────────────────────────────────────
 
   const visibleNodeIds  = graph ? computeVisibleNodeIds(graph, depthLevel) : new Set<string>()
   const nm              = new Map(simNodes.current.map(n => [n.id, n]))
-  const visibleSimNodes = simNodes.current.filter(n => visibleNodeIds.has(n.id))
+  const visibleSimNodes = simNodes.current.filter(n => {
+    if (!visibleNodeIds.has(n.id)) return false
+    if (n.pinned) return true // centre node always visible regardless of filter
+    if (nodeFilter === 'named')   return n.type === 'person'
+    if (nodeFilter === 'unnamed') return n.type === 'cluster'
+    return true
+  })
+  const visibleNodeIdSet = new Set(visibleSimNodes.map(n => n.id))
   const visibleEdges    = (graph?.edges ?? []).filter(
-    e => visibleNodeIds.has(e.source) && visibleNodeIds.has(e.target)
+    e => visibleNodeIdSet.has(e.source) && visibleNodeIdSet.has(e.target)
   )
   const maxWeight = graph ? Math.max(...graph.edges.map(e => e.weight), 1) : 1
 
@@ -665,6 +719,18 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
         </div>
 
         <div className="flex items-center gap-4">
+          {/* Node filter */}
+          <div className="flex items-center gap-1 bg-gray-900 border border-gray-700 rounded-lg overflow-hidden">
+            {(['all', 'named', 'unnamed'] as const).map(f => (
+              <button key={f} onClick={() => changeFilter(f)}
+                className={`px-2.5 py-1 text-xs font-medium transition-colors capitalize ${
+                  nodeFilter === f
+                    ? 'bg-indigo-700 text-white'
+                    : 'text-gray-400 hover:text-white hover:bg-gray-800'
+                }`}>{f}</button>
+            ))}
+          </div>
+
           {/* Layout mode selector */}
           <div className="flex items-center gap-1">
             <span className="text-gray-600 text-xs mr-1">View:</span>
@@ -940,7 +1006,7 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
                     )}
                   </div>
                   {editError && <p className="text-xs text-red-400 mb-2">{editError}</p>}
-                  <div className="flex gap-2">
+                  <div className="flex flex-col gap-2">
                     <button onClick={saveEdit}
                       disabled={editSaving || !editName.trim()}
                       className="flex-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white text-xs font-medium rounded-lg py-1.5 transition-colors">
@@ -950,6 +1016,12 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
                       className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-400 text-xs rounded-lg py-1.5 transition-colors">
                       Cancel
                     </button>
+                    {editingNode.type === 'cluster' && (
+                      <button onClick={ignoreClusterNode} disabled={editSaving}
+                        className="flex-1 bg-transparent border border-gray-700 hover:border-red-700 hover:text-red-400 text-gray-600 text-xs rounded-lg py-1.5 transition-colors">
+                        Ignore face
+                      </button>
+                    )}
                   </div>
                 </>
               )}

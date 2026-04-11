@@ -7,6 +7,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { api, type TagsByCategory, type FaceRow, type Person } from '../api/client'
 import AnalysisPanel from './AnalysisPanel'
+import ConnectionsGraph from './ConnectionsGraph'
 
 type Tab = 'details' | 'analysis'
 
@@ -38,6 +39,10 @@ export default function PhotoDetail({ mediaId, filePath, onClose }: Props) {
   const [removingFace, setRemovingFace] = useState<number | null>(null)
   const [showSuggestions, setShowSuggestions] = useState(false)
   const nameInputRef = useRef<HTMLInputElement>(null)
+
+  // Connections graph
+  const [connectionsPid,  setConnectionsPid]  = useState<number | null>(null)
+  const [connectionsName, setConnectionsName] = useState('')
 
   const filename = filePath.split('/').pop() ?? ''
   const thumbSrc = api.media.thumbnailUrl(mediaId)
@@ -146,6 +151,7 @@ export default function PhotoDetail({ mediaId, filePath, onClose }: Props) {
     : []
 
   return (
+    <>
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4"
       onClick={e => { if (e.target === e.currentTarget) onClose() }}
@@ -315,14 +321,25 @@ export default function PhotoDetail({ mediaId, filePath, onClose }: Props) {
                                     </div>
                                   </div>
                                 ) : (
-                                  <span
-                                    className={`text-[10px] text-center max-w-[4rem] truncate ${
-                                      named ? 'text-gray-200' : 'text-gray-500 italic'
-                                    }`}
-                                    title={f.person_name ?? undefined}
-                                  >
-                                    {named ? f.person_name : (f.cluster_id != null ? 'tap ✎ to name' : '?')}
-                                  </span>
+                                  <>
+                                    <span
+                                      className={`text-[10px] text-center max-w-[4rem] truncate ${
+                                        named ? 'text-gray-200' : 'text-gray-500 italic'
+                                      }`}
+                                      title={f.person_name ?? undefined}
+                                    >
+                                      {named ? f.person_name : (f.cluster_id != null ? 'tap ✎ to name' : '?')}
+                                    </span>
+                                    {named && f.person_id != null && (
+                                      <button
+                                        onClick={() => { setConnectionsPid(f.person_id!); setConnectionsName(f.person_name ?? '') }}
+                                        title="Show connections graph"
+                                        className="text-[9px] text-gray-600 hover:text-purple-400 transition-colors"
+                                      >
+                                        connections
+                                      </button>
+                                    )}
+                                  </>
                                 )}
                               </div>
                             )
@@ -392,6 +409,15 @@ export default function PhotoDetail({ mediaId, filePath, onClose }: Props) {
         </div>
       </div>
     </div>
+
+    {connectionsPid !== null && (
+      <ConnectionsGraph
+        personId={connectionsPid}
+        personName={connectionsName}
+        onClose={() => setConnectionsPid(null)}
+      />
+    )}
+    </>
   )
 }
 

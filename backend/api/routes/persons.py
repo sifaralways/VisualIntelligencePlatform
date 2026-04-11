@@ -858,7 +858,6 @@ async def connections_graph(person_id: int, depth: int = 2):
             WHERE f1.person_id = ?
             GROUP BY f2.cluster_id
             ORDER BY shared_photos DESC
-            LIMIT 10
         """, (person_id,))
 
         for row in unnamed_d1:
