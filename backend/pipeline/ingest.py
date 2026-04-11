@@ -173,7 +173,12 @@ async def run_reprocess(force_retag: bool = False) -> None:
     # embeddings from mixed files (some named, some unnamed).
     await _phase_cluster()
 
-    # Step 3a: Absorb HDBSCAN noise singletons into nearby clusters.
+    # Step 3a: Refresh co-occurrence graph from existing named persons so
+    # the singleton-recovery boost has current data to query against.
+    await _phase_build_cooccurrence()
+
+    # Step 3b: Absorb HDBSCAN noise singletons into nearby clusters.
+    # Uses co-occurrence data built above for confidence boost.
     await _phase_recover_singletons()
 
     # Step 4: Auto-merge + suppress.
@@ -181,7 +186,8 @@ async def run_reprocess(force_retag: bool = False) -> None:
     # Matches new clusters → ignored persons (silently suppressed).
     await _phase_auto_merge()
 
-    # Step 4b: Rebuild person co-occurrence graph.
+    # Step 4b: Rebuild co-occurrence again to capture any new assignments
+    # made by singleton recovery and auto-merge in this run.
     await _phase_build_cooccurrence()
 
     # Step 5: Restore VIP-history names for newly-detected faces in files
@@ -350,6 +356,7 @@ async def run_single_reprocess(media_id: int) -> None:
     # guard in _phase_embed sees no existing embeddings and processes normally.
     await _phase_embed()
     await _phase_cluster()
+    await _phase_build_cooccurrence()
     await _phase_recover_singletons()
     await _phase_auto_merge()
     await _phase_build_cooccurrence()
@@ -444,6 +451,7 @@ async def run_batch_reprocess(media_ids: list[int]) -> None:
     # guard in _phase_embed sees no existing embeddings and processes normally.
     await _phase_embed()
     await _phase_cluster()
+    await _phase_build_cooccurrence()
     await _phase_recover_singletons()
     await _phase_auto_merge()
     await _phase_build_cooccurrence()
@@ -626,6 +634,7 @@ async def run_model_migration() -> None:
     # ------------------------------------------------------------------
     await _phase_embed()
     await _phase_cluster()
+    await _phase_build_cooccurrence()
     await _phase_recover_singletons()
     await _phase_auto_merge()
     await _phase_build_cooccurrence()
@@ -685,13 +694,16 @@ async def run_ingest(folder: str) -> None:
     # -- Phase 3: Cluster ---------------------------------------------------
     await _phase_cluster()
 
-    # -- Phase 3a: Singleton recovery — FAISS nearest-neighbour pass --------
+    # -- Phase 3a-i: Refresh co-occurrence so singleton recovery can use it --
+    await _phase_build_cooccurrence()
+
+    # -- Phase 3a-ii: Singleton recovery — FAISS nearest-neighbour pass ------
     await _phase_recover_singletons()
 
     # -- Phase 3b: Auto-merge high-conf + surface borderline suggestions ----
     await _phase_auto_merge()
 
-    # -- Phase 3b-ii: Rebuild person co-occurrence graph -------------------
+    # -- Phase 3b-ii: Rebuild co-occurrence to capture this run's assignments -
     await _phase_build_cooccurrence()
 
     # -- Phase 3c: Restore person names from VIP History -------------------
@@ -1729,31 +1741,39 @@ async def _phase_build_cooccurrence() -> None:
         await db.execute("DELETE FROM person_cooccurrence")
 
         # Self-join faces on same media_file to find co-occurring persons.
-        # The MIN/MAX trick avoids storing both (A,B) and (B,A).
+        # CTE pre-computes canonical (person_a_id, person_b_id) ordering with
+        # CASE so that the outer GROUP BY uses plain columns — SQLite does not
+        # allow aggregate functions inside GROUP BY clauses.
         await db.execute("""
             INSERT INTO person_cooccurrence
                 (person_a_id, person_b_id, count, last_seen_at)
             SELECT
-                MIN(f1.person_id)                        AS person_a_id,
-                MAX(f1.person_id)                        AS person_b_id,
-                COUNT(DISTINCT f1.media_file_id)         AS count,
-                COALESCE(
-                    MAX(m.date_taken),
-                    datetime('now')
-                )                                        AS last_seen_at
-            FROM faces f1
-            JOIN faces f2
-              ON  f2.media_file_id = f1.media_file_id
-              AND f2.person_id     != f1.person_id
-              AND f2.person_id     IS NOT NULL
-            JOIN media_files m ON m.id = f1.media_file_id
-            JOIN persons pa ON pa.id = MIN(f1.person_id, f2.person_id)
+                pairs.pa,
+                pairs.pb,
+                COUNT(DISTINCT pairs.media_file_id) AS count,
+                COALESCE(MAX(pairs.date_taken), datetime('now')) AS last_seen_at
+            FROM (
+                SELECT
+                    CASE WHEN f1.person_id < f2.person_id
+                         THEN f1.person_id ELSE f2.person_id END AS pa,
+                    CASE WHEN f1.person_id < f2.person_id
+                         THEN f2.person_id ELSE f1.person_id END AS pb,
+                    f1.media_file_id,
+                    m.date_taken
+                FROM faces f1
+                JOIN faces f2
+                  ON  f2.media_file_id = f1.media_file_id
+                  AND f2.person_id     != f1.person_id
+                  AND f2.person_id     IS NOT NULL
+                JOIN media_files m ON m.id = f1.media_file_id
+                WHERE f1.person_id IS NOT NULL
+            ) AS pairs
+            JOIN persons pa ON pa.id = pairs.pa
                            AND pa.is_merged = 0 AND pa.is_ignored = 0
-            JOIN persons pb ON pb.id = MAX(f1.person_id, f2.person_id)
+            JOIN persons pb ON pb.id = pairs.pb
                            AND pb.is_merged = 0 AND pb.is_ignored = 0
-            WHERE f1.person_id IS NOT NULL
-            GROUP BY MIN(f1.person_id), MAX(f1.person_id)
-            HAVING COUNT(DISTINCT f1.media_file_id) >= 1
+            GROUP BY pairs.pa, pairs.pb
+            HAVING COUNT(DISTINCT pairs.media_file_id) >= 1
         """)
 
         row = await (await db.execute("SELECT COUNT(*) AS n FROM person_cooccurrence")).fetchone()

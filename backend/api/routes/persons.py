@@ -177,6 +177,80 @@ async def _rescore_after_person_update(person_id: int) -> None:
         logger.warning("_rescore_after_person_update failed (non-fatal): %s", exc)
 
 
+async def _update_cooccurrence_for_person(person_id: int) -> None:
+    """Incrementally refresh co-occurrence edges for a newly named/updated person.
+
+    Called as a background task after any naming or merge action.
+    Only touches edges where this person is one of the two participants,
+    so it is much faster than a full rebuild.
+
+    Steps:
+    1. Delete all existing edges that involve person_id.
+    2. Recompute and insert fresh edges by joining this person's faces
+       against all other named persons sharing the same photos.
+    """
+    try:
+        async with get_db() as db:
+            # Verify the person is still active (not merged/ignored)
+            p = await (await db.execute(
+                "SELECT id FROM persons WHERE id=? AND is_merged=0 AND is_ignored=0",
+                (person_id,),
+            )).fetchone()
+            if not p:
+                return
+
+            # Remove stale edges for this person
+            await db.execute(
+                "DELETE FROM person_cooccurrence WHERE person_a_id=? OR person_b_id=?",
+                (person_id, person_id),
+            )
+
+            # Recompute edges: find all named persons that share a photo with
+            # this person, using the same canonical (a < b) ordering.
+            await db.execute("""
+                INSERT INTO person_cooccurrence (person_a_id, person_b_id, count, last_seen_at)
+                SELECT
+                    pairs.pa,
+                    pairs.pb,
+                    COUNT(DISTINCT pairs.media_file_id) AS count,
+                    COALESCE(MAX(pairs.date_taken), datetime('now')) AS last_seen_at
+                FROM (
+                    SELECT
+                        CASE WHEN f1.person_id < f2.person_id
+                             THEN f1.person_id ELSE f2.person_id END AS pa,
+                        CASE WHEN f1.person_id < f2.person_id
+                             THEN f2.person_id ELSE f1.person_id END AS pb,
+                        f1.media_file_id,
+                        m.date_taken
+                    FROM faces f1
+                    JOIN faces f2
+                      ON  f2.media_file_id = f1.media_file_id
+                      AND f2.person_id     != f1.person_id
+                      AND f2.person_id     IS NOT NULL
+                    JOIN media_files m ON m.id = f1.media_file_id
+                    WHERE f1.person_id = ?
+                ) AS pairs
+                JOIN persons pa ON pa.id = pairs.pa
+                               AND pa.is_merged = 0 AND pa.is_ignored = 0
+                JOIN persons pb ON pb.id = pairs.pb
+                               AND pb.is_merged = 0 AND pb.is_ignored = 0
+                GROUP BY pairs.pa, pairs.pb
+                HAVING COUNT(DISTINCT pairs.media_file_id) >= 1
+            """, (person_id,))
+
+            row = await (await db.execute(
+                "SELECT COUNT(*) AS n FROM person_cooccurrence WHERE person_a_id=? OR person_b_id=?",
+                (person_id, person_id),
+            )).fetchone()
+            edge_count = row["n"] if row else 0
+
+        logger.debug(
+            "Co-occurrence updated for person %d: %d edges", person_id, edge_count
+        )
+    except Exception as exc:
+        logger.warning("_update_cooccurrence_for_person failed (non-fatal): %s", exc)
+
+
 class NamePersonRequest(BaseModel):
     name: str
 
@@ -457,6 +531,7 @@ async def name_person(person_id: int, req: NamePersonRequest, background_tasks: 
         await update_person_centroid(db, person_id)
 
     background_tasks.add_task(_rescore_after_person_update, person_id)
+    background_tasks.add_task(_update_cooccurrence_for_person, person_id)
     return {"status": "ok", "name": req.name}
 
 
@@ -600,6 +675,7 @@ async def merge_named_persons(
         await update_person_centroid(db, survivor_id)
 
     background_tasks.add_task(_rescore_after_person_update, survivor_id)
+    background_tasks.add_task(_update_cooccurrence_for_person, survivor_id)
     return {
         "status": "merged",
         "survivor_id": survivor_id,
@@ -641,6 +717,7 @@ async def create_person_from_cluster(cluster_id: int, req: NameClusterRequest, b
         await update_person_centroid(db, person_id)
 
     background_tasks.add_task(_rescore_after_person_update, person_id)
+    background_tasks.add_task(_update_cooccurrence_for_person, person_id)
     return {"status": "created", "person_id": person_id, "uuid": person_uuid}
 
 
@@ -678,6 +755,7 @@ async def add_cluster_to_person(person_id: int, cluster_id: int, background_task
         await update_person_centroid(db, person_id)
 
     background_tasks.add_task(_rescore_after_person_update, person_id)
+    background_tasks.add_task(_update_cooccurrence_for_person, person_id)
     return {"status": "merged", "person_id": person_id}
 
 
