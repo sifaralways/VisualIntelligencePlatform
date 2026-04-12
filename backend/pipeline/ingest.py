@@ -1336,6 +1336,9 @@ async def _phase_recover_singletons() -> None:
     # Track clusters we've already absorbed a singleton into this run
     # to prevent the same target being suggested multiple times in one pass
     already_targeted: set[int] = set()
+    # Track clusters deleted this run so stale face_to_cluster entries don't
+    # cause FK violations (face_to_cluster is built once before the loop).
+    deleted_clusters: set[int] = set()
 
     for row in singleton_rows:
         singleton_cluster_id = row["cluster_id"]
@@ -1363,6 +1366,10 @@ async def _phase_recover_singletons() -> None:
 
         if target_cluster_id == singleton_cluster_id:
             continue   # hit itself somehow
+
+        # Skip if the target cluster was deleted earlier in this same pass
+        if target_cluster_id in deleted_clusters:
+            continue
 
         # ── Social-context boost ───────────────────────────────────────────
         # If the singleton's photo also contains companions who have
@@ -1444,6 +1451,13 @@ async def _phase_recover_singletons() -> None:
                     """, (target_cluster_id,))
 
             already_targeted.add(target_cluster_id)
+            deleted_clusters.add(singleton_cluster_id)
+            # Update in-memory map so subsequent iterations don't try to
+            # target the now-deleted singleton_cluster_id.
+            for info in face_to_cluster.values():
+                if info["cluster_id"] == singleton_cluster_id:
+                    info["cluster_id"] = target_cluster_id
+                    info["person_id"]  = target_person_id
             auto_merged += 1
             logger.debug(
                 "Singleton %d absorbed into cluster %d (sim=%.3f boost=%.2f eff=%.3f)",

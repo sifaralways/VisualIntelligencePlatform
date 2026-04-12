@@ -21,9 +21,10 @@ interface Props {
   mediaId: number
   filePath: string
   onClose: () => void
+  onTagRemoved?: () => void
 }
 
-export default function PhotoDetail({ mediaId, filePath, onClose }: Props) {
+export default function PhotoDetail({ mediaId, filePath, onClose, onTagRemoved }: Props) {
   const [tags,    setTags]    = useState<TagsByCategory | null>(null)
   const [faces,   setFaces]   = useState<FaceRow[]>([])
   const [persons, setPersons] = useState<Person[]>([])
@@ -134,6 +135,25 @@ export default function PhotoDetail({ mediaId, filePath, onClose }: Props) {
     } finally {
       setRemovingFace(null)
     }
+  }
+
+  async function removeTag(category: string, label: string) {
+    await api.tags.remove(mediaId, category, label)
+    setTags(prev => {
+      if (!prev) return prev
+      const updated = { ...prev }
+      const arr = updated[category as keyof typeof updated] as string[] | undefined
+      if (arr) {
+        const next = arr.filter(l => l !== label)
+        if (next.length === 0) {
+          delete updated[category as keyof typeof updated]
+        } else {
+          (updated as Record<string, string[]>)[category] = next
+        }
+      }
+      return updated
+    })
+    onTagRemoved?.()
   }
 
   // Close on Escape — but only if no edit is in progress
@@ -388,6 +408,15 @@ export default function PhotoDetail({ mediaId, filePath, onClose }: Props) {
                             <TagChips labels={tags.place} colour="bg-pink-800/60 text-pink-200" />
                           </Section>
                         )}
+                        {tags.explicit && tags.explicit.length > 0 && (
+                          <Section title="Explicit Content" icon="🔞">
+                            <TagChips
+                              labels={tags.explicit}
+                              colour="bg-red-900/60 text-red-300"
+                              onRemove={label => removeTag('explicit', label)}
+                            />
+                          </Section>
+                        )}
                       </>
                     )}
 
@@ -454,12 +483,21 @@ function Section({ title, icon, children }: { title: string; icon: string; child
   )
 }
 
-function TagChips({ labels, colour }: { labels: string[]; colour: string }) {
+function TagChips({ labels, colour, onRemove }: { labels: string[]; colour: string; onRemove?: (label: string) => void }) {
   return (
     <div className="flex flex-wrap gap-1.5">
       {labels.map(l => (
-        <span key={l} className={`text-xs px-2 py-0.5 rounded-full font-medium ${colour}`}>
+        <span key={l} className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-medium ${colour}`}>
           {l}
+          {onRemove && (
+            <button
+              onClick={() => onRemove(l)}
+              title={`Remove tag "${l}"`}
+              className="ml-0.5 opacity-60 hover:opacity-100 leading-none"
+            >
+              ✕
+            </button>
+          )}
         </span>
       ))}
     </div>

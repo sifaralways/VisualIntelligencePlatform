@@ -6,15 +6,15 @@ The detector returns per-region bounding boxes; we collapse them to a
 per-photo label list and a single "is explicit" boolean.
 
 Label taxonomy (NudeNet 3.4):
-  Explicit (stored as tags, photo marked is_explicit):
+  Stored as tags (photo marked is_explicit):
     FEMALE_GENITALIA_EXPOSED, MALE_GENITALIA_EXPOSED,
     ANUS_EXPOSED, FEMALE_BREAST_EXPOSED, BUTTOCKS_EXPOSED
 
-  Borderline / covered (stored as tags but not is_explicit):
+  Not stored (too many false positives on clothed subjects):
     FEMALE_GENITALIA_COVERED, FEMALE_BREAST_COVERED,
     ANUS_COVERED, BUTTOCKS_COVERED
 
-  Neutral / face / clothing (not stored):
+  Not stored (neutral):
     FACE_FEMALE, FACE_MALE, BELLY_COVERED, BELLY_EXPOSED,
     FEET_EXPOSED, FEET_COVERED, ARMPITS_COVERED, ARMPITS_EXPOSED,
     MALE_BREAST_EXPOSED
@@ -41,13 +41,10 @@ _EXPLICIT_LABELS: frozenset[str] = frozenset({
     "BUTTOCKS_EXPOSED",
 })
 
-# Labels we want to store as tags (explicit + borderline).
-_STORE_LABELS: frozenset[str] = _EXPLICIT_LABELS | frozenset({
-    "FEMALE_GENITALIA_COVERED",
-    "FEMALE_BREAST_COVERED",
-    "ANUS_COVERED",
-    "BUTTOCKS_COVERED",
-})
+# Labels we want to store as tags.
+# Only exposed content is stored — "covered" labels (e.g. FEMALE_BREAST_COVERED)
+# generate too many false positives on clothed subjects and are excluded.
+_STORE_LABELS: frozenset[str] = _EXPLICIT_LABELS
 
 
 @dataclass

@@ -66,3 +66,17 @@ async def get_top_tags(category: str | None = None, limit: int = 20):
             """, (limit,))
 
     return [dict(r) for r in rows]
+
+
+@router.delete("/{media_file_id}/{category}/{label}")
+async def delete_tag(media_file_id: int, category: str, label: str):
+    """Remove a specific ML tag from a media file."""
+    async with get_db() as db:
+        result = await db.execute(
+            "DELETE FROM media_tags WHERE media_file_id=? AND category=? AND label=?",
+            (media_file_id, category, label),
+        )
+        await db.commit()
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Tag not found")
+    return {"status": "deleted", "media_file_id": media_file_id, "category": category, "label": label}

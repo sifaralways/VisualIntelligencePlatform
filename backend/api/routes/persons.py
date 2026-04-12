@@ -505,6 +505,56 @@ async def unignore_person(person_id: int):
     return {"status": "restored", "person_id": person_id}
 
 
+@router.delete("/{person_id}")
+async def delete_person(person_id: int, background_tasks: BackgroundTasks):
+    """
+    Un-name a person: remove their name assignment and release all associated
+    clusters back to the unnamed pool.
+
+    Does NOT delete faces or embeddings — the face detections are kept and
+    will reappear in the Unnamed Faces tab after the next cluster run.
+    """
+    async with get_db() as db:
+        person = await (
+            await db.execute(
+                "SELECT id, name, is_merged FROM persons WHERE id=?", (person_id,)
+            )
+        ).fetchone()
+        if not person:
+            raise HTTPException(status_code=404, detail="Person not found")
+        if person["is_merged"]:
+            raise HTTPException(status_code=400, detail="Cannot un-name a merged person record.")
+
+        # 1. Queue affected media for writeback BEFORE unlinking (so we can find them)
+        await db.execute("""
+            INSERT OR REPLACE INTO writeback_queue (media_file_id)
+            SELECT DISTINCT media_file_id FROM faces WHERE person_id=?
+        """, (person_id,))
+
+        # 2. Unlink faces from person
+        await db.execute("UPDATE faces SET person_id=NULL WHERE person_id=?", (person_id,))
+
+        # 3. Unlink clusters from person
+        await db.execute("UPDATE clusters SET person_id=NULL WHERE person_id=?", (person_id,))
+
+        # 4. Remove co-occurrence edges
+        await db.execute(
+            "DELETE FROM person_cooccurrence WHERE person_a_id=? OR person_b_id=?",
+            (person_id, person_id),
+        )
+
+        # 5. Remove suggestion rejections
+        await db.execute(
+            "DELETE FROM rejected_suggestions WHERE person_id=?", (person_id,)
+        )
+
+        # 6. Delete the person row itself
+        await db.execute("DELETE FROM persons WHERE id=?", (person_id,))
+
+    logger.info("Person %d ('%s') un-named — clusters released to unnamed pool", person_id, person["name"])
+    return {"status": "deleted", "person_id": person_id}
+
+
 @router.patch("/{person_id}/name")
 async def name_person(person_id: int, req: NamePersonRequest, background_tasks: BackgroundTasks):
     """Assign or update the name of a person."""

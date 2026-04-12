@@ -38,6 +38,14 @@ const ACTIONS = [
     danger: false,
   },
   {
+    scope: 'clean_explicit',
+    label: 'Remove false-positive explicit tags',
+    colour: 'blue',
+    description:
+      'Deletes "covered" explicit tags (e.g. Female Breast Covered) that were stored under old detection rules and frequently produce false positives on clothed subjects. Only truly explicit (exposed) labels are kept. Re-run the pipeline to refresh detection with the current threshold.',
+    danger: false,
+  },
+  {
     scope: 'persons',
     label: 'Clear named persons',
     colour: 'amber',

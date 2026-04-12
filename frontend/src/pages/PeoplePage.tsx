@@ -43,6 +43,8 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   const [reviewLoading, setReviewLoading] = useState(false)
   const [reviewPortraitFaceId, setReviewPortraitFaceId] = useState<number | null>(null)
   const [settingPortrait, setSettingPortrait] = useState<number | null>(null)
+  const [confirmUnname, setConfirmUnname] = useState(false)
+  const [unnaming, setUnnaming] = useState(false)
 
   // ── Unnamed cluster face review ──────────────────────────────────────────
   const [reviewCluster, setReviewCluster] = useState<Cluster | null>(null)
@@ -397,6 +399,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     setReviewPerson(person)
     setReviewFaces([])
     setReviewPortraitFaceId(null)
+    setConfirmUnname(false)
     setReviewLoading(true)
     try {
       const faces = await api.faces.byPerson(person.id)
@@ -425,6 +428,19 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     await api.faces.removeFromPerson(faceId)
     setReviewFaces(f => f.filter(x => x.id !== faceId))
     load() // refresh counts
+  }
+
+  async function handleUnnamePerson() {
+    if (!reviewPerson) return
+    setUnnaming(true)
+    try {
+      await api.persons.delete(reviewPerson.id)
+      setReviewPerson(null)
+      setConfirmUnname(false)
+      await load()
+    } finally {
+      setUnnaming(false)
+    }
   }
 
   async function openClusterReview(cluster: Cluster) {
@@ -786,8 +802,37 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
                   Click ✕ to remove a face &nbsp;·&nbsp; Click ★ to set as primary thumbnail
                 </p>
               </div>
-              <button onClick={() => setReviewPerson(null)}
-                className="text-gray-400 hover:text-white text-xl leading-none px-2">✕</button>
+              <div className="flex items-center gap-2">
+                {confirmUnname ? (
+                  <>
+                    <span className="text-xs text-red-400">Remove name &amp; release all faces?</span>
+                    <button
+                      onClick={handleUnnamePerson}
+                      disabled={unnaming}
+                      className="text-xs px-2.5 py-1 rounded-lg bg-red-700 hover:bg-red-600 disabled:opacity-40 text-white transition-colors"
+                    >
+                      {unnaming ? 'Removing…' : 'Yes, un-name'}
+                    </button>
+                    <button
+                      onClick={() => setConfirmUnname(false)}
+                      disabled={unnaming}
+                      className="text-xs px-2 py-1 rounded-lg bg-gray-700 hover:bg-gray-600 text-gray-300 transition-colors"
+                    >
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    onClick={() => setConfirmUnname(true)}
+                    title="Remove name and release faces back to unnamed pool"
+                    className="text-xs px-2.5 py-1 rounded-lg border border-red-800 bg-red-900/20 text-red-400 hover:bg-red-900/40 hover:text-red-300 transition-colors"
+                  >
+                    Un-name
+                  </button>
+                )}
+                <button onClick={() => { setReviewPerson(null); setConfirmUnname(false) }}
+                  className="text-gray-400 hover:text-white text-xl leading-none px-2">✕</button>
+              </div>
             </div>
             {reviewLoading
               ? <p className="text-gray-400 text-sm">Loading…</p>

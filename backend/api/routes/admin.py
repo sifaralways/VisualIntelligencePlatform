@@ -133,7 +133,7 @@ async def _vacuum_db() -> int:
 @router.delete("/reset/{scope}")
 async def reset(scope: str):
     """Clear data at the specified scope level."""
-    valid = {"all", "scan", "faces", "clusters", "persons", "thumbs", "clean_blurry"}
+    valid = {"all", "scan", "faces", "clusters", "persons", "thumbs", "clean_blurry", "clean_explicit"}
     if scope not in valid:
         raise HTTPException(status_code=400, detail=f"Unknown scope '{scope}'. Use: {valid}")
 
@@ -269,6 +269,27 @@ async def reset(scope: str):
                 "Re-run the pipeline (Rescan All) to re-cluster remaining faces."
             ),
             "deleted": len(blurry_ids),
+            "pages_freed": freed,
+        }
+
+    if scope == "clean_explicit":
+        # Delete covered-label explicit tags that were stored under old rules.
+        # Keeps only labels that are in the current _EXPLICIT_LABELS set.
+        from backend.ml.explicit_detector import _EXPLICIT_LABELS as _EXP
+        async with get_db() as db:
+            result = await db.execute(
+                "DELETE FROM media_tags WHERE category='explicit' AND label NOT IN (%s)"
+                % ",".join("?" * len(_EXP)),
+                list(_EXP),
+            )
+            deleted = result.rowcount
+            logger.warning("ADMIN: clean_explicit — removed %d covered/invalid explicit tags", deleted)
+        freed = await _vacuum_db()
+        return {
+            "status": "ok",
+            "scope": scope,
+            "detail": f"Removed {deleted} covered/false-positive explicit tag(s). Re-run the pipeline to refresh.",
+            "deleted": deleted,
             "pages_freed": freed,
         }
 

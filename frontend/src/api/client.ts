@@ -148,6 +148,9 @@ export const api = {
         `/persons/assign-face/${faceId}`,
         { method: 'POST', body: JSON.stringify({ name }) }
       ),
+    /** Un-name a person: releases all their clusters back to the unnamed pool and deletes the person record. */
+    delete: (personId: number) =>
+      request<{ status: string; person_id: number }>(`/persons/${personId}`, { method: 'DELETE' }),
   },
 
   // ─── Faces ────────────────────────────────────────────────────────────────
@@ -199,6 +202,12 @@ export const api = {
       const q = category ? `?category=${category}&limit=${limit}` : `?limit=${limit}`
       return request<TopTag[]>(`/tags/summary/top${q}`)
     },
+    /** Remove a specific ML tag from a media file. */
+    remove: (mediaFileId: number, category: string, label: string) =>
+      request<{ status: string }>(
+        `/tags/${mediaFileId}/${encodeURIComponent(category)}/${encodeURIComponent(label)}`,
+        { method: 'DELETE' },
+      ),
   },
 
   // ─── Analysis ────────────────────────────────────────────────────────────
@@ -545,6 +554,7 @@ export interface TagsByCategory {
   animal?: string[]
   geography?: string[]
   place?: string[]
+  explicit?: string[]
 }
 
 export interface TopTag {
