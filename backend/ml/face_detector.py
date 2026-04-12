@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 from backend.config import settings
 from backend.database.settings_store import get as get_setting
@@ -182,7 +182,17 @@ class FaceDetector:
 
         try:
             pil_img = Image.open(image_path)
+            # Capture raw EXIF before transpose (used for focal-length signal in
+            # Intelligent mode).  The _getexif() call must happen on the original
+            # opened image; after exif_transpose the attribute may be missing.
             exif_data = pil_img._getexif() if hasattr(pil_img, '_getexif') else None  # type: ignore[attr-defined]
+            # Apply EXIF orientation so the numpy array always has physically upright
+            # pixels regardless of how the preview JPEG was generated.  For previews
+            # that were already correctly oriented (Orientation=1 or no tag) this is
+            # a no-op.  For any preview with a residual orientation tag (e.g. stale
+            # cached preview from before the orientation-correction code was added),
+            # this ensures the face crop and its saved thumbnail are correctly oriented.
+            pil_img = ImageOps.exif_transpose(pil_img)
             img = np.array(pil_img.convert("RGB"))
         except Exception as e:
             logger.warning("Cannot open image %s: %s", image_path, e)
@@ -427,16 +437,48 @@ class FaceDetector:
                 )
 
             # ── Quality: brightness + sharpness from face crop ────────────────
+            # Both metrics use the TIGHT face bbox (no padding) to avoid the
+            # bokeh background skewing measurements.
+            #
+            # Sharpness: resize to a fixed 128×128 before computing the
+            # Laplacian variance.  This makes the metric:
+            #   • scale-invariant  (large faces ≠ higher score)
+            #   • background-free  (no padded bokeh included)
+            #   • calibrated to 0–100 where ~100 = crisp, ~10 = clearly blurry
+            #
+            # Normalization divisor 20.0 was empirically derived from real
+            # camera photos: sharp faces score ~20–50 raw variance → 100–250
+            # → clipped to 100; blurry bokeh faces score ~0.5–5 → 2.5–25.
             quality_brightness = quality_sharpness = None
-            if crop.size > 0:
-                gray = np.mean(crop, axis=2)
-                quality_brightness = float(np.clip(np.mean(gray) / 255 * 100, 0, 100))
-                laplacian = np.array([
-                    gray[:-2, 1:-1] + gray[2:, 1:-1] + gray[1:-1, :-2] + gray[1:-1, 2:]
-                    - 4 * gray[1:-1, 1:-1]
-                ])
+            face_crop = img[y1:y2, x1:x2]  # tight, no padding
+            if face_crop.size > 0:
+                gray_face = np.mean(face_crop, axis=2)
+                quality_brightness = float(np.clip(np.mean(gray_face) / 255 * 100, 0, 100))
+
+                # Resize to fixed 128×128 for scale-invariant Laplacian
+                resized = np.array(
+                    Image.fromarray(face_crop).resize(
+                        (128, 128), Image.Resampling.BILINEAR
+                    ),
+                    dtype=np.float64,
+                )
+                gray_r = np.mean(resized, axis=2)
+                laplacian = (
+                    gray_r[:-2, 1:-1] + gray_r[2:, 1:-1]
+                    + gray_r[1:-1, :-2] + gray_r[1:-1, 2:]
+                    - 4 * gray_r[1:-1, 1:-1]
+                )
                 lap_var = float(np.var(laplacian))
-                quality_sharpness = float(np.clip(lap_var / 500 * 100, 0, 100))
+                quality_sharpness = float(np.clip(lap_var / 20.0 * 100, 0, 100))
+
+            # ── Sharpness gate — discard bokeh / depth-of-field blurs ─────────
+            min_sharpness = float(get_setting('face_min_sharpness'))
+            if min_sharpness > 0 and quality_sharpness is not None and quality_sharpness < min_sharpness:
+                logger.debug(
+                    "Skipping blurry face (sharpness=%.1f < %.1f) in %s",
+                    quality_sharpness, min_sharpness, image_path.name,
+                )
+                continue
 
             results.append(DetectedFace(
                 bbox_x=x1 / img_w,

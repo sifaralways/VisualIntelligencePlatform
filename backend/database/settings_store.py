@@ -66,6 +66,19 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "description": "Suppress gender and age predictions when the face crop sharpness (0–100) is below this. Blurry crops produce near-random results.",
         "group": "Face Detection",
     },
+    "face_min_sharpness": {
+        "value": 20.0, "type": "float", "min": 0.0, "max": 100.0, "step": 5.0,
+        "label": "Min face sharpness",
+        "description": (
+            "Discard face detections whose sharpness score falls below this. "
+            "Sharpness is measured on the tight face crop resized to 128×128 using Laplacian variance (0–100). "
+            "Bokeh / depth-of-field blurred faces typically score 5–15; "
+            "clearly in-focus faces typically score 60–100. "
+            "20 removes most out-of-focus background faces while keeping anything recognisably sharp. "
+            "0 = accept everything (original behaviour). Takes effect on the next scan."
+        ),
+        "group": "Face Detection",
+    },
     "hdbscan_min_cluster_size": {
         "value": 2, "type": "int", "min": 2, "max": 10, "step": 1,
         "label": "Min cluster size",
@@ -185,6 +198,16 @@ DEFAULTS: dict[str, dict[str, Any]] = {
             "Reduce to 50–100 if your library is on a NAS or if Phase 1 times out."
         ),
         "group": "System",
+    },
+    "nudenet_confidence_threshold": {
+        "value": 0.65, "type": "float", "min": 0.1, "max": 0.95, "step": 0.05,
+        "label": "Explicit content confidence threshold",
+        "description": (
+            "NudeNet minimum detection confidence to store an explicit label. "
+            "Lower values detect more but increase false positives. "
+            "0.65 is a reliable default. Takes effect on the next scan."
+        ),
+        "group": "Content Safety",
     },
     "exif_batch_timeout": {
         "value": 300, "type": "int", "min": 30, "max": 3600, "step": 30,

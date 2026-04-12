@@ -173,10 +173,22 @@ async def run_reprocess(force_retag: bool = False) -> None:
     # embeddings from mixed files (some named, some unnamed).
     await _phase_cluster()
 
+    # Step 3a: Refresh co-occurrence graph from existing named persons so
+    # the singleton-recovery boost has current data to query against.
+    await _phase_build_cooccurrence()
+
+    # Step 3b: Absorb HDBSCAN noise singletons into nearby clusters.
+    # Uses co-occurrence data built above for confidence boost.
+    await _phase_recover_singletons()
+
     # Step 4: Auto-merge + suppress.
     # Matches new clusters → named persons (auto-name or suggestion).
     # Matches new clusters → ignored persons (silently suppressed).
     await _phase_auto_merge()
+
+    # Step 4b: Rebuild co-occurrence again to capture any new assignments
+    # made by singleton recovery and auto-merge in this run.
+    await _phase_build_cooccurrence()
 
     # Step 5: Restore VIP-history names for newly-detected faces in files
     # that VIP previously wrote XMP data to.
@@ -344,7 +356,10 @@ async def run_single_reprocess(media_id: int) -> None:
     # guard in _phase_embed sees no existing embeddings and processes normally.
     await _phase_embed()
     await _phase_cluster()
+    await _phase_build_cooccurrence()
+    await _phase_recover_singletons()
     await _phase_auto_merge()
+    await _phase_build_cooccurrence()
     await _phase_restore_vip_names()
 
     await broadcast("pipeline_complete", folder=f"[reprocess photo {media_id}]")
@@ -436,7 +451,10 @@ async def run_batch_reprocess(media_ids: list[int]) -> None:
     # guard in _phase_embed sees no existing embeddings and processes normally.
     await _phase_embed()
     await _phase_cluster()
+    await _phase_build_cooccurrence()
+    await _phase_recover_singletons()
     await _phase_auto_merge()
+    await _phase_build_cooccurrence()
     await _phase_restore_vip_names()
 
     await broadcast("pipeline_complete", folder=label)
@@ -612,11 +630,14 @@ async def run_model_migration() -> None:
     await broadcast("phase_complete", phase="redetect_prep")
 
     # ------------------------------------------------------------------
-    # Step 4: Re-detect + embed → cluster → auto-merge → name-restore
+    # Step 4: Re-detect + embed → cluster → singleton-recovery → auto-merge → name-restore
     # ------------------------------------------------------------------
     await _phase_embed()
     await _phase_cluster()
+    await _phase_build_cooccurrence()
+    await _phase_recover_singletons()
     await _phase_auto_merge()
+    await _phase_build_cooccurrence()
     await _phase_restore_vip_names()
 
     # Sync denormalised photo_count on all active persons
@@ -673,8 +694,17 @@ async def run_ingest(folder: str) -> None:
     # -- Phase 3: Cluster ---------------------------------------------------
     await _phase_cluster()
 
+    # -- Phase 3a-i: Refresh co-occurrence so singleton recovery can use it --
+    await _phase_build_cooccurrence()
+
+    # -- Phase 3a-ii: Singleton recovery — FAISS nearest-neighbour pass ------
+    await _phase_recover_singletons()
+
     # -- Phase 3b: Auto-merge high-conf + surface borderline suggestions ----
     await _phase_auto_merge()
+
+    # -- Phase 3b-ii: Rebuild co-occurrence to capture this run's assignments -
+    await _phase_build_cooccurrence()
 
     # -- Phase 3c: Restore person names from VIP History -------------------
     # When ExifTool has previously written named face regions to a photo,
@@ -1217,6 +1247,267 @@ async def _phase_cluster() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Phase 3a: Singleton recovery — FAISS nearest-neighbour pass
+# ---------------------------------------------------------------------------
+
+async def _phase_recover_singletons() -> None:
+    """Absorb HDBSCAN noise singletons into existing clusters using FAISS.
+
+    Problem: HDBSCAN labels low-density faces as noise (label=-1).  VIP
+    promotes each noise face to its own singleton cluster so it appears in
+    the UI.  The same person may appear twice in the same album yet end up
+    as a real cluster (5 photos) + 2 singletons (bad angle, dark photo).
+
+    Fix: After clustering, query FAISS with each singleton's centroid and
+    find the k nearest face embeddings.  If the closest match belongs to
+    an existing multi-face cluster (or a named person), absorb the singleton:
+
+    - similarity >= singleton_auto_merge  → silent merge into cluster/person
+    - similarity >= merge_suggest_threshold → surface as a suggestion card
+
+    Only singletons are considered as the query side; any non-singleton can
+    already appear as a neighbor.  Named-person clusters are valid targets
+    (a singleton may be a known person photographed in an unusual situation).
+
+    The FAISS index built by _phase_cluster() is reused in memory — no
+    rebuild needed.  This phase is O(S × k) in FAISS lookups where S is the
+    number of singletons and k is small (default 20).
+    """
+    from backend.database.settings_store import get as get_setting
+    from backend.pipeline.centroid import update_person_centroid, load_centroid
+
+    if _faiss.total == 0:
+        logger.info("Phase 3a: FAISS index empty — skipping singleton recovery")
+        return
+
+    auto_th    = float(get_setting("auto_name_threshold"))   # default 0.98
+    suggest_th = float(get_setting("merge_suggest_threshold"))  # default 0.63
+
+    # Singleton recovery uses a slightly lower auto-threshold than person
+    # auto-naming.  Two near-identical embeddings that both ended up as
+    # HDBSCAN singletons almost certainly belong together.
+    singleton_auto_th = max(suggest_th, min(auto_th, 0.88))
+
+    logger.info(
+        "Phase 3a: Singleton recovery (auto≥%.2f, suggest≥%.2f)",
+        singleton_auto_th, suggest_th,
+    )
+    await broadcast("phase_start", phase="singleton_recovery")
+
+    # -- Load singleton clusters (member_count == 1, person_id IS NULL) -----
+    async with get_db() as db:
+        singleton_rows = await db.execute_fetchall("""
+            SELECT c.id AS cluster_id, c.centroid,
+                   MIN(f.id) AS face_id
+            FROM clusters c
+            JOIN faces f ON f.cluster_id = c.id
+            WHERE c.member_count = 1
+              AND c.person_id IS NULL
+            GROUP BY c.id
+        """)
+
+        # Build face_id → cluster_id map for all non-singleton unnamed clusters
+        # (needed to find which cluster a FAISS hit belongs to)
+        face_to_cluster_rows = await db.execute_fetchall("""
+            SELECT f.id AS face_id, f.cluster_id, c.member_count,
+                   f.person_id,
+                   c.person_id AS cluster_person_id
+            FROM faces f
+            JOIN clusters c ON c.id = f.cluster_id
+            WHERE f.cluster_id IS NOT NULL
+        """)
+
+    face_to_cluster: dict[int, dict] = {
+        r["face_id"]: {
+            "cluster_id":        r["cluster_id"],
+            "member_count":      r["member_count"],
+            "person_id":         r["cluster_person_id"],
+        }
+        for r in face_to_cluster_rows
+    }
+
+    if not singleton_rows:
+        logger.info("Phase 3a: No singleton clusters to recover")
+        await broadcast("phase_complete", phase="singleton_recovery", merged=0)
+        return
+
+    auto_merged   = 0
+    suggestions: list[dict] = []
+    # Track clusters we've already absorbed a singleton into this run
+    # to prevent the same target being suggested multiple times in one pass
+    already_targeted: set[int] = set()
+    # Track clusters deleted this run so stale face_to_cluster entries don't
+    # cause FK violations (face_to_cluster is built once before the loop).
+    deleted_clusters: set[int] = set()
+
+    for row in singleton_rows:
+        singleton_cluster_id = row["cluster_id"]
+        if not row["centroid"]:
+            continue
+        centroid = load_centroid(row["centroid"])
+
+        # Query FAISS — exclude the singleton's own face from hits (it's in
+        # the index too; subtract 1 from k so we always get real neighbours)
+        hits = _faiss.search(centroid, k=21, threshold=suggest_th)
+        # Filter out the singleton's own face
+        own_face_id = row["face_id"]
+        hits = [(fid, sim) for fid, sim in hits if fid != own_face_id]
+
+        if not hits:
+            continue
+
+        best_face_id, best_sim = hits[0]
+        target = face_to_cluster.get(best_face_id)
+        if target is None:
+            continue
+
+        target_cluster_id = target["cluster_id"]
+        target_person_id  = target["person_id"]
+
+        if target_cluster_id == singleton_cluster_id:
+            continue   # hit itself somehow
+
+        # Skip if the target cluster was deleted earlier in this same pass
+        if target_cluster_id in deleted_clusters:
+            continue
+
+        # ── Social-context boost ───────────────────────────────────────────
+        # If the singleton's photo also contains companions who have
+        # previously appeared alongside the proposed target_person_id, we
+        # credit extra confidence (up to +0.10).  This mirrors the temporal
+        # co-occurrence signal Apple Photos uses to disambiguate look-alikes.
+        # Only applicable when the target cluster already belongs to a known
+        # named person; anonymous clusters don't have historical co-occurrence.
+        boost = 0.0
+        if target_person_id is not None:
+            async with get_db() as _bdb:
+                _br = await (await _bdb.execute("""
+                    SELECT COUNT(DISTINCT companion.person_id) AS colocated
+                    FROM faces s
+                    JOIN faces companion
+                      ON  companion.media_file_id = s.media_file_id
+                      AND companion.person_id IS NOT NULL
+                    WHERE s.cluster_id = ?
+                      AND EXISTS (
+                          SELECT 1 FROM faces f1
+                          JOIN faces f2
+                            ON  f2.media_file_id = f1.media_file_id
+                            AND f2.person_id = ?
+                          WHERE f1.person_id = companion.person_id
+                      )
+                """, (singleton_cluster_id, target_person_id))).fetchone()
+            colocated = _br["colocated"] if _br else 0
+            boost = min(0.10, colocated * 0.05)
+
+        effective_sim = min(1.0, best_sim + boost)
+
+        if effective_sim >= singleton_auto_th:
+            # ── Silent auto-merge: move singleton faces into target cluster ─
+            if target_cluster_id in already_targeted:
+                continue
+            async with get_db() as db:
+                # Move the singleton's face(s) into the target cluster
+                await db.execute(
+                    "UPDATE faces SET cluster_id=?, person_id=? WHERE cluster_id=?",
+                    (target_cluster_id, target_person_id, singleton_cluster_id),
+                )
+                # Delete the now-empty singleton cluster row
+                await db.execute(
+                    "DELETE FROM clusters WHERE id=?", (singleton_cluster_id,)
+                )
+                # Update target cluster member count
+                await db.execute("""
+                    UPDATE clusters SET member_count = (
+                        SELECT COUNT(*) FROM faces WHERE cluster_id = ?
+                    ) WHERE id = ?
+                """, (target_cluster_id, target_cluster_id))
+                # Also update centroid of the target cluster by recomputing
+                # from its embeddings (now includes the absorbed singleton)
+                emb_rows = await db.execute_fetchall("""
+                    SELECT e.vector FROM embeddings e
+                    JOIN faces f ON f.id = e.face_id
+                    WHERE f.cluster_id = ?
+                """, (target_cluster_id,))
+                if emb_rows:
+                    vecs = np.stack([
+                        np.frombuffer(r["vector"], dtype=np.float32)
+                        for r in emb_rows
+                    ])
+                    new_centroid = vecs.mean(axis=0)
+                    norm = np.linalg.norm(new_centroid)
+                    if norm > 0:
+                        new_centroid /= norm
+                    await db.execute(
+                        "UPDATE clusters SET centroid=? WHERE id=?",
+                        (new_centroid.tobytes(), target_cluster_id),
+                    )
+                # If the target cluster belongs to a named person, refresh
+                # the person's centroid and queue photos for writeback.
+                if target_person_id is not None:
+                    await update_person_centroid(db, target_person_id)
+                    await db.execute("""
+                        INSERT OR REPLACE INTO writeback_queue (media_file_id)
+                        SELECT DISTINCT media_file_id FROM faces WHERE cluster_id=?
+                    """, (target_cluster_id,))
+
+            already_targeted.add(target_cluster_id)
+            deleted_clusters.add(singleton_cluster_id)
+            # Update in-memory map so subsequent iterations don't try to
+            # target the now-deleted singleton_cluster_id.
+            for info in face_to_cluster.values():
+                if info["cluster_id"] == singleton_cluster_id:
+                    info["cluster_id"] = target_cluster_id
+                    info["person_id"]  = target_person_id
+            auto_merged += 1
+            logger.debug(
+                "Singleton %d absorbed into cluster %d (sim=%.3f boost=%.2f eff=%.3f)",
+                singleton_cluster_id, target_cluster_id, best_sim, boost, effective_sim,
+            )
+
+        else:
+            # ── Suggestion (between suggest_th and singleton_auto_th) ───────
+            # Only surface if the raw sim clears the suggest_th (effective_sim
+            # may push borderline cases through to auto-merge above).
+            if best_sim < suggest_th:
+                continue
+            # Look up the representative thumbnail for the target cluster
+            async with get_db() as db:
+                rep = await (await db.execute("""
+                    SELECT MIN(f.thumbnail_path) AS thumb, c.member_count
+                    FROM clusters c
+                    JOIN faces f ON f.cluster_id = c.id AND f.thumbnail_path IS NOT NULL
+                    WHERE c.id = ?
+                    GROUP BY c.id
+                """, (target_cluster_id,))).fetchone()
+                s_rep = await (await db.execute("""
+                    SELECT MIN(f.thumbnail_path) AS thumb
+                    FROM faces f WHERE f.cluster_id = ?
+                """, (singleton_cluster_id,))).fetchone()
+
+            suggestions.append({
+                "singleton_cluster_id": singleton_cluster_id,
+                "singleton_thumb": s_rep["thumb"] if s_rep else None,
+                "target_cluster_id": target_cluster_id,
+                "target_person_id":  target_person_id,
+                "target_member_count": rep["member_count"] if rep else 1,
+                "target_thumb": rep["thumb"] if rep else None,
+                "similarity": round(best_sim, 3),
+            })
+
+    # Broadcast a summary so the frontend can refresh the People tab
+    await broadcast(
+        "phase_complete",
+        phase="singleton_recovery",
+        merged=auto_merged,
+        suggestions=len(suggestions),
+    )
+    logger.info(
+        "Phase 3a: %d singletons absorbed, %d suggestions",
+        auto_merged, len(suggestions),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Phase 3b: Auto-merge (high confidence) + notify borderline suggestions
 # ---------------------------------------------------------------------------
 
@@ -1437,6 +1728,73 @@ async def _phase_auto_merge() -> None:
     logger.info(
         "Phase 3b: %d auto-named, %d suggestions surfaced", auto_named, len(suggestions)
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3b-ii: Rebuild person co-occurrence graph
+# ---------------------------------------------------------------------------
+
+async def _phase_build_cooccurrence() -> None:
+    """
+    Rebuild the person_cooccurrence table from the current face assignments.
+
+    Each row = (person_a_id, person_b_id, count, last_seen_at) where:
+      - person_a_id < person_b_id   (canonical ordering, no duplicate pairs)
+      - count = number of distinct photos both persons appear in together
+      - last_seen_at = MAX(date_taken) of shared photos (falls back to now())
+
+    Strategy: full recompute rather than incremental, so the table is always
+    consistent with the current face→person assignment even after merges or
+    manual corrections.  At typical library sizes (<100 K photos) the query
+    runs in <1 s with the indexes on faces.person_id and
+    media_files.date_taken.
+    """
+    logger.info("Phase 3b-ii: rebuilding person co-occurrence graph …")
+    async with get_db() as db:
+        # Wipe stale edges — we rebuild fully every time for consistency.
+        await db.execute("DELETE FROM person_cooccurrence")
+
+        # Self-join faces on same media_file to find co-occurring persons.
+        # CTE pre-computes canonical (person_a_id, person_b_id) ordering with
+        # CASE so that the outer GROUP BY uses plain columns — SQLite does not
+        # allow aggregate functions inside GROUP BY clauses.
+        await db.execute("""
+            INSERT INTO person_cooccurrence
+                (person_a_id, person_b_id, count, last_seen_at)
+            SELECT
+                pairs.pa,
+                pairs.pb,
+                COUNT(DISTINCT pairs.media_file_id) AS count,
+                COALESCE(MAX(pairs.date_taken), datetime('now')) AS last_seen_at
+            FROM (
+                SELECT
+                    CASE WHEN f1.person_id < f2.person_id
+                         THEN f1.person_id ELSE f2.person_id END AS pa,
+                    CASE WHEN f1.person_id < f2.person_id
+                         THEN f2.person_id ELSE f1.person_id END AS pb,
+                    f1.media_file_id,
+                    m.date_taken
+                FROM faces f1
+                JOIN faces f2
+                  ON  f2.media_file_id = f1.media_file_id
+                  AND f2.person_id     != f1.person_id
+                  AND f2.person_id     IS NOT NULL
+                JOIN media_files m ON m.id = f1.media_file_id
+                WHERE f1.person_id IS NOT NULL
+            ) AS pairs
+            JOIN persons pa ON pa.id = pairs.pa
+                           AND pa.is_merged = 0 AND pa.is_ignored = 0
+            JOIN persons pb ON pb.id = pairs.pb
+                           AND pb.is_merged = 0 AND pb.is_ignored = 0
+            GROUP BY pairs.pa, pairs.pb
+            HAVING COUNT(DISTINCT pairs.media_file_id) >= 1
+        """)
+
+        row = await (await db.execute("SELECT COUNT(*) AS n FROM person_cooccurrence")).fetchone()
+        edge_count = row["n"] if row else 0
+
+    logger.info("Phase 3b-ii: %d co-occurrence edges written", edge_count)
+    await broadcast("phase_complete", phase="cooccurrence", edges=edge_count)
 
 
 # ---------------------------------------------------------------------------
@@ -1705,7 +2063,29 @@ async def _phase_tag() -> None:
 
             # Batch-persist all tags and state transitions in one DB write.
             async with get_db() as db:
+                # Clear stale place tags before re-inserting so that a
+                # force_retag run doesn't leave old Nominatim labels alongside
+                # new MapKit-resolved labels (UNIQUE is on (file, category,
+                # label) so differing strings would both survive INSERT OR IGNORE).
+                if media_ids:
+                    placeholders = ",".join("?" * len(media_ids))
+                    await db.execute(
+                        f"DELETE FROM media_tags WHERE category='place' "
+                        f"AND media_file_id IN ({placeholders})",
+                        media_ids,
+                    )
+
+                # Clear stale explicit tags before re-inserting (same reason as place tags).
+                if media_ids:
+                    placeholders = ",".join("?" * len(media_ids))
+                    await db.execute(
+                        f"DELETE FROM media_tags WHERE category='explicit' "
+                        f"AND media_file_id IN ({placeholders})",
+                        media_ids,
+                    )
+
                 tag_rows: list[tuple] = []
+                gps_resolved_ids: list[int] = []   # files that got a GPS-resolved place label
                 for media_id, result, (gps_lat, gps_lon) in zip(
                     media_ids, tag_results, gps_data
                 ):
@@ -1716,12 +2096,16 @@ async def _phase_tag() -> None:
                     for label in result.geography:
                         tag_rows.append((media_id, "geography", label, None, "places365"))
                     for label in result.places:
-                        model = (
-                            "nominatim"
-                            if gps_lat is not None and label == result.places[0]
-                            else "clip"
-                        )
+                        # First place label is the GPS-derived one when geo_source is set.
+                        # Use the actual resolver name (mapkit/nominatim) so we can
+                        # track source provenance in the DB; fall back to "clip".
+                        is_geo_place = result.geo_source is not None and label == result.places[0]
+                        model = result.geo_source if is_geo_place else "clip"
                         tag_rows.append((media_id, "place", label, None, model))
+                        if is_geo_place:
+                            gps_resolved_ids.append(media_id)
+                    for label in result.explicit_labels:
+                        tag_rows.append((media_id, "explicit", label, None, "nudenet"))
 
                 if tag_rows:
                     await db.executemany("""
@@ -1729,6 +2113,14 @@ async def _phase_tag() -> None:
                             (media_file_id, category, label, confidence, model)
                         VALUES (?,?,?,?,?)
                     """, tag_rows)
+
+                # Queue files that received a GPS-resolved place label for
+                # writeback so the location name reaches EXIF/XMP automatically.
+                if gps_resolved_ids:
+                    await db.executemany(
+                        "INSERT OR REPLACE INTO writeback_queue (media_file_id) VALUES (?)",
+                        [(mid,) for mid in gps_resolved_ids],
+                    )
 
                 # Mark tagging complete and advance ingest_state.
                 # tags_done = 1 causes this file to be skipped on future

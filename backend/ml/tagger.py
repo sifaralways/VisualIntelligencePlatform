@@ -30,6 +30,7 @@ from backend.ml.scene_classifier import SceneClassifier
 from backend.ml.landmark_recogniser import LandmarkRecogniser
 from backend.ml.species_classifier import SpeciesClassifier
 from backend.ml.geo_resolver import GeoResolver
+from backend.ml.explicit_detector import ExplicitDetector
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,9 @@ class TagResult:
     animals: list[str]   = field(default_factory=list)
     geography: list[str] = field(default_factory=list)
     places: list[str]    = field(default_factory=list)
+    geo_source: str | None = None  # "mapkit" | "nominatim" | None (no GPS place)
+    explicit_labels: list[str] = field(default_factory=list)  # NudeNet detected labels
+    is_explicit: bool = False                                   # True if any EXPOSED label found
 
     def is_empty(self) -> bool:
         return not any([self.objects, self.animals, self.geography, self.places])
@@ -57,6 +61,7 @@ class Tagger:
         self._landmark          = LandmarkRecogniser()
         self._species           = SpeciesClassifier()
         self._geo               = GeoResolver()
+        self._explicit          = ExplicitDetector()
         self._loaded            = False
 
     def load(self) -> None:
@@ -70,6 +75,7 @@ class Tagger:
             self._landmark,
             self._species,
             self._geo,
+            self._explicit,
         ):
             try:
                 model.load()
@@ -144,7 +150,7 @@ class Tagger:
         except Exception as e:
             logger.warning("Landmark recognition failed for %s: %s", image_path.name, e)
 
-        # ── GPS → Place name (Nominatim) ────────────────────────────────────
+        # ── GPS → Place name (GeoResolver) ───────────────────────────────
         if gps_lat is not None and gps_lon is not None:
             try:
                 geo = self._geo.resolve(gps_lat, gps_lon)
@@ -152,13 +158,23 @@ class Tagger:
                     # Prepend GPS-derived place (highest priority)
                     if geo.label and geo.label not in result.places:
                         result.places.insert(0, geo.label)
+                    result.geo_source = geo.source
             except Exception as e:
                 logger.warning("Geo resolution failed: %s", e)
 
+        # ── Explicit content detection (NudeNet) ───────────────────────────────────────
+        if self._explicit.available:
+            try:
+                explicit = self._explicit.detect(image_path)
+                result.explicit_labels = explicit.labels
+                result.is_explicit = explicit.is_explicit
+            except Exception as e:
+                logger.warning("Explicit detection failed for %s: %s", image_path.name, e)
+
         logger.debug(
-            "Tagged %s → objects=%s animals=%s geography=%s places=%s",
+            "Tagged %s → objects=%s animals=%s geography=%s places=%s explicit=%s",
             image_path.name, result.objects, result.animals,
-            result.geography, result.places,
+            result.geography, result.places, result.explicit_labels,
         )
         return result
 
@@ -250,13 +266,23 @@ class Tagger:
                     geo = self._geo.resolve(gps_lat, gps_lon)
                     if geo and geo.label and geo.label not in result.places:
                         result.places.insert(0, geo.label)
+                        result.geo_source = geo.source
                 except Exception as e:
                     logger.warning("Geo resolution failed: %s", e)
 
+            # ── Explicit content detection (NudeNet) ────────────────────────────────
+            if self._explicit.available:
+                try:
+                    explicit = self._explicit.detect(image_path)
+                    result.explicit_labels = explicit.labels
+                    result.is_explicit = explicit.is_explicit
+                except Exception as e:
+                    logger.warning("Explicit detection failed for %s: %s", image_path.name, e)
+
             logger.debug(
-                "Tagged %s → objects=%s animals=%s geography=%s places=%s",
+                "Tagged %s → objects=%s animals=%s geography=%s places=%s explicit=%s",
                 image_path.name, result.objects, result.animals,
-                result.geography, result.places,
+                result.geography, result.places, result.explicit_labels,
             )
 
         return results

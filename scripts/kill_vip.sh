@@ -93,15 +93,41 @@ kill_pids "uvicorn / backend :7474" "${REPLY_PIDS[@]+"${REPLY_PIDS[@]}"}"
 collect_pids lsof -ti tcp:5173
 kill_pids "vite / frontend :5173" "${REPLY_PIDS[@]+"${REPLY_PIDS[@]}"}"
 
-# ── 3. exiftool processes (may be mid-batch) ───────────────────────────────
-collect_pids pgrep -x exiftool
-kill_pids "exiftool" "${REPLY_PIDS[@]+"${REPLY_PIDS[@]}"}"
+# ── 3. Kill orphaned Python pipeline workers first ─────────────────────────
+# When uvicorn dies abruptly, multiprocessing workers it spawned (YOLO, ML
+# models) become orphaned (PPID=1).  They keep running and keep spawning new
+# exiftool children, which is why killing exiftool alone doesn't help.
+#
+# These workers use the Homebrew Python binary directly
+# (/opt/homebrew/Cellar/python@3.11/.../Python) with "spawn_main" in args,
+# so pgrep -f "$VENV_DIR/bin/python" never matches them.
+collect_pids pgrep -f "spawn_main"
+kill_pids "python multiprocessing worker" "${REPLY_PIDS[@]+"${REPLY_PIDS[@]}"}"
 
-# ── 4. Python workers running from this project's venv ────────────────────
+# Also catch any workers that still reference the project path directly.
 if [[ -d "$VENV_DIR" ]]; then
-  collect_pids pgrep -f "$VENV_DIR/bin/python"
+  collect_pids pgrep -f "$VENV_DIR"
   kill_pids "python (.venv)" "${REPLY_PIDS[@]+"${REPLY_PIDS[@]}"}"
 fi
+
+# ── 4. exiftool processes — killed AFTER their parents so nothing respawns ─
+# On macOS, Homebrew ExifTool is a Perl script — the process shows up as
+# "perl" with "exiftool" in the arguments, so -x (exact name) never matches.
+# We also collect the PPIDs of any surviving exiftool processes just in case
+# a worker wasn't caught above, and kill those parents too.
+collect_pids pgrep -f "exiftool"
+ET_PIDS=("${REPLY_PIDS[@]+"${REPLY_PIDS[@]}"}")
+
+# Kill any parents of remaining exiftool processes (belt-and-suspenders).
+PARENT_PIDS=()
+for et_pid in "${ET_PIDS[@]+"${ET_PIDS[@]}"}"; do
+  ppid=$(ps -p "$et_pid" -o ppid= 2>/dev/null | tr -d ' ')
+  if [[ -n "$ppid" && "$ppid" != "1" ]]; then
+    PARENT_PIDS+=("$ppid")
+  fi
+done
+kill_pids "exiftool parent" "${PARENT_PIDS[@]+"${PARENT_PIDS[@]}"}"
+kill_pids "exiftool" "${ET_PIDS[@]+"${ET_PIDS[@]}"}"
 
 # ── Summary ───────────────────────────────────────────────────────────────
 echo ""

@@ -9,6 +9,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api/client'
 import type { Cluster, Person, MergeSuggestion, FaceRow, SimilarCluster, MergePersonsResult, FindSimilarSuggestion, FindSimilarAllResult, IgnoredPerson } from '../api/client'
+import ConnectionsGraph from '../components/ConnectionsGraph'
 
 interface Props {
   /** Called when user clicks a named person tile to view their photos. */
@@ -40,6 +41,15 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   const [reviewPerson, setReviewPerson] = useState<Person | null>(null)
   const [reviewFaces, setReviewFaces] = useState<FaceRow[]>([])
   const [reviewLoading, setReviewLoading] = useState(false)
+  const [reviewPortraitFaceId, setReviewPortraitFaceId] = useState<number | null>(null)
+  const [settingPortrait, setSettingPortrait] = useState<number | null>(null)
+  const [confirmUnname, setConfirmUnname] = useState(false)
+  const [unnaming, setUnnaming] = useState(false)
+
+  // ── Unnamed cluster face review ──────────────────────────────────────────
+  const [reviewCluster, setReviewCluster] = useState<Cluster | null>(null)
+  const [reviewClusterFaces, setReviewClusterFaces] = useState<FaceRow[]>([])
+  const [reviewClusterLoading, setReviewClusterLoading] = useState(false)
 
   // ── Multi-select for named persons ─────────────────────────────────────
   const [namedSelectMode, setNamedSelectMode] = useState(false)
@@ -47,6 +57,9 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   const [namedBulkWorking, setNamedBulkWorking] = useState(false)
   const [namedMergeOpen, setNamedMergeOpen] = useState(false)
   const [namedMergeNameInput, setNamedMergeNameInput] = useState('')
+
+  // ── Named faces search ────────────────────────────────────────────────────
+  const [nameSearch, setNameSearch] = useState('')
   const [namedMergeResult, setNamedMergeResult] = useState<MergePersonsResult | null>(null)
 
   function toggleNamedSelect(id: number) {
@@ -105,10 +118,20 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     setFindSimilarResult(null)
     try {
       const result: FindSimilarAllResult = await api.persons.findSimilarAll(findSimilarThreshold)
-      if (result.auto_merged.length > 0) await load()
-      const queue: FindSimilarSuggestion[] = result.suggestions
-      setBulkSuggestionQueue(queue)
-      setFindSimilarResult({ autoMerged: result.auto_merged.length, suggestionsFound: result.suggestions.length })
+
+      // Split suggestions: high-confidence → auto-merge; rest → ask user
+      const highConf  = result.suggestions.filter(s => s.is_high_conf === 1)
+      const needsReview = result.suggestions.filter(s => s.is_high_conf !== 1)
+
+      for (const s of highConf) {
+        await api.persons.addCluster(s.person_id, s.cluster_id)
+      }
+
+      const totalAutoMerged = result.auto_merged.length + highConf.length
+      if (totalAutoMerged > 0) await load()
+
+      setBulkSuggestionQueue(needsReview)
+      setFindSimilarResult({ autoMerged: totalAutoMerged, suggestionsFound: needsReview.length })
     } finally {
       setFindSimilarWorking(false)
     }
@@ -137,8 +160,21 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
 
   async function fetchNextSuggestion(personId: number) {
     try {
-      const list = await api.persons.mergeSuggestions(personId)
-      setSuggestion(list.length > 0 ? list[0] : null)
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const list = await api.persons.mergeSuggestions(personId)
+        if (list.length === 0) { setSuggestion(null); break }
+        const s = list[0]
+        if (s.is_high_conf === 1) {
+          // auto-merge silently — don't ask the user
+          await api.persons.addCluster(personId, s.cluster_id)
+          await load()
+          // loop: fetch next suggestion (the merged cluster is now excluded)
+        } else {
+          setSuggestion(s)
+          break
+        }
+      }
     } catch {
       setSuggestion(null)
     }
@@ -179,6 +215,10 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   const [dismissWorking, setDismissWorking] = useState(false)
   const [similarClusters, setSimilarClusters] = useState<SimilarCluster[]>([])
   const [similarLoading, setSimilarLoading] = useState(false)
+
+  // ── Connections graph modal ──────────────────────────────────────────────
+  const [connectionsPersonId, setConnectionsPersonId] = useState<number | null>(null)
+  const [connectionsPersonName, setConnectionsPersonName] = useState<string>('')
 
   // ── Multi-select for unnamed clusters ────────────────────────────────────
   const [selectMode, setSelectMode] = useState(false)
@@ -358,12 +398,29 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   async function openReview(person: Person) {
     setReviewPerson(person)
     setReviewFaces([])
+    setReviewPortraitFaceId(null)
+    setConfirmUnname(false)
     setReviewLoading(true)
     try {
       const faces = await api.faces.byPerson(person.id)
       setReviewFaces(faces)
+      // Determine current portrait face id from representative thumbnail path
+      // No dedicated field returned yet — we'll track it locally via setPortrait calls
     } finally {
       setReviewLoading(false)
+    }
+  }
+
+  async function setPortraitFace(faceId: number) {
+    if (!reviewPerson) return
+    setSettingPortrait(faceId)
+    try {
+      await api.persons.setPortrait(reviewPerson.id, faceId)
+      setReviewPortraitFaceId(faceId)
+      // Reload from server so persons grid + suggestion modal use the confirmed thumbnail
+      await load()
+    } finally {
+      setSettingPortrait(null)
     }
   }
 
@@ -371,6 +428,37 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     await api.faces.removeFromPerson(faceId)
     setReviewFaces(f => f.filter(x => x.id !== faceId))
     load() // refresh counts
+  }
+
+  async function handleUnnamePerson() {
+    if (!reviewPerson) return
+    setUnnaming(true)
+    try {
+      await api.persons.delete(reviewPerson.id)
+      setReviewPerson(null)
+      setConfirmUnname(false)
+      await load()
+    } finally {
+      setUnnaming(false)
+    }
+  }
+
+  async function openClusterReview(cluster: Cluster) {
+    setReviewCluster(cluster)
+    setReviewClusterFaces([])
+    setReviewClusterLoading(true)
+    try {
+      const faces = await api.faces.byCluster(cluster.id)
+      setReviewClusterFaces(faces)
+    } finally {
+      setReviewClusterLoading(false)
+    }
+  }
+
+  async function ejectFromCluster(faceId: number) {
+    await api.faces.removeFromCluster(faceId)
+    setReviewClusterFaces(f => f.filter(x => x.id !== faceId))
+    load() // refresh cluster counts
   }
 
   async function handleName(clusterId: number) {
@@ -651,27 +739,29 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
         </div>
       )}
 
-      {/* Face review panel */}
-      {reviewPerson && (
+      {/* Unnamed cluster face review panel */}
+      {reviewCluster && (
         <div className="fixed inset-0 bg-black/70 flex items-start justify-center z-50 overflow-y-auto py-10">
           <div className="bg-gray-900 rounded-xl p-6 w-full max-w-2xl shadow-xl mx-4">
             <div className="flex items-center justify-between mb-4">
               <div>
-                <h2 className="text-white font-semibold text-lg">{reviewPerson.name}</h2>
+                <h2 className="text-white font-semibold text-lg">
+                  Cluster · {reviewCluster.member_count} face{reviewCluster.member_count !== 1 ? 's' : ''}
+                </h2>
                 <p className="text-gray-400 text-xs mt-0.5">
-                  Click ✕ on any face to remove it (false positive correction)
+                  Click ✕ on a face to remove it from this cluster
                 </p>
               </div>
-              <button onClick={() => setReviewPerson(null)}
+              <button onClick={() => setReviewCluster(null)}
                 className="text-gray-400 hover:text-white text-xl leading-none px-2">✕</button>
             </div>
-            {reviewLoading
+            {reviewClusterLoading
               ? <p className="text-gray-400 text-sm">Loading…</p>
-              : reviewFaces.length === 0
-                ? <p className="text-gray-500 text-sm">No faces assigned.</p>
+              : reviewClusterFaces.length === 0
+                ? <p className="text-gray-500 text-sm">No faces in this cluster.</p>
                 : (
                   <div className="grid grid-cols-4 sm:grid-cols-6 gap-3">
-                    {reviewFaces.map(f => {
+                    {reviewClusterFaces.map(f => {
                       const url = f.thumbnail_path
                         ? '/thumbnails/' + f.thumbnail_path.split('/thumbnails/').pop()
                         : null
@@ -683,11 +773,112 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
                               : <span className="flex items-center justify-center h-full text-gray-600 text-xl">?</span>}
                           </div>
                           <button
+                            onClick={() => ejectFromCluster(f.id)}
+                            title="Remove — not in this cluster"
+                            className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-red-600 hover:bg-red-500 text-white rounded-full text-xs leading-none flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                            ✕
+                          </button>
+                          <p className="text-gray-500 text-[10px] mt-0.5 text-center truncate">
+                            {(f.detection_conf * 100).toFixed(0)}%
+                          </p>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )
+            }
+          </div>
+        </div>
+      )}
+
+      {/* Face review panel */}
+      {reviewPerson && (
+        <div className="fixed inset-0 bg-black/70 flex items-start justify-center z-50 overflow-y-auto py-10">
+          <div className="bg-gray-900 rounded-xl p-6 w-full max-w-2xl shadow-xl mx-4">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h2 className="text-white font-semibold text-lg">{reviewPerson.name}</h2>
+                <p className="text-gray-400 text-xs mt-0.5">
+                  Click ✕ to remove a face &nbsp;·&nbsp; Click ★ to set as primary thumbnail
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                {confirmUnname ? (
+                  <>
+                    <span className="text-xs text-red-400">Remove name &amp; release all faces?</span>
+                    <button
+                      onClick={handleUnnamePerson}
+                      disabled={unnaming}
+                      className="text-xs px-2.5 py-1 rounded-lg bg-red-700 hover:bg-red-600 disabled:opacity-40 text-white transition-colors"
+                    >
+                      {unnaming ? 'Removing…' : 'Yes, un-name'}
+                    </button>
+                    <button
+                      onClick={() => setConfirmUnname(false)}
+                      disabled={unnaming}
+                      className="text-xs px-2 py-1 rounded-lg bg-gray-700 hover:bg-gray-600 text-gray-300 transition-colors"
+                    >
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    onClick={() => setConfirmUnname(true)}
+                    title="Remove name and release faces back to unnamed pool"
+                    className="text-xs px-2.5 py-1 rounded-lg border border-red-800 bg-red-900/20 text-red-400 hover:bg-red-900/40 hover:text-red-300 transition-colors"
+                  >
+                    Un-name
+                  </button>
+                )}
+                <button onClick={() => { setReviewPerson(null); setConfirmUnname(false) }}
+                  className="text-gray-400 hover:text-white text-xl leading-none px-2">✕</button>
+              </div>
+            </div>
+            {reviewLoading
+              ? <p className="text-gray-400 text-sm">Loading…</p>
+              : reviewFaces.length === 0
+                ? <p className="text-gray-500 text-sm">No faces assigned.</p>
+                : (
+                  <div className="grid grid-cols-4 sm:grid-cols-6 gap-3">
+                    {reviewFaces.map(f => {
+                      const url = f.thumbnail_path
+                        ? '/thumbnails/' + f.thumbnail_path.split('/thumbnails/').pop()
+                        : null
+                      const isPortrait = reviewPortraitFaceId === f.id
+                      const isSetting = settingPortrait === f.id
+                      return (
+                        <div key={f.id} className="relative group">
+                          <div className={`w-16 h-16 rounded-lg overflow-hidden bg-gray-800 ${
+                            isPortrait ? 'ring-2 ring-yellow-400' : ''
+                          }`}>
+                            {url
+                              ? <img src={url} alt="face" className="w-full h-full object-cover" />
+                              : <span className="flex items-center justify-center h-full text-gray-600 text-xl">?</span>}
+                          </div>
+                          {/* Remove button */}
+                          <button
                             onClick={() => ejectFace(f.id)}
                             title="Remove — not this person"
                             className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-red-600 hover:bg-red-500 text-white rounded-full text-xs leading-none flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
                             ✕
                           </button>
+                          {/* Portrait / primary button */}
+                          {!isPortrait && (
+                            <button
+                              onClick={() => setPortraitFace(f.id)}
+                              disabled={!!settingPortrait}
+                              title="Set as primary thumbnail"
+                              className="absolute -top-1.5 -left-1.5 w-5 h-5 bg-gray-700 hover:bg-yellow-500 disabled:opacity-40 text-yellow-300 hover:text-white rounded-full text-xs leading-none flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                              {isSetting ? '…' : '★'}
+                            </button>
+                          )}
+                          {isPortrait && (
+                            <span
+                              title="Current primary thumbnail"
+                              className="absolute -top-1.5 -left-1.5 w-5 h-5 bg-yellow-500 text-white rounded-full text-xs leading-none flex items-center justify-center">
+                              ★
+                            </span>
+                          )}
                           <p className="text-gray-500 text-[10px] mt-0.5 text-center truncate">
                             {(f.detection_conf * 100).toFixed(0)}%
                           </p>
@@ -881,7 +1072,8 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
                 onNameInput={setNameInput}
                 onConfirm={() => handleName(c.id)}
                 onCancel={() => setNamingId(null)}
-                onDismiss={() => openDismiss(c)} />
+                onDismiss={() => openDismiss(c)}
+                onReview={() => openClusterReview(c)} />
             ))}
           </div>
 
@@ -988,7 +1180,9 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
         <section>
         <div className="flex items-center justify-between mb-3">
             <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
-              Named ({persons.length})
+              Named ({nameSearch.trim()
+                ? `${persons.filter(p => (p.name ?? '').toLowerCase().includes(nameSearch.toLowerCase())).length} of ${persons.length}`
+                : persons.length})
             </h2>
             <div className="flex items-center gap-2">
               {namedSelectMode && namedSelected.size > 0 && (
@@ -1028,15 +1222,35 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
                   : <span>0 auto-merged</span>}
                 {', '}
                 {findSimilarResult.suggestionsFound > 0
-                  ? <span className="text-yellow-400 font-medium">{findSimilarResult.suggestionsFound} suggestion{findSimilarResult.suggestionsFound !== 1 ? 's' : ''} reviewed</span>
-                  : <span>no suggestions found</span>}
+                  ? <span className="text-yellow-400 font-medium">{findSimilarResult.suggestionsFound} reviewed manually</span>
+                  : <span>no manual review needed</span>}
               </p>
               <button onClick={() => setFindSimilarResult(null)} className="text-indigo-600 hover:text-indigo-400 text-sm ml-4">✕</button>
             </div>
           )}
 
+          {/* Search box */}
+          <div className="relative mb-4 max-w-xs">
+            <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 text-sm pointer-events-none">🔍</span>
+            <input
+              type="text"
+              value={nameSearch}
+              onChange={e => setNameSearch(e.target.value)}
+              placeholder="Search by name…"
+              className="w-full bg-gray-900 border border-gray-700 rounded-lg pl-8 pr-8 py-1.5 text-sm text-white placeholder-gray-600 outline-none focus:border-indigo-500 transition-colors"
+            />
+            {nameSearch && (
+              <button
+                onClick={() => setNameSearch('')}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300 text-xs leading-none"
+              >✕</button>
+            )}
+          </div>
+
           <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-4">
-            {[...persons].sort((a, b) => (a.name ?? '').localeCompare(b.name ?? '')).map(p => {
+            {[...persons].sort((a, b) => (a.name ?? '').localeCompare(b.name ?? ''))
+              .filter(p => !nameSearch.trim() || (p.name ?? '').toLowerCase().includes(nameSearch.toLowerCase()))
+              .map(p => {
               const thumb = p.representative_thumbnail
               const thumbUrl = thumb ? '/thumbnails/' + thumb.split('/thumbnails/').pop() : null
               const isRenaming = renamingPersonId === p.id
@@ -1145,6 +1359,16 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
                       ≈ similar
                     </button>
                   )}
+                  {/* ── Connections graph ──────────────────────────────── */}
+                  {!namedSelectMode && (
+                    <button
+                      onClick={() => { setConnectionsPersonId(p.id); setConnectionsPersonName(p.name ?? '') }}
+                      title="Show social connection graph"
+                      className="text-xs text-gray-600 hover:text-purple-400 transition-colors"
+                    >
+                      Connections
+                    </button>
+                  )}
                 </div>
               )
             })}
@@ -1181,6 +1405,19 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
             </div>
           )}
         </section>
+      )}
+
+      {/* ── Connections graph modal ────────────────────────────────────────── */}
+      {connectionsPersonId !== null && (
+        <ConnectionsGraph
+          personId={connectionsPersonId}
+          personName={connectionsPersonName}
+          onClose={() => setConnectionsPersonId(null)}
+          onNavigatePerson={(pid, name) => {
+            setConnectionsPersonId(null)
+            onSelectPerson?.(pid, name)
+          }}
+        />
       )}
 
       {/* ── Find Similar threshold dialog ──────────────────────────────────── */}
@@ -1233,8 +1470,10 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
       {/* ── Bulk suggestion review modal ───────────────────────────────────── */}
       {bulkSuggestionQueue.length > 0 && (() => {
         const current = bulkSuggestionQueue[0]
-        const personThumbUrl = current.person_thumbnail
-          ? '/thumbnails/' + current.person_thumbnail.split('/thumbnails/').pop()
+        const livePerson = persons.find(x => x.id === current.person_id)
+        const personThumbRaw = livePerson?.representative_thumbnail ?? current.person_thumbnail
+        const personThumbUrl = personThumbRaw
+          ? '/thumbnails/' + personThumbRaw.split('/thumbnails/').pop()
           : null
         const clusterThumbUrl = current.representative_thumbnail
           ? '/thumbnails/' + current.representative_thumbnail.split('/thumbnails/').pop()
@@ -1365,13 +1604,14 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   )
 }
 
-function ClusterTile({ cluster, isNaming, nameInput, saving, personNames, selectMode, isSelected, onToggleSelect, onViewPhotos, onStartNaming, onNameInput, onConfirm, onCancel, onDismiss }: {
+function ClusterTile({ cluster, isNaming, nameInput, saving, personNames, selectMode, isSelected, onToggleSelect, onViewPhotos, onStartNaming, onNameInput, onConfirm, onCancel, onDismiss, onReview }: {
   cluster: Cluster; isNaming: boolean; nameInput: string; saving: boolean
   personNames: string[]
   selectMode: boolean; isSelected: boolean; onToggleSelect: (shiftHeld: boolean) => void
   onViewPhotos: () => void
   onStartNaming: () => void; onNameInput: (v: string) => void; onConfirm: () => void; onCancel: () => void
   onDismiss: () => void
+  onReview: () => void
 }) {
   const [showSuggestions, setShowSuggestions] = useState(false)
   const thumb = cluster.representative_thumbnail
@@ -1421,12 +1661,22 @@ function ClusterTile({ cluster, isNaming, nameInput, saving, personNames, select
             ✎
           </button>
         )}
-        {/* Dismiss button — shown on hover, hidden in select mode */}
+        {/* Review button — shown on hover, hidden in select mode */}
+        {!selectMode && !isNaming && (
+          <button
+            onClick={e => { e.stopPropagation(); onReview() }}
+            title="Review faces in this cluster"
+            className="absolute -top-1 -right-1 bg-gray-700 hover:bg-gray-600 border border-gray-600 rounded-full w-5 h-5 text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity text-gray-300 hover:text-white leading-none"
+          >
+            ⋯
+          </button>
+        )}
+        {/* Dismiss button — shown on hover, hidden in select mode and review button position */}
         {!selectMode && (
           <button
             onClick={e => { e.stopPropagation(); onDismiss() }}
             title="Remove this face"
-            className="absolute -top-1 -right-1 w-5 h-5 bg-gray-700 hover:bg-red-700 border border-gray-600 rounded-full text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity text-gray-300 hover:text-white leading-none"
+            className="absolute -bottom-1 -right-1 w-5 h-5 bg-gray-700 hover:bg-red-700 border border-gray-600 rounded-full text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity text-gray-300 hover:text-white leading-none"
           >
             ✕
           </button>

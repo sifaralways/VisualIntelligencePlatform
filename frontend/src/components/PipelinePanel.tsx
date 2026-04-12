@@ -15,9 +15,11 @@ interface Props {
   onToggle: () => void
   /** Called whenever a pipeline completes so App can refresh folder list */
   onPipelineComplete?: () => void
+  /** Controlled width of the expanded panel in px (default 288 = w-72) */
+  width?: number
 }
 
-export default function PipelinePanel({ collapsed, onToggle, onPipelineComplete }: Props) {
+export default function PipelinePanel({ collapsed, onToggle, onPipelineComplete, width }: Props) {
   const [folder, setFolder]       = useState('')
   const [status, setStatus]       = useState<string>('idle')
   const [events, setEvents]       = useState<WsEvent[]>([])
@@ -127,7 +129,10 @@ export default function PipelinePanel({ collapsed, onToggle, onPipelineComplete 
 
   // ── Expanded panel ────────────────────────────────────────────────────────
   return (
-    <div className="w-72 shrink-0 border-r border-gray-800 bg-gray-950 flex flex-col overflow-hidden">
+    <div
+      style={{ width: width ?? 288 }}
+      className="shrink-0 border-r border-gray-800 bg-gray-950 flex flex-col overflow-hidden"
+    >
       {/* Header row */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-gray-800 shrink-0">
         <div className="flex items-center gap-2">

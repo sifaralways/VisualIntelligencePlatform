@@ -6,17 +6,18 @@ import TagsPage from './pages/TagsPage'
 import WritebackPage from './pages/WritebackPage'
 import AdminPage from './pages/AdminPage'
 import QualityPage from './pages/QualityPage'
+import ExplicitPage from './pages/ExplicitPage'
 import PhotoGrid from './components/PhotoGrid'
 import PipelinePanel from './components/PipelinePanel'
 import { api } from './api/client'
-import type { MediaFilter, WsEvent, MergeSuggestionItem, FolderItem, RemoveResult } from './api/client'
+import type { MediaFilter, WsEvent, MergeSuggestionItem, FolderItem, SubfolderItem, RemoveResult } from './api/client'
 import './index.css'
 
 // ---------------------------------------------------------------------------
 // View state machine
 // ---------------------------------------------------------------------------
 
-type SidebarSection = 'library' | 'people' | 'animals' | 'places' | 'things' | 'tags' | 'writeback' | 'quality'
+type SidebarSection = 'library' | 'people' | 'animals' | 'places' | 'things' | 'tags' | 'writeback' | 'quality' | 'explicit'
 
 interface FilteredView {
   title: string
@@ -24,6 +25,8 @@ interface FilteredView {
   backTo: SidebarSection
   /** Track which folder (if any) this view is showing — for sidebar active state */
   folderId?: number
+  /** Path prefix when viewing a subfolder — for sidebar active state */
+  pathPrefix?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -45,6 +48,65 @@ export default function App() {
     })
   }
 
+  // Panel widths — persisted so they survive page reload
+  const [sidebarWidth, setSidebarWidth] = useState(() =>
+    parseInt(localStorage.getItem('vip_sidebar_width') ?? '192', 10)
+  )
+  const [pipelineWidth, setPipelineWidth] = useState(() =>
+    parseInt(localStorage.getItem('vip_pipeline_width') ?? '288', 10)
+  )
+  const panelDragRef = useRef<{
+    which: 'sidebar' | 'pipeline'
+    startX: number
+    startW: number
+  } | null>(null)
+
+  function onPanelDragStart(which: 'sidebar' | 'pipeline', e: React.MouseEvent) {
+    e.preventDefault()
+    panelDragRef.current = {
+      which,
+      startX: e.clientX,
+      startW: which === 'sidebar' ? sidebarWidth : pipelineWidth,
+    }
+  }
+
+  useEffect(() => {
+    const SIDEBAR_MIN = 140, SIDEBAR_MAX = 480
+    const PIPELINE_MIN = 220, PIPELINE_MAX = 600
+
+    function onMouseMove(e: MouseEvent) {
+      const drag = panelDragRef.current
+      if (!drag) return
+      document.body.style.userSelect = 'none'
+      document.body.style.cursor = 'col-resize'
+      const delta = e.clientX - drag.startX
+      if (drag.which === 'sidebar') {
+        const w = Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, drag.startW + delta))
+        setSidebarWidth(w)
+        localStorage.setItem('vip_sidebar_width', String(w))
+      } else {
+        const w = Math.max(PIPELINE_MIN, Math.min(PIPELINE_MAX, drag.startW + delta))
+        setPipelineWidth(w)
+        localStorage.setItem('vip_pipeline_width', String(w))
+      }
+    }
+
+    function onMouseUp() {
+      if (panelDragRef.current) {
+        panelDragRef.current = null
+        document.body.style.userSelect = ''
+        document.body.style.cursor = ''
+      }
+    }
+
+    window.addEventListener('mousemove', onMouseMove)
+    window.addEventListener('mouseup', onMouseUp)
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove)
+      window.removeEventListener('mouseup', onMouseUp)
+    }
+  }, [])
+
   // Admin floating popup
   const [adminOpen, setAdminOpen] = useState(false)
 
@@ -55,14 +117,34 @@ export default function App() {
     folder: FolderItem
     result: RemoveResult
   } | null>(null)
+  // Subfolders keyed by scanned folder id — loaded lazily on expand
+  const [subfolderMap, setSubfolderMap] = useState<Record<number, SubfolderItem[]>>({})
 
   const loadFolders = useCallback(async () => {
     try {
       setFolderLoadError(false)
-      setFolders(await api.folders.list())
+      const list = await api.folders.list()
+      setFolders(list)
+      // Refresh subfolder data for any folder we already have open
+      setSubfolderMap(prev => {
+        const next = { ...prev }
+        // Remove entries for folders no longer in list
+        const ids = new Set(list.map(f => f.id))
+        for (const k of Object.keys(next)) {
+          if (!ids.has(Number(k))) delete next[Number(k)]
+        }
+        return next
+      })
     } catch {
       setFolderLoadError(true)
     }
+  }, [])
+
+  const loadSubfolders = useCallback(async (folderId: number) => {
+    try {
+      const subs = await api.folders.subfolders(folderId)
+      setSubfolderMap(prev => ({ ...prev, [folderId]: subs }))
+    } catch { /* ignore */ }
   }, [])
 
   // ── Global pipeline notifications ─────────────────────────────────────────
@@ -121,8 +203,8 @@ export default function App() {
   }, [mergeSuggestions])
 
   /** Navigate to a filtered photo grid (e.g. photos of Alice, photos of dogs) */
-  function openFiltered(filter: MediaFilter, title: string, backTo: SidebarSection, folderId?: number) {
-    setFiltered({ filter, title, backTo, folderId })
+  function openFiltered(filter: MediaFilter, title: string, backTo: SidebarSection, folderId?: number, pathPrefix?: string) {
+    setFiltered({ filter, title, backTo, folderId, pathPrefix })
   }
 
   /** Go back from filtered view to the discover/people section */
@@ -216,6 +298,19 @@ export default function App() {
           />
         )
         break
+      case 'explicit':
+        mainContent = (
+          <ExplicitPage
+            onSelectLabel={(label) =>
+              openFiltered(
+                { tag_category: 'explicit', tag_label: label },
+                `🔞 ${label.replace(/_/g, ' ')}`,
+                'explicit',
+              )
+            }
+          />
+        )
+        break
       case 'tags':
         mainContent = <TagsPage />
         break
@@ -247,7 +342,10 @@ export default function App() {
 
       <div className="flex flex-1 overflow-hidden">
         {/* ── Nav sidebar ── */}
-        <aside className="w-48 shrink-0 border-r border-gray-800 py-3 flex flex-col gap-1 overflow-y-auto bg-gray-950">
+        <aside
+          style={{ width: sidebarWidth }}
+          className="shrink-0 border-r border-gray-800 py-3 flex flex-col gap-1 overflow-y-auto bg-gray-950"
+        >
           <NavGroup label="Library">
             <NavItem id="library" icon="📚" label="All Photos" active={section === 'library' && !filtered} onClick={() => navigate('library')} />
             {folderLoadError && (
@@ -257,13 +355,19 @@ export default function App() {
               <p className="text-[10px] text-gray-600 px-3 py-1 italic">No folders scanned yet</p>
             )}
             {folders.map(f => {
-              const name = f.folder_path.split('/').pop() || f.folder_path
+              const rootName = f.folder_path.split('/').pop() || f.folder_path
               return (
-                <FolderNavItem
+                <FolderTreeRoot
                   key={f.id}
                   folder={f}
-                  active={filtered?.folderId === f.id}
-                  onClick={() => openFiltered({ folder_id: f.id }, `📁 ${name}`, 'library', f.id)}
+                  subfolders={subfolderMap[f.id] ?? null}
+                  activePathPrefix={filtered?.pathPrefix ?? null}
+                  activeFolderId={filtered?.folderId ?? null}
+                  onRootClick={() => openFiltered({ folder_id: f.id }, `📁 ${rootName}`, 'library', f.id, undefined)}
+                  onSubfolderClick={(path, name) =>
+                    openFiltered({ path_prefix: path }, `📁 ${name}`, 'library', f.id, path)
+                  }
+                  onExpand={() => loadSubfolders(f.id)}
                   onRemove={() => handleFolderRemove(f)}
                 />
               )
@@ -275,6 +379,7 @@ export default function App() {
             <NavItem id="animals"   icon="🐾" label="Animals"      active={(section === 'animals'  || filtered?.backTo === 'animals') } onClick={() => navigate('animals')} />
             <NavItem id="places"    icon="📍" label="Places"       active={(section === 'places'   || filtered?.backTo === 'places')  } onClick={() => navigate('places')} />
             <NavItem id="things"    icon="📦" label="Things"       active={(section === 'things'   || filtered?.backTo === 'things')  } onClick={() => navigate('things')} />
+            <NavItem id="explicit"  icon="🔞" label="Explicit"     active={(section === 'explicit' || filtered?.backTo === 'explicit')} onClick={() => navigate('explicit')} />
             <NavItem id="tags"      icon="🏷️" label="All Tags"     active={section === 'tags'      && !filtered} onClick={() => navigate('tags')} />
           </NavGroup>
 
@@ -284,12 +389,29 @@ export default function App() {
           </NavGroup>
         </aside>
 
+        {/* Sidebar resize handle */}
+        <div
+          className="w-1 shrink-0 -ml-px cursor-col-resize hover:bg-indigo-500/50 active:bg-indigo-500/70 transition-colors z-10"
+          onMouseDown={e => onPanelDragStart('sidebar', e)}
+          title="Drag to resize sidebar"
+        />
+
         {/* ── Pipeline panel (always mounted, collapsible) ── */}
         <PipelinePanel
           collapsed={pipelineCollapsed}
           onToggle={togglePipeline}
           onPipelineComplete={loadFolders}
+          width={pipelineWidth}
         />
+
+        {/* Pipeline resize handle (hidden when panel is collapsed) */}
+        {!pipelineCollapsed && (
+          <div
+            className="w-1 shrink-0 -ml-px cursor-col-resize hover:bg-indigo-500/50 active:bg-indigo-500/70 transition-colors z-10"
+            onMouseDown={e => onPanelDragStart('pipeline', e)}
+            title="Drag to resize pipeline panel"
+          />
+        )}
 
         {/* ── Main content ── */}
         <main className="flex-1 overflow-y-auto p-6">
@@ -442,40 +564,196 @@ export default function App() {
 // Sidebar sub-components
 // ---------------------------------------------------------------------------
 
-function FolderNavItem({
-  folder,
-  active,
-  onClick,
-  onRemove,
+// ── Folder tree ──────────────────────────────────────────────────────────────
+
+/** One node in the flat subfolder list from the API */
+interface TreeNode {
+  path: string
+  name: string
+  photo_count: number
+  children: TreeNode[]
+}
+
+/** Build a nested tree from the flat list returned by the backend. */
+function buildTree(root: string, items: SubfolderItem[]): TreeNode[] {
+  // items are sorted by path so parents always precede children
+  const nodeMap = new Map<string, TreeNode>()
+  const roots: TreeNode[] = []
+
+  for (const item of items) {
+    const node: TreeNode = { path: item.path, name: item.name, photo_count: item.photo_count, children: [] }
+    nodeMap.set(item.path, node)
+    const parentPath = item.path.substring(0, item.path.lastIndexOf('/'))
+    const parent = parentPath === root ? null : nodeMap.get(parentPath)
+    if (parent) {
+      parent.children.push(node)
+    } else {
+      roots.push(node)
+    }
+  }
+  return roots
+}
+
+/** Recursive node in the tree */
+function FolderTreeNode({
+  node,
+  depth,
+  activePathPrefix,
+  onSubfolderClick,
 }: {
-  folder: FolderItem
-  active: boolean
-  onClick: () => void
-  onRemove: () => void
+  node: TreeNode
+  depth: number
+  activePathPrefix: string | null
+  onSubfolderClick: (path: string, name: string) => void
 }) {
-  const name = folder.folder_path.split('/').pop() || folder.folder_path
+  const [expanded, setExpanded] = useState(false)
+  const hasChildren = node.children.length > 0
+  const isActive = activePathPrefix === node.path
+  const indentPx = 12 + depth * 12
+
   return (
-    <div
-      className={`group w-full flex items-center gap-1 pl-3 pr-1 py-1.5 rounded-lg text-sm transition-colors
-        ${active ? 'bg-indigo-600/80 text-white' : 'text-gray-400 hover:text-white hover:bg-gray-800'}`}
-    >
-      <button onClick={onClick} className="flex-1 flex items-center gap-2 text-left truncate min-w-0">
-        <span className="text-base leading-none shrink-0">📁</span>
-        <span className="truncate">{name}</span>
-        {folder.active_count > 0 && (
-          <span className="text-[10px] text-gray-500 ml-auto pl-1 shrink-0">{folder.active_count}</span>
-        )}
-      </button>
-      <button
-        onClick={e => { e.stopPropagation(); onRemove() }}
-        title="Remove folder from app"
-        className="shrink-0 w-6 h-6 flex items-center justify-center rounded text-gray-500 hover:text-white hover:bg-red-600 transition-colors ml-1"
+    <div>
+      <div
+        style={{ paddingLeft: indentPx }}
+        className={`group flex items-center pr-1 py-1 rounded-lg text-xs transition-colors cursor-pointer
+          ${isActive ? 'bg-indigo-600/80 text-white' : 'text-gray-400 hover:text-white hover:bg-gray-800'}`}
       >
-        ✕
-      </button>
+        {/* chevron / spacer */}
+        <button
+          onClick={e => { e.stopPropagation(); setExpanded(v => !v) }}
+          className="w-4 h-4 shrink-0 flex items-center justify-center text-gray-500 hover:text-white mr-1"
+          aria-label={expanded ? 'Collapse' : 'Expand'}
+        >
+          {hasChildren ? (expanded ? '▾' : '▸') : ''}
+        </button>
+
+        {/* name + count */}
+        <button
+          onClick={() => onSubfolderClick(node.path, node.name)}
+          className="flex-1 flex items-center gap-1.5 min-w-0 text-left"
+        >
+          <span className="shrink-0">📁</span>
+          <span className="truncate">{node.name}</span>
+          {node.photo_count > 0 && (
+            <span className={`ml-auto pl-1 shrink-0 text-[10px] ${isActive ? 'text-indigo-200' : 'text-gray-600'}`}>
+              {node.photo_count}
+            </span>
+          )}
+        </button>
+      </div>
+
+      {expanded && hasChildren && (
+        <div>
+          {node.children.map(child => (
+            <FolderTreeNode
+              key={child.path}
+              node={child}
+              depth={depth + 1}
+              activePathPrefix={activePathPrefix}
+              onSubfolderClick={onSubfolderClick}
+            />
+          ))}
+        </div>
+      )}
     </div>
   )
 }
+
+/** Top-level scanned folder row — always visible, expands to reveal tree */
+function FolderTreeRoot({
+  folder,
+  subfolders,
+  activePathPrefix,
+  activeFolderId,
+  onRootClick,
+  onSubfolderClick,
+  onExpand,
+  onRemove,
+}: {
+  folder: FolderItem
+  subfolders: SubfolderItem[] | null   // null = not loaded yet
+  activePathPrefix: string | null
+  activeFolderId: number | null
+  onRootClick: () => void
+  onSubfolderClick: (path: string, name: string) => void
+  onExpand: () => void
+  onRemove: () => void
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const name = folder.folder_path.split('/').pop() || folder.folder_path
+  const isRootActive = activeFolderId === folder.id && !activePathPrefix
+
+  function toggle() {
+    const next = !expanded
+    setExpanded(next)
+    if (next && subfolders === null) {
+      onExpand()
+    }
+  }
+
+  const tree = subfolders ? buildTree(folder.folder_path, subfolders) : []
+  const hasChildren = subfolders === null || subfolders.length > 0
+
+  return (
+    <div>
+      <div
+        className={`group flex items-center pl-1 pr-1 py-1.5 rounded-lg text-sm transition-colors
+          ${isRootActive ? 'bg-indigo-600/80 text-white' : 'text-gray-400 hover:text-white hover:bg-gray-800'}`}
+      >
+        {/* expand/collapse chevron */}
+        <button
+          onClick={e => { e.stopPropagation(); toggle() }}
+          className="w-5 h-5 shrink-0 flex items-center justify-center text-gray-500 hover:text-white"
+          aria-label={expanded ? 'Collapse' : 'Expand'}
+        >
+          {hasChildren ? (expanded ? '▾' : '▸') : <span className="w-4" />}
+        </button>
+
+        {/* folder label */}
+        <button onClick={onRootClick} className="flex-1 flex items-center gap-1.5 min-w-0 text-left px-1">
+          <span className="text-base leading-none shrink-0">📁</span>
+          <span className="truncate">{name}</span>
+          {folder.active_count > 0 && (
+            <span className={`ml-auto pl-1 shrink-0 text-[10px] ${isRootActive ? 'text-indigo-200' : 'text-gray-600'}`}>
+              {folder.active_count}
+            </span>
+          )}
+        </button>
+
+        {/* remove button */}
+        <button
+          onClick={e => { e.stopPropagation(); onRemove() }}
+          title="Remove folder from app"
+          className="shrink-0 w-6 h-6 flex items-center justify-center rounded text-gray-500 hover:text-white hover:bg-red-600 transition-colors"
+        >
+          ✕
+        </button>
+      </div>
+
+      {/* Subtree */}
+      {expanded && (
+        <div className="ml-2">
+          {subfolders === null ? (
+            <p className="text-[10px] text-gray-600 px-4 py-1">Loading…</p>
+          ) : tree.length === 0 ? (
+            <p className="text-[10px] text-gray-600 px-4 py-1 italic">No subfolders</p>
+          ) : (
+            tree.map(node => (
+              <FolderTreeNode
+                key={node.path}
+                node={node}
+                depth={0}
+                activePathPrefix={activePathPrefix}
+                onSubfolderClick={onSubfolderClick}
+              />
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 
 
 function NavGroup({ label, children }: { label: string; children: React.ReactNode }) {

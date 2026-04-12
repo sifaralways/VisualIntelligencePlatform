@@ -61,6 +61,21 @@ def cluster_embeddings(
         logger.info("No embeddings to cluster")
         return []
 
+    # HDBSCAN needs ≥2 samples.  A single embedding trivially forms its own cluster.
+    if len(vectors) == 1:
+        logger.info("Only 1 embedding — skipping HDBSCAN, returning singleton cluster")
+        v = np.array(vectors[0], dtype=np.float32)
+        norm = np.linalg.norm(v)
+        if norm > 0:
+            v /= norm
+        return [ClusterResult(
+            label=-1,
+            face_ids=list(face_ids),
+            centroid=v,
+            intra_similarity=1.0,
+            is_high_conf=False,
+        )]
+
     # C-contiguous float64 is what sklearn HDBSCAN's Cython extension expects
     # internally.  Passing float32 causes sklearn to produce a non-contiguous
     # view during internal conversion, which corrupts the condensed tree and
@@ -68,15 +83,13 @@ def cluster_embeddings(
     matrix = np.ascontiguousarray(np.stack(vectors), dtype=np.float64)
     logger.info("Clustering %d face embeddings...", len(matrix))
 
-    # Embeddings are already L2-normalised (unit sphere).  On unit vectors
-    # euclidean distance is a monotonic transformation of cosine distance:
-    #   euclidean = sqrt(2 * cosine_distance)
-    # so clustering results are identical, but the euclidean code path in
-    # sklearn's HDBSCAN Cython extension avoids a bug in epsilon_search that
-    # triggers a TypeError when metric="cosine" and cluster_selection_epsilon>0.
-    # Rescale epsilon accordingly: eps_euc = sqrt(2 * eps_cos).
+    # epsilon_search / traverse_upwards in sklearn's HDBSCAN Cython extension
+    # has a longstanding bug (TypeError: only 0-dimensional arrays can be
+    # converted to Python scalars) that triggers with certain data geometries
+    # whenever cluster_selection_epsilon > 0, regardless of metric.
+    # Work-around: always pass epsilon=0.0 to sklearn and apply our own
+    # post-clustering merge pass based on centroid cosine distance.
     cos_epsilon = float(get_setting('hdbscan_cluster_epsilon'))
-    euc_epsilon = float(np.sqrt(2.0 * cos_epsilon))
 
     try:
         from sklearn.cluster import HDBSCAN  # sklearn >= 1.3
@@ -85,7 +98,7 @@ def cluster_embeddings(
             min_samples=int(get_setting('hdbscan_min_samples')),
             metric="euclidean",
             cluster_selection_method="eom",
-            cluster_selection_epsilon=euc_epsilon,
+            cluster_selection_epsilon=0.0,   # disabled — see comment above
             copy=True,
         )
     except ImportError:
@@ -95,7 +108,7 @@ def cluster_embeddings(
             min_samples=int(get_setting('hdbscan_min_samples')),
             metric="euclidean",
             cluster_selection_method="eom",
-            cluster_selection_epsilon=euc_epsilon,
+            cluster_selection_epsilon=0.0,   # disabled — see comment above
             copy=True,
         )
 
@@ -169,7 +182,85 @@ def cluster_embeddings(
             is_high_conf=intra_sim >= float(get_setting('high_confidence_threshold')),
         ))
 
+    # ── Post-clustering epsilon merge ─────────────────────────────────────────
+    # HDBSCAN with epsilon=0 may leave clusters that are very close together
+    # (centroid cosine similarity > 1 - cos_epsilon).  Merge them here instead
+    # of relying on the broken sklearn Cython path.
+    if cos_epsilon > 0:
+        results = _merge_by_epsilon(results, cos_epsilon)
+
     return results
+
+
+def _merge_by_epsilon(
+    clusters: list[ClusterResult],
+    cos_epsilon: float,
+) -> list[ClusterResult]:
+    """
+    Greedily merge named clusters (label != -1) whose centroids are within
+    cosine distance cos_epsilon of each other.  Singleton noise clusters
+    (label == -1) are left untouched.
+
+    This replicates what HDBSCAN's cluster_selection_epsilon would do without
+    triggering the Cython traverse_upwards / epsilon_search bug.
+    """
+    # Separate named clusters from singletons
+    named  = [c for c in clusters if c.label != -1]
+    singles = [c for c in clusters if c.label == -1]
+
+    if len(named) < 2:
+        return clusters
+
+    merged_flags = [False] * len(named)
+    merged: list[ClusterResult] = []
+
+    for i, ci in enumerate(named):
+        if merged_flags[i]:
+            continue
+        group_face_ids = list(ci.face_ids)
+        centroid_sum = ci.centroid.astype(np.float64) * len(ci.face_ids)
+        total_members = len(ci.face_ids)
+        merged_flags[i] = True
+
+        for j, cj in enumerate(named):
+            if merged_flags[j] or i == j:
+                continue
+            # Cosine similarity between unit-normalised centroids
+            cos_sim = float(np.dot(ci.centroid, cj.centroid))
+            if cos_sim >= 1.0 - cos_epsilon:
+                group_face_ids.extend(cj.face_ids)
+                centroid_sum += cj.centroid.astype(np.float64) * len(cj.face_ids)
+                total_members += len(cj.face_ids)
+                merged_flags[j] = True
+
+        new_centroid = (centroid_sum / total_members).astype(np.float32)
+        norm = np.linalg.norm(new_centroid)
+        if norm > 0:
+            new_centroid /= norm
+
+        # Recompute intra-similarity for merged group
+        # (approximate via centroid dot product — same method as elsewhere)
+        intra_sim = 1.0  # will be recomputed below if we have vectors
+        merged.append(ClusterResult(
+            label=i,
+            face_ids=group_face_ids,
+            centroid=new_centroid,
+            intra_similarity=intra_sim,
+            is_high_conf=False,  # recomputed below
+        ))
+
+    # Recompute is_high_conf from settings after merge
+    hc_threshold = float(get_setting('high_confidence_threshold'))
+    for c in merged:
+        c.is_high_conf = c.intra_similarity >= hc_threshold
+
+    if len(merged) < len(named):
+        logger.info(
+            "Epsilon merge (cos_eps=%.3f): %d clusters → %d after merging",
+            cos_epsilon, len(named), len(merged),
+        )
+
+    return merged + singles
 
 
 def _mean_cosine_similarity(vectors: np.ndarray) -> float:

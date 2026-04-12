@@ -51,6 +51,7 @@ export const api = {
       if (params.tag_category)        q.set('tag_category', params.tag_category)
       if (params.tag_label)           q.set('tag_label',    params.tag_label)
       if (params.folder_id != null)   q.set('folder_id',    String(params.folder_id))
+      if (params.path_prefix)         q.set('path_prefix',  params.path_prefix)
       return request<MediaFile[]>(`/media?${q}`)
     },
     count: (params: Omit<MediaFilter, 'limit' | 'offset'> = {}) => {
@@ -61,6 +62,7 @@ export const api = {
       if (params.tag_category)        q.set('tag_category', params.tag_category)
       if (params.tag_label)           q.set('tag_label',    params.tag_label)
       if (params.folder_id != null)   q.set('folder_id',    String(params.folder_id))
+      if (params.path_prefix)         q.set('path_prefix',  params.path_prefix)
       return request<{ count: number }>(`/media/count?${q}`)
     },
     get: (id: number) => request<MediaFile>(`/media/${id}`),
@@ -83,8 +85,8 @@ export const api = {
 
   // ─── Folders ──────────────────────────────────────────────────────────────
   folders: {
-    list: () => request<FolderItem[]>('/folders'),
-    removeFromApp: (folderId: number, force = false) =>
+    list: () => request<FolderItem[]>('/folders'),    subfolders: (folderId: number) =>
+      request<SubfolderItem[]>(`/folders/${folderId}/subfolders`),    removeFromApp: (folderId: number, force = false) =>
       request<RemoveResult>(`/folders/${folderId}/remove-from-app?force=${force}`, {
         method: 'POST',
       }),
@@ -133,6 +135,22 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ auto_threshold: autoThreshold }),
       }),
+    frequentlyWith: (personId: number, limit = 5) =>
+      request<FrequentlyWithEntry[]>(`/persons/${personId}/frequently-with?limit=${limit}`),
+    connectionsGraph: (personId: number, depth = 2) =>
+      request<ConnectionGraph>(`/persons/${personId}/connections-graph?depth=${depth}`),
+    setPortrait: (personId: number, faceId: number) =>
+      request<{ status: string; person_id: number; portrait_face_id: number }>(
+        `/persons/${personId}/set-portrait/${faceId}`, { method: 'POST' }
+      ),
+    assignFace: (faceId: number, name: string) =>
+      request<{ status: string; face_id: number; person_id: number }>(
+        `/persons/assign-face/${faceId}`,
+        { method: 'POST', body: JSON.stringify({ name }) }
+      ),
+    /** Un-name a person: releases all their clusters back to the unnamed pool and deletes the person record. */
+    delete: (personId: number) =>
+      request<{ status: string; person_id: number }>(`/persons/${personId}`, { method: 'DELETE' }),
   },
 
   // ─── Faces ────────────────────────────────────────────────────────────────
@@ -184,6 +202,12 @@ export const api = {
       const q = category ? `?category=${category}&limit=${limit}` : `?limit=${limit}`
       return request<TopTag[]>(`/tags/summary/top${q}`)
     },
+    /** Remove a specific ML tag from a media file. */
+    remove: (mediaFileId: number, category: string, label: string) =>
+      request<{ status: string }>(
+        `/tags/${mediaFileId}/${encodeURIComponent(category)}/${encodeURIComponent(label)}`,
+        { method: 'DELETE' },
+      ),
   },
 
   // ─── Analysis ────────────────────────────────────────────────────────────
@@ -210,6 +234,11 @@ export const api = {
     reset: (scope: string) =>
       request<{ status: string; scope: string; detail: string }>(`/admin/reset/${scope}`, {
         method: 'DELETE',
+      }),
+    contactsMatch: (threshold: number) =>
+      request<ContactsMatchResult>('/admin/contacts-match', {
+        method: 'POST',
+        body: JSON.stringify({ threshold }),
       }),
   },
 
@@ -277,6 +306,7 @@ export interface MediaFilter {
   tag_category?: string
   tag_label?: string
   folder_id?: number
+  path_prefix?: string
 }
 
 export interface FolderItem {
@@ -287,6 +317,12 @@ export interface FolderItem {
   status: string
   active_count: number
   pending_writeback_count: number
+}
+
+export interface SubfolderItem {
+  path: string
+  name: string
+  photo_count: number
 }
 
 export interface RemoveResult {
@@ -415,6 +451,35 @@ export interface MergePersonsResult {
   photos_queued_for_writeback: number
 }
 
+export interface ConnectionGraphNode {
+  id: string
+  type: 'person' | 'cluster'
+  raw_id: number
+  name: string | null
+  photo_count: number
+  thumbnail: string | null
+  depth: number
+}
+
+export interface ConnectionGraphEdge {
+  source: string
+  target: string
+  weight: number
+}
+
+export interface ConnectionGraph {
+  center_id: string
+  nodes: ConnectionGraphNode[]
+  edges: ConnectionGraphEdge[]
+}
+
+export interface FrequentlyWithEntry {
+  id: number
+  name: string
+  shared_photos: number
+  representative_thumbnail: string | null
+}
+
 export interface SimilarCluster {
   cluster_id: number
   member_count: number
@@ -433,6 +498,7 @@ export interface FaceRow {
   person_name: string | null
   cluster_id?: number | null
   date_taken?: string | null
+  sharpness?: number | null
 }
 
 export interface SearchRequest {
@@ -488,6 +554,7 @@ export interface TagsByCategory {
   animal?: string[]
   geography?: string[]
   place?: string[]
+  explicit?: string[]
 }
 
 export interface TopTag {
@@ -636,4 +703,28 @@ export interface RemoteServerConfig {
   remote_path_prefix: string
   writeback_concurrency: number
   enabled: boolean
+}
+
+// ─── Contacts Face Match ─────────────────────────────────────────────────────
+
+export interface ContactsMatchSuggestion {
+  contact_name: string
+  cluster_id: number
+  cluster_size: number
+  similarity_pct: number
+  auto_name: boolean
+  /** Absolute path stored in DB — convert via '/thumbnails/' + path.split('/thumbnails/').pop() */
+  thumbnail_path: string | null
+}
+
+export interface ContactsMatchStats {
+  total_contacts: number
+  contacts_with_face: number
+  unnamed_clusters: number
+  elapsed_seconds: number
+}
+
+export interface ContactsMatchResult {
+  matches: ContactsMatchSuggestion[]
+  stats: ContactsMatchStats
 }

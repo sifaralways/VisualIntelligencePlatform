@@ -38,6 +38,7 @@ export default function PhotoGrid({
   const [loading,  setLoading]  = useState(false)
   const [error,    setError]    = useState<string | null>(null)
   const [selected, setSelected] = useState<MediaFile | null>(null)
+  const [refreshKey, setRefreshKey] = useState(0)
 
   // Multi-select
   const [selectMode,   setSelectMode]   = useState(false)
@@ -78,7 +79,7 @@ export default function PhotoGrid({
     } finally {
       setLoading(false)
     }
-  }, [filterKey, offset]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [filterKey, offset, refreshKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { load() }, [load])
 
@@ -247,6 +248,7 @@ export default function PhotoGrid({
           mediaId={selected.id}
           filePath={selected.file_path}
           onClose={() => setSelected(null)}
+          onTagRemoved={() => setRefreshKey(k => k + 1)}
         />
       )}
 
