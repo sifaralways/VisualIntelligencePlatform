@@ -2061,6 +2061,15 @@ async def _phase_tag() -> None:
                         media_ids,
                     )
 
+                # Clear stale explicit tags before re-inserting (same reason as place tags).
+                if media_ids:
+                    placeholders = ",".join("?" * len(media_ids))
+                    await db.execute(
+                        f"DELETE FROM media_tags WHERE category='explicit' "
+                        f"AND media_file_id IN ({placeholders})",
+                        media_ids,
+                    )
+
                 tag_rows: list[tuple] = []
                 gps_resolved_ids: list[int] = []   # files that got a GPS-resolved place label
                 for media_id, result, (gps_lat, gps_lon) in zip(
@@ -2081,6 +2090,8 @@ async def _phase_tag() -> None:
                         tag_rows.append((media_id, "place", label, None, model))
                         if is_geo_place:
                             gps_resolved_ids.append(media_id)
+                    for label in result.explicit_labels:
+                        tag_rows.append((media_id, "explicit", label, None, "nudenet"))
 
                 if tag_rows:
                     await db.executemany("""

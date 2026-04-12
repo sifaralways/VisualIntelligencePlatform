@@ -77,16 +77,33 @@ async def get_cluster_faces(cluster_id: int, limit: int = 20):
 @router.get("/media/{media_id}")
 async def get_faces_for_media(media_id: int):
     """Return all faces detected in a specific media file, with person names."""
+    import json as _json
     async with get_db() as db:
         rows = await db.execute_fetchall("""
             SELECT f.id, f.thumbnail_path, f.detection_conf,
-                   f.cluster_id, f.person_id, p.name AS person_name
+                   f.cluster_id, f.person_id, p.name AS person_name,
+                   f.face_attributes
             FROM faces f
             LEFT JOIN persons p ON p.id = f.person_id AND p.is_merged = 0
             WHERE f.media_file_id = ?
             ORDER BY f.detection_conf DESC
         """, (media_id,))
-    return [dict(r) for r in rows]
+    result = []
+    for r in rows:
+        d = dict(r)
+        sharpness: float | None = None
+        if d.get("face_attributes"):
+            try:
+                attrs = _json.loads(d["face_attributes"])
+                raw = attrs.get("Quality", {}).get("Sharpness")
+                if raw is not None:
+                    sharpness = round(float(raw), 1)
+            except Exception:
+                pass
+        d["sharpness"] = sharpness
+        del d["face_attributes"]
+        result.append(d)
+    return result
 
 
 @router.delete("/{face_id}/from-cluster")

@@ -489,6 +489,7 @@ export interface FaceRow {
   person_name: string | null
   cluster_id?: number | null
   date_taken?: string | null
+  sharpness?: number | null
 }
 
 export interface SearchRequest {

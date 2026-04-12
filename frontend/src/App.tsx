@@ -6,6 +6,7 @@ import TagsPage from './pages/TagsPage'
 import WritebackPage from './pages/WritebackPage'
 import AdminPage from './pages/AdminPage'
 import QualityPage from './pages/QualityPage'
+import ExplicitPage from './pages/ExplicitPage'
 import PhotoGrid from './components/PhotoGrid'
 import PipelinePanel from './components/PipelinePanel'
 import { api } from './api/client'
@@ -16,7 +17,7 @@ import './index.css'
 // View state machine
 // ---------------------------------------------------------------------------
 
-type SidebarSection = 'library' | 'people' | 'animals' | 'places' | 'things' | 'tags' | 'writeback' | 'quality'
+type SidebarSection = 'library' | 'people' | 'animals' | 'places' | 'things' | 'tags' | 'writeback' | 'quality' | 'explicit'
 
 interface FilteredView {
   title: string
@@ -297,6 +298,19 @@ export default function App() {
           />
         )
         break
+      case 'explicit':
+        mainContent = (
+          <ExplicitPage
+            onSelectLabel={(label) =>
+              openFiltered(
+                { tag_category: 'explicit', tag_label: label },
+                `🔞 ${label.replace(/_/g, ' ')}`,
+                'explicit',
+              )
+            }
+          />
+        )
+        break
       case 'tags':
         mainContent = <TagsPage />
         break
@@ -365,6 +379,7 @@ export default function App() {
             <NavItem id="animals"   icon="🐾" label="Animals"      active={(section === 'animals'  || filtered?.backTo === 'animals') } onClick={() => navigate('animals')} />
             <NavItem id="places"    icon="📍" label="Places"       active={(section === 'places'   || filtered?.backTo === 'places')  } onClick={() => navigate('places')} />
             <NavItem id="things"    icon="📦" label="Things"       active={(section === 'things'   || filtered?.backTo === 'things')  } onClick={() => navigate('things')} />
+            <NavItem id="explicit"  icon="🔞" label="Explicit"     active={(section === 'explicit' || filtered?.backTo === 'explicit')} onClick={() => navigate('explicit')} />
             <NavItem id="tags"      icon="🏷️" label="All Tags"     active={section === 'tags'      && !filtered} onClick={() => navigate('tags')} />
           </NavGroup>
 

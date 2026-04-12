@@ -18,6 +18,7 @@ ultralytics            # YOLOv8 OIV7 (yolov8n-oiv7.pt auto-downloads on first us
 torch>=2.2             # PyTorch with MPS backend for Apple Silicon
 torchvision>=0.17      # Required by Places365 ResNet-50
 open-clip-torch        # OpenCLIP (landmark CLIP fallback) + BioCLIP (species)
+nudenet>=3.4           # Explicit content detection (ONNX, fully offline)
 timm>=0.9              # GLDv2 EfficientNet-B4 landmark recogniser (primary)
 huggingface_hub>=0.20  # Auto-download GLDv2 weights from HuggingFace Hub
 

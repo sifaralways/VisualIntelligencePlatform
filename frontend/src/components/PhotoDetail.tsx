@@ -333,6 +333,20 @@ export default function PhotoDetail({ mediaId, filePath, onClose }: Props) {
                                     >
                                       {named ? f.person_name : (f.cluster_id != null ? 'tap ✎ to name' : '?')}
                                     </span>
+                                    {f.sharpness != null && (
+                                      <span
+                                        title={`Face sharpness: ${f.sharpness} / 100`}
+                                        className={`text-[9px] tabular-nums px-1.5 py-px rounded-full border ${
+                                          f.sharpness >= 20
+                                            ? 'bg-emerald-900/40 text-emerald-400 border-emerald-700/40'
+                                            : f.sharpness >= 10
+                                              ? 'bg-amber-900/40 text-amber-400 border-amber-700/40'
+                                              : 'bg-red-900/40 text-red-400 border-red-700/40'
+                                        }`}
+                                      >
+                                        ◎ {f.sharpness}
+                                      </span>
+                                    )}
                                     {named && f.person_id != null && (
                                       <button
                                         onClick={() => { setConnectionsPid(f.person_id!); setConnectionsName(f.person_name ?? '') }}

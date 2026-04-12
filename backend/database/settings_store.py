@@ -197,6 +197,16 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         ),
         "group": "System",
     },
+    "nudenet_confidence_threshold": {
+        "value": 0.50, "type": "float", "min": 0.1, "max": 0.95, "step": 0.05,
+        "label": "Explicit content confidence threshold",
+        "description": (
+            "NudeNet minimum detection confidence to store an explicit label. "
+            "Lower values detect more but increase false positives. "
+            "0.5 is a reliable default. Takes effect on the next scan."
+        ),
+        "group": "Content Safety",
+    },
     "exif_batch_timeout": {
         "value": 300, "type": "int", "min": 30, "max": 3600, "step": 30,
         "label": "Phase 1 ExifTool timeout (s)",
