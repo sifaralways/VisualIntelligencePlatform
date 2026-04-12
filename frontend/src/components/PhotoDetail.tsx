@@ -337,9 +337,9 @@ export default function PhotoDetail({ mediaId, filePath, onClose }: Props) {
                                       <span
                                         title={`Face sharpness: ${f.sharpness} / 100`}
                                         className={`text-[9px] tabular-nums px-1.5 py-px rounded-full border ${
-                                          f.sharpness >= 20
+                                          f.sharpness >= 50
                                             ? 'bg-emerald-900/40 text-emerald-400 border-emerald-700/40'
-                                            : f.sharpness >= 10
+                                            : f.sharpness >= 20
                                               ? 'bg-amber-900/40 text-amber-400 border-amber-700/40'
                                               : 'bg-red-900/40 text-red-400 border-red-700/40'
                                         }`}
