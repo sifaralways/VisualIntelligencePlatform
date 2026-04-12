@@ -4,12 +4,13 @@ These endpoints allow selective or full reset of the database so the user
 can re-run the pipeline without manually touching SQLite.
 
 Scopes (DELETE /api/admin/reset/{scope}):
-  all       → wipe every table + all thumbnails on disk
-  scan      → reset media_files to 'scanned', drop faces/embeddings/clusters/persons
-  faces     → drop faces, embeddings, clusters, persons; reset media_files ingest_state to 'scanned'
-  clusters  → drop clusters, persons; unlink face.cluster_id / face.person_id
-  persons   → drop persons; unlink cluster.person_id / face.person_id
-  thumbs    → delete cached photo thumbnails only (forces regeneration on next scan)
+  all          → wipe every table + all thumbnails on disk
+  scan         → reset media_files to 'scanned', drop faces/embeddings/clusters/persons
+  faces        → drop faces, embeddings, clusters, persons; reset media_files ingest_state to 'scanned'
+  clusters     → drop clusters, persons; unlink face.cluster_id / face.person_id
+  persons      → drop persons; unlink cluster.person_id / face.person_id
+  thumbs       → delete cached photo thumbnails only (forces regeneration on next scan)
+  clean_blurry → delete faces below the current face_min_sharpness threshold
 """
 
 from __future__ import annotations
@@ -132,7 +133,7 @@ async def _vacuum_db() -> int:
 @router.delete("/reset/{scope}")
 async def reset(scope: str):
     """Clear data at the specified scope level."""
-    valid = {"all", "scan", "faces", "clusters", "persons", "thumbs"}
+    valid = {"all", "scan", "faces", "clusters", "persons", "thumbs", "clean_blurry"}
     if scope not in valid:
         raise HTTPException(status_code=400, detail=f"Unknown scope '{scope}'. Use: {valid}")
 
@@ -203,6 +204,73 @@ async def reset(scope: str):
         logger.warning("ADMIN: Photo thumbnails wiped — will regenerate on next pipeline run")
         return {"status": "ok", "scope": scope,
                 "detail": "Photo thumbnail cache cleared. Re-run the pipeline scan to regenerate upright thumbnails."}
+
+    if scope == "clean_blurry":
+        import json as _json
+        from backend.database import settings_store as _ss
+        min_sharp = float(_ss.get("face_min_sharpness"))
+        if min_sharp <= 0:
+            return {"status": "ok", "scope": scope,
+                    "detail": "face_min_sharpness is 0 — nothing to clean. Raise the setting first.",
+                    "deleted": 0}
+        async with get_db() as db:
+            # Fetch all faces that have a stored sharpness value
+            rows = await db.execute_fetchall(
+                "SELECT id, thumbnail_path, face_attributes FROM faces WHERE face_attributes IS NOT NULL"
+            )
+            blurry_ids: list[int] = []
+            blurry_thumbs: list[str] = []
+            for row in rows:
+                try:
+                    attrs = _json.loads(row["face_attributes"])
+                    sharpness = attrs.get("Quality", {}).get("Sharpness")
+                    if sharpness is not None and float(sharpness) < min_sharp:
+                        blurry_ids.append(row["id"])
+                        if row["thumbnail_path"]:
+                            blurry_thumbs.append(row["thumbnail_path"])
+                except Exception:
+                    pass
+
+            if not blurry_ids:
+                return {"status": "ok", "scope": scope,
+                        "detail": f"No faces below sharpness {min_sharp:.0f} found.",
+                        "deleted": 0}
+
+            # Delete in FK order: embeddings first, then faces
+            ph = ",".join("?" * len(blurry_ids))
+            await db.execute(f"DELETE FROM embeddings WHERE face_id IN ({ph})", blurry_ids)
+            # Unlink from cluster member_count will be recomputed on re-cluster.
+            # Unlink portrait_face_id references first so FK is not violated.
+            await db.execute(
+                f"UPDATE persons SET portrait_face_id=NULL WHERE portrait_face_id IN ({ph})",
+                blurry_ids,
+            )
+            await db.execute(f"DELETE FROM faces WHERE id IN ({ph})", blurry_ids)
+            logger.warning(
+                "ADMIN: clean_blurry — deleted %d faces below sharpness %.1f",
+                len(blurry_ids), min_sharp,
+            )
+
+        # Delete face thumbnail files from disk
+        removed_files = 0
+        for thumb in blurry_thumbs:
+            p = Path(thumb)
+            if p.exists():
+                p.unlink()
+                removed_files += 1
+
+        freed = await _vacuum_db()
+        return {
+            "status": "ok",
+            "scope": scope,
+            "detail": (
+                f"Deleted {len(blurry_ids)} blurry face(s) below sharpness {min_sharp:.0f}. "
+                f"Removed {removed_files} thumbnail file(s). "
+                "Re-run the pipeline (Rescan All) to re-cluster remaining faces."
+            ),
+            "deleted": len(blurry_ids),
+            "pages_freed": freed,
+        }
 
     # unreachable
     raise HTTPException(status_code=500, detail="Unexpected error")

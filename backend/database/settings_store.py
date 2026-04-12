@@ -66,6 +66,17 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "description": "Suppress gender and age predictions when the face crop sharpness (0–100) is below this. Blurry crops produce near-random results.",
         "group": "Face Detection",
     },
+    "face_min_sharpness": {
+        "value": 20.0, "type": "float", "min": 0.0, "max": 60.0, "step": 5.0,
+        "label": "Min face sharpness",
+        "description": (
+            "Discard face detections whose crop sharpness (0–100) falls below this. "
+            "Bokeh / depth-of-field blur on background faces typically scores 0–10. "
+            "20 removes most out-of-focus faces while keeping anything recognisably in-focus. "
+            "0 = accept everything (original behaviour). Takes effect on the next scan."
+        ),
+        "group": "Face Detection",
+    },
     "hdbscan_min_cluster_size": {
         "value": 2, "type": "int", "min": 2, "max": 10, "step": 1,
         "label": "Min cluster size",

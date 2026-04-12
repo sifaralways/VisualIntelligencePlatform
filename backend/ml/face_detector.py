@@ -448,6 +448,15 @@ class FaceDetector:
                 lap_var = float(np.var(laplacian))
                 quality_sharpness = float(np.clip(lap_var / 500 * 100, 0, 100))
 
+            # ── Sharpness gate — discard bokeh / depth-of-field blurs ─────────
+            min_sharpness = float(get_setting('face_min_sharpness'))
+            if min_sharpness > 0 and quality_sharpness is not None and quality_sharpness < min_sharpness:
+                logger.debug(
+                    "Skipping blurry face (sharpness=%.1f < %.1f) in %s",
+                    quality_sharpness, min_sharpness, image_path.name,
+                )
+                continue
+
             results.append(DetectedFace(
                 bbox_x=x1 / img_w,
                 bbox_y=y1 / img_h,

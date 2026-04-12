@@ -30,6 +30,14 @@ interface Stats {
 
 const ACTIONS = [
   {
+    scope: 'clean_blurry',
+    label: 'Remove blurry faces',
+    colour: 'blue',
+    description:
+      'Deletes existing face detections whose sharpness score falls below the current Min Face Sharpness setting. Faces belonging to named persons are preserved. Run after adjusting the sharpness slider, then rescan to re-cluster.',
+    danger: false,
+  },
+  {
     scope: 'persons',
     label: 'Clear named persons',
     colour: 'amber',
@@ -80,6 +88,8 @@ function StatCard({ label, value, sub }: { label: string; value: number | string
 // ─── Colour helpers ─────────────────────────────────────────────────────────
 
 const btnClass: Record<string, string> = {
+  blue:
+    'border-blue-600 text-blue-400 hover:bg-blue-600/20',
   amber:
     'border-amber-600 text-amber-400 hover:bg-amber-600/20',
   orange:
