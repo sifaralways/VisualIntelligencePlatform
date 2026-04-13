@@ -32,6 +32,10 @@ class Settings(BaseSettings):
         return self.app_support_dir / "vip.faiss"
 
     @property
+    def clip_faiss_path(self) -> Path:
+        return self.app_support_dir / "vip_clip.faiss"
+
+    @property
     def thumbnail_dir(self) -> Path:
         """Small face crop JPEGs — permanent residents."""
         return self.app_support_dir / "thumbnails"
@@ -51,6 +55,8 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     api_host: str = "127.0.0.1"
     api_port: int = 7474
+    ollama_base_url: str = "http://127.0.0.1:11434"
+    ollama_model: str = "qwen2.5-coder:14b"
 
     # -------------------------------------------------------------------------
     # Supported formats (RAW + direct image formats)

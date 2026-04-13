@@ -169,6 +169,20 @@ export const api = {
   search: {
     query: (params: SearchRequest) =>
       request<SearchResponse>('/search', { method: 'POST', body: JSON.stringify(params) }),
+    natural: (params: NaturalSearchRequest) =>
+      request<NaturalSearchResponse>('/search/natural', {
+        method: 'POST',
+        body: JSON.stringify(params),
+      }),
+  },
+
+  // ─── Assistant Chat ──────────────────────────────────────────────────────
+  chat: {
+    message: (params: ChatRequest) =>
+      request<ChatResponse>('/chat/message', {
+        method: 'POST',
+        body: JSON.stringify(params),
+      }),
   },
 
   // ─── Writeback ────────────────────────────────────────────────────────────
@@ -521,6 +535,57 @@ export interface MediaResult {
   date_taken: string | null
   camera_model: string | null
   persons: string | null
+}
+
+export interface NaturalSearchRequest {
+  query: string
+  limit?: number
+}
+
+export interface NaturalSearchResult {
+  media_id: number
+  file_path: string
+  date_taken: string | null
+  persons: string[]
+  tags: string[]
+  clip_score?: number
+  sql_matched?: boolean
+}
+
+export interface NaturalSearchResponse {
+  intent: 'SQL_ONLY' | 'CLIP_ONLY' | 'HYBRID'
+  explanation: string
+  results: NaturalSearchResult[]
+  count: number
+  error?: string
+}
+
+export interface ChatRequest {
+  message: string
+  limit?: number
+  conversation_id?: string
+}
+
+export interface ChatActionPayload {
+  query?: string
+}
+
+export interface ChatTopPerson {
+  name: string
+  photo_count: number
+}
+
+export interface ChatResponse {
+  conversation_id: string
+  reply_text: string
+  results: NaturalSearchResult[]
+  count: number
+  action: 'none' | 'open_search'
+  action_payload: ChatActionPayload
+  intent?: 'SQL_ONLY' | 'CLIP_ONLY' | 'HYBRID'
+  explanation?: string
+  error?: string
+  top_people?: ChatTopPerson[]
 }
 
 export interface WritebackPreview {

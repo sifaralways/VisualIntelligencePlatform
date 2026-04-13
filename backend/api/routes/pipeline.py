@@ -226,6 +226,17 @@ async def migrate_model(background_tasks: BackgroundTasks):
     return {"status": "started"}
 
 
+@router.post("/rebuild_clip_index")
+async def rebuild_clip_index(background_tasks: BackgroundTasks):
+    """Rebuild CLIP embeddings/index for all active photos only."""
+    if _pipeline_state["status"] == "running":
+        raise HTTPException(status_code=409, detail="Pipeline already running")
+
+    _pipeline_state.update({"status": "running", "folder": "[clip index rebuild]", "error": None})
+    background_tasks.add_task(_run_clip_index_rebuild)
+    return {"status": "started"}
+
+
 async def _run_model_migration() -> None:
     from backend.pipeline.ingest import run_model_migration
     try:
@@ -233,5 +244,16 @@ async def _run_model_migration() -> None:
         _pipeline_state["status"] = "idle"
     except Exception as e:
         logger.exception("Model migration error")
+        _pipeline_state["status"] = "error"
+        _pipeline_state["error"] = str(e)
+
+
+async def _run_clip_index_rebuild() -> None:
+    from backend.pipeline.ingest import run_clip_index_rebuild
+    try:
+        await run_clip_index_rebuild()
+        _pipeline_state["status"] = "idle"
+    except Exception as e:
+        logger.exception("CLIP index rebuild error")
         _pipeline_state["status"] = "error"
         _pipeline_state["error"] = str(e)
