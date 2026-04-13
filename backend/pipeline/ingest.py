@@ -33,6 +33,7 @@ from backend.ml.face_detector import FaceDetector
 from backend.ml.embedder import FaceEmbedder, save_face_thumbnail
 from backend.ml.clusterer import cluster_embeddings
 from backend.ml.index import FaissIndex
+from backend.ml.clip_index import ClipFaissIndex
 from backend.ml.tagger import Tagger
 from backend.api.websocket import broadcast
 from backend.database import settings_store
@@ -49,6 +50,7 @@ logger = logging.getLogger(__name__)
 _detector = FaceDetector()
 _embedder = FaceEmbedder()
 _faiss = FaissIndex()
+_clip_index = ClipFaissIndex()
 _tagger = Tagger()
 _models_loaded = False
 
@@ -61,6 +63,7 @@ def _ensure_models() -> None:
         # during detection (face.normed_embedding). FaceEmbedder is only
         # used here for vector_to_bytes / bytes_to_vector utility methods.
         _faiss.load()
+        _clip_index.load()
         _models_loaded = True
 
 
@@ -198,6 +201,9 @@ async def run_reprocess(force_retag: bool = False) -> None:
     # (tags_done was already reset to 0 at the top of this function.)
     if force_retag:
         await _phase_tag()
+
+    # Keep CLIP embeddings current for natural-language visual search.
+    await _phase_clip_index()
 
     # Step 6: quality re-check on stored photo thumbnails
     await broadcast("phase_start", phase="quality_recheck")
@@ -656,6 +662,19 @@ async def run_model_migration() -> None:
     logger.info("=== Model migration complete ===")
 
 
+async def run_clip_index_rebuild() -> None:
+    """Rebuild CLIP embeddings/index only for all active photos in app."""
+    logger.info("=== CLIP index rebuild start ===")
+    await broadcast("pipeline_start", folder="[clip index rebuild]")
+    await settings_store.load_cache()
+    _ensure_models()
+
+    await _phase_clip_index(rebuild_all=True)
+
+    await broadcast("pipeline_complete", folder="[clip index rebuild]")
+    logger.info("=== CLIP index rebuild complete ===")
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline entry point
 # ---------------------------------------------------------------------------
@@ -717,6 +736,9 @@ async def run_ingest(folder: str) -> None:
 
     # -- Phase 4: Tag (objects, animals, geography, places) -----------------
     await _phase_tag()
+
+    # -- Phase 4b: Build per-photo CLIP vector index -------------------------
+    await _phase_clip_index()
 
     # -- Phase 5: Build analysis documents (Rekognition-format JSON) --------
     await _phase_analyse()
@@ -2144,6 +2166,121 @@ async def _phase_tag() -> None:
 
     await broadcast("phase_complete", phase="tag", tagged=_counter[0])
     logger.info("Phase 4 complete: %d files tagged", _counter[0])
+
+
+def _encode_clip_photo_embedding(preview_path: Path, landmark) -> np.ndarray | None:
+    """Encode a photo thumbnail into a unit-normalised CLIP vector."""
+    if landmark._clip_model is None or landmark._clip_preprocess is None:
+        return None
+
+    try:
+        import torch
+
+        with _PILImage.open(preview_path).convert("RGB") as img:
+            tensor = landmark._clip_preprocess(img).unsqueeze(0).to(landmark._device)
+        with torch.no_grad():
+            vec = landmark._clip_model.encode_image(tensor)
+            vec = vec / vec.norm(dim=-1, keepdim=True)
+        return vec.squeeze(0).detach().cpu().numpy().astype(np.float32)
+    except Exception as exc:
+        logger.debug("CLIP encode failed for %s: %s", preview_path, exc)
+        return None
+
+
+async def _phase_clip_index(rebuild_all: bool = False) -> None:
+    """Persist per-photo CLIP embeddings and rebuild the CLIP FAISS index."""
+    logger.info("Phase 4b: Building CLIP photo index (rebuild_all=%s)", rebuild_all)
+    await broadcast("phase_start", phase="clip_index")
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _tagger.load)
+    landmark = _tagger._landmark
+
+    if landmark._clip_model is None or landmark._clip_preprocess is None:
+        logger.warning("Phase 4b: CLIP model not available; skipping")
+        await broadcast("phase_complete", phase="clip_index", added=0, indexed=_clip_index.total)
+        return
+
+    if rebuild_all:
+        async with get_db() as db:
+            await db.execute("DELETE FROM clip_embeddings")
+
+    async with get_db() as db:
+        if rebuild_all:
+            pending = await db.execute_fetchall(
+                """
+                SELECT id
+                FROM media_files
+                WHERE is_stub = 0
+                  AND removed_from_app = 0
+                ORDER BY id
+                """
+            )
+        else:
+            pending = await db.execute_fetchall(
+                """
+                SELECT mf.id
+                FROM media_files mf
+                LEFT JOIN clip_embeddings ce ON ce.media_file_id = mf.id
+                WHERE mf.is_stub = 0
+                  AND mf.removed_from_app = 0
+                  AND mf.tags_done = 1
+                  AND ce.media_file_id IS NULL
+                ORDER BY mf.id
+                """
+            )
+
+    added = 0
+    for row in pending:
+        media_id = row["id"]
+        thumb_path = settings.photo_thumbs_dir / f"{media_id}.jpg"
+        if not thumb_path.exists():
+            continue
+
+        vec = await loop.run_in_executor(
+            None,
+            _encode_clip_photo_embedding,
+            thumb_path,
+            landmark,
+        )
+        if vec is None:
+            continue
+
+        async with get_db() as db:
+            await db.execute(
+                """
+                INSERT INTO clip_embeddings (media_file_id, vector, model_name, embed_dim)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(media_file_id) DO UPDATE SET
+                    vector=excluded.vector,
+                    model_name=excluded.model_name,
+                    embed_dim=excluded.embed_dim
+                """,
+                (
+                    media_id,
+                    vec.tobytes(),
+                    type(landmark._clip_model).__name__,
+                    int(vec.shape[0]),
+                ),
+            )
+        added += 1
+
+    async with get_db() as db:
+        all_rows = await db.execute_fetchall(
+            "SELECT media_file_id, vector FROM clip_embeddings ORDER BY media_file_id"
+        )
+
+    if all_rows:
+        media_ids = [int(r["media_file_id"]) for r in all_rows]
+        vectors = [np.frombuffer(r["vector"], dtype=np.float32).copy() for r in all_rows]
+        _clip_index.build(media_ids, vectors)
+        _clip_index.save()
+    else:
+        # Ensure stale in-memory index does not survive an empty rebuild.
+        _clip_index.build([], [])
+
+    await broadcast("phase_complete", phase="clip_index", added=added, indexed=_clip_index.total)
+    logger.info("Phase 4b complete: added=%d, indexed=%d", added, _clip_index.total)
 
 
 def _hash_path(path: Path) -> str:

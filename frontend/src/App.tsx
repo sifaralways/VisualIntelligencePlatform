@@ -2,6 +2,8 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import LibraryPage from './pages/LibraryPage'
 import PeoplePage from './pages/PeoplePage'
 import DiscoverPage from './pages/DiscoverPage'
+import SearchPage from './pages/SearchPage'
+import AssistantPage from './pages/AssistantPage'
 import TagsPage from './pages/TagsPage'
 import WritebackPage from './pages/WritebackPage'
 import AdminPage from './pages/AdminPage'
@@ -17,7 +19,7 @@ import './index.css'
 // View state machine
 // ---------------------------------------------------------------------------
 
-type SidebarSection = 'library' | 'people' | 'animals' | 'places' | 'things' | 'tags' | 'writeback' | 'quality' | 'explicit'
+type SidebarSection = 'library' | 'people' | 'animals' | 'places' | 'things' | 'search' | 'assistant' | 'tags' | 'writeback' | 'quality' | 'explicit'
 
 interface FilteredView {
   title: string
@@ -36,6 +38,8 @@ interface FilteredView {
 export default function App() {
   const [section, setSection]       = useState<SidebarSection>('library')
   const [filtered, setFiltered]     = useState<FilteredView | null>(null)
+  const [headerSearchQuery, setHeaderSearchQuery] = useState('')
+  const [activeSearchQuery, setActiveSearchQuery] = useState('')
 
   // Pipeline panel collapse state (persisted in sessionStorage for comfort)
   const [pipelineCollapsed, setPipelineCollapsed] = useState(() => {
@@ -218,6 +222,14 @@ export default function App() {
     setFiltered(null)
   }
 
+  function runHeaderSearch() {
+    const q = headerSearchQuery.trim()
+    if (!q) return
+    setActiveSearchQuery(q)
+    setSection('search')
+    setFiltered(null)
+  }
+
   /** Start folder remove — check for pending writeback first */
   async function handleFolderRemove(folder: FolderItem, force = false) {
     try {
@@ -311,6 +323,20 @@ export default function App() {
           />
         )
         break
+      case 'search':
+        mainContent = <SearchPage initialQuery={activeSearchQuery} />
+        break
+      case 'assistant':
+        mainContent = (
+          <AssistantPage
+            onOpenSearch={(query) => {
+              setActiveSearchQuery(query)
+              setSection('search')
+              setFiltered(null)
+            }}
+          />
+        )
+        break
       case 'tags':
         mainContent = <TagsPage />
         break
@@ -329,7 +355,26 @@ export default function App() {
       <header className="h-11 border-b border-gray-800 flex items-center px-4 gap-3 shrink-0">
         <span className="font-semibold text-white text-sm tracking-wide">📸 VIP</span>
         <span className="text-gray-600 text-xs">Visual Intelligence Platform</span>
-        <div className="flex-1" />
+
+        <div className="flex-1 max-w-2xl ml-2">
+          <div className="relative">
+            <input
+              value={headerSearchQuery}
+              onChange={e => setHeaderSearchQuery(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') runHeaderSearch() }}
+              placeholder="Search photos in natural language..."
+              className="w-full h-8 rounded-lg border border-gray-700 bg-gray-900 pl-9 pr-20 text-xs text-gray-100 placeholder:text-gray-500 outline-none focus:border-indigo-500"
+            />
+            <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 text-xs">🔎</span>
+            <button
+              onClick={runHeaderSearch}
+              className="absolute right-1.5 top-1/2 -translate-y-1/2 h-6 px-2.5 rounded-md bg-indigo-600 hover:bg-indigo-500 text-[11px] font-medium text-white"
+            >
+              Search
+            </button>
+          </div>
+        </div>
+
         {/* Gear icon — opens Admin popup */}
         <button
           onClick={() => setAdminOpen(true)}
@@ -379,6 +424,8 @@ export default function App() {
             <NavItem id="animals"   icon="🐾" label="Animals"      active={(section === 'animals'  || filtered?.backTo === 'animals') } onClick={() => navigate('animals')} />
             <NavItem id="places"    icon="📍" label="Places"       active={(section === 'places'   || filtered?.backTo === 'places')  } onClick={() => navigate('places')} />
             <NavItem id="things"    icon="📦" label="Things"       active={(section === 'things'   || filtered?.backTo === 'things')  } onClick={() => navigate('things')} />
+            <NavItem id="search"    icon="🔎" label="Search"       active={section === 'search'    && !filtered} onClick={() => navigate('search')} />
+            <NavItem id="assistant" icon="💬" label="Assistant"    active={section === 'assistant' && !filtered} onClick={() => navigate('assistant')} />
             <NavItem id="explicit"  icon="🔞" label="Explicit"     active={(section === 'explicit' || filtered?.backTo === 'explicit')} onClick={() => navigate('explicit')} />
             <NavItem id="tags"      icon="🏷️" label="All Tags"     active={section === 'tags'      && !filtered} onClick={() => navigate('tags')} />
           </NavGroup>

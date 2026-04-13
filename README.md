@@ -183,31 +183,38 @@ VisualIntelligencePlatform/
 ├── backend/
 │   ├── main.py                     # FastAPI app entry point
 │   ├── config.py                   # All settings (Pydantic)
-│   ├── admin.py                    # Admin reset / stats
 │   ├── database/
 │   │   ├── db.py                   # aiosqlite pool
+│   │   ├── models.py               # Pydantic models for DB
+│   │   ├── settings_store.py       # App settings persistence
 │   │   └── migrations/
-│   │       ├── 001_initial.sql     # Core schema (7 tables)
+│   │       ├── 001_initial.sql     # Core schema (media_files, faces, embeddings, persons, clusters, scan_state, writeback_queue)
 │   │       └── 002_tags.sql        # media_tags table
 │   ├── scanner/
-│   │   ├── walker.py, hasher.py, exif_reader.py, preview_extractor.py
+│   │   ├── walker.py               # Recursive walk, stub detection
+│   │   ├── hasher.py               # SHA-256, idempotency check
+│   │   ├── exif_reader.py          # ExifTool JSON wrapper
+│   │   └── preview_extractor.py    # Embedded JPEG preview extraction
 │   ├── ml/
-│   │   ├── face_detector.py        # InsightFace RetinaFace (CPU EP)
-│   │   ├── embedder.py             # InsightFace ArcFace, 200×200 crops
-│   │   ├── clusterer.py            # HDBSCAN
+│   │   ├── face_detector.py        # InsightFace RetinaFace (CPUExecutionProvider)
+│   │   ├── embedder.py             # ArcFace embedding
+│   │   ├── clusterer.py            # HDBSCAN clustering
 │   │   ├── object_detector.py      # YOLOv11s
 │   │   ├── scene_classifier.py     # Places365
 │   │   ├── landmark_recogniser.py  # OpenCLIP zero-shot
 │   │   ├── species_classifier.py   # BioCLIP
-│   │   ├── geo_resolver.py         # Nominatim
-│   │   └── tagger.py               # Orchestrator for all taggers
+│   │   ├── geo_resolver.py         # Nominatim/geopy
+│   │   ├── tagger.py               # Orchestrates all taggers
+│   │   └── index.py                # FAISS index
 │   ├── pipeline/
-│   │   └── ingest.py               # 4-phase pipeline orchestrator
+│   │   ├── ingest.py               # Pipeline orchestrator (all phases)
+│   │   └── centroid.py             # Person centroid update
 │   ├── writeback/
-│   │   ├── exiftool.py, fields.py, engine.py
+│   │   ├── exiftool.py             # ExifTool subprocess wrapper
+│   │   ├── fields.py               # XMP field mapping
+│   │   └── engine.py               # Writeback logic
 │   └── api/routes/
-│       ├── pipeline.py, persons.py, faces.py, media.py
-│       ├── search.py, writeback.py, tags.py, admin.py
+│       ├── pipeline.py, persons.py, faces.py, media.py, search.py, writeback.py, tags.py, admin.py
 ├── frontend/src/
 │   ├── pages/
 │   │   ├── PeoplePage.tsx          # Face tiles, naming, face review, eject
@@ -230,17 +237,23 @@ VisualIntelligencePlatform/
 | Method | Endpoint | Description |
 |---|---|---|
 | `POST` | `/api/pipeline/scan` | Start pipeline (all 4 phases) |
+| `GET` | `/api/pipeline/status` | Current pipeline status |
 | `WS` | `/ws/progress` | Real-time progress events |
-| `GET` | `/api/persons` | All persons with photo counts + thumbnails |
-| `GET` | `/api/persons/{id}/faces` | All face crops for person review |
-| `PATCH` | `/api/persons/{id}` | Set name / merge |
-| `DELETE` | `/api/faces/{id}/from-person` | Eject a misassigned face |
-| `GET` | `/api/tags/{media_file_id}` | All ML tags for a photo |
-| `GET` | `/api/tags/summary/top` | Most frequent tags across library |
-| `GET` | `/api/writeback/preview` | Dry-run: files + fields to be written |
+| `GET` | `/api/persons` | All persons with photo counts + representative thumbnail |
+| `GET` | `/api/persons/{id}/faces` | All face crops for a person (for review panel) |
+| `PATCH` | `/api/persons/{id}` | Set name, merge, split |
+| `DELETE` | `/api/faces/{id}/from-person` | Eject a misassigned face from a person |
+| `GET` | `/api/media/{id}` | Media file metadata |
+| `GET` | `/api/media/{id}/preview` | Serve JPEG preview |
+| `GET` | `/api/faces/{id}/thumbnail` | Serve face crop JPEG (200×200) |
+| `POST` | `/api/search` | Search query |
+| `GET` | `/api/writeback/preview` | Dry-run: list of pending writes + field diffs |
 | `POST` | `/api/writeback/confirm` | Execute ExifTool writes |
-| `GET` | `/api/admin/stats` | DB counts + pipeline state |
-| `POST` | `/api/admin/reset/{scope}` | Scoped reset (faces, clusters, tags, all) |
+| `GET` | `/api/writeback/status` | Writeback job status |
+| `GET` | `/api/tags/{media_file_id}` | ML tags for a photo, grouped by category |
+| `GET` | `/api/tags/summary/top` | Most frequent tags across library (filterable by category) |
+| `GET` | `/api/admin/stats` | DB row counts + pipeline state breakdown |
+| `POST` | `/api/admin/reset/{scope}` | Scoped reset: faces / clusters / tags / all (FK-safe) |
 
 ---
 
