@@ -117,6 +117,7 @@ export default function App() {
   // Scanned folders displayed in sidebar
   const [folders, setFolders] = useState<FolderItem[]>([])
   const [folderLoadError, setFolderLoadError] = useState(false)
+  const [allPhotosExpanded, setAllPhotosExpanded] = useState(false)
   const [folderWarning, setFolderWarning] = useState<{
     folder: FolderItem
     result: RemoveResult
@@ -391,48 +392,74 @@ export default function App() {
           style={{ width: sidebarWidth }}
           className="shrink-0 border-r border-gray-800 py-3 flex flex-col gap-1 overflow-y-auto bg-gray-950"
         >
-          <NavGroup label="Library">
-            <NavItem id="library" icon="📚" label="All Photos" active={section === 'library' && !filtered} onClick={() => navigate('library')} />
-            {folderLoadError && (
-              <p className="text-[10px] text-red-400 px-3 py-1">Could not load folders — is the server running?</p>
-            )}
-            {!folderLoadError && folders.length === 0 && (
-              <p className="text-[10px] text-gray-600 px-3 py-1 italic">No folders scanned yet</p>
-            )}
-            {folders.map(f => {
-              const rootName = f.folder_path.split('/').pop() || f.folder_path
-              return (
-                <FolderTreeRoot
-                  key={f.id}
-                  folder={f}
-                  subfolders={subfolderMap[f.id] ?? null}
-                  activePathPrefix={filtered?.pathPrefix ?? null}
-                  activeFolderId={filtered?.folderId ?? null}
-                  onRootClick={() => openFiltered({ folder_id: f.id }, `📁 ${rootName}`, 'library', f.id, undefined)}
-                  onSubfolderClick={(path, name) =>
-                    openFiltered({ path_prefix: path }, `📁 ${name}`, 'library', f.id, path)
-                  }
-                  onExpand={() => loadSubfolders(f.id)}
-                  onRemove={() => handleFolderRemove(f)}
-                />
-              )
-            })}
-          </NavGroup>
-
-          <NavGroup label="People & Places">
+          <NavGroup label="Browse">
+            <NavItem id="assistant" icon="💬" label="Assistant"    active={section === 'assistant' && !filtered} onClick={() => navigate('assistant')} />
             <NavItem id="people"    icon="👤" label="People"       active={(section === 'people'   || filtered?.backTo === 'people')  } onClick={() => navigate('people')} />
-            <NavItem id="animals"   icon="🐾" label="Animals"      active={(section === 'animals'  || filtered?.backTo === 'animals') } onClick={() => navigate('animals')} />
             <NavItem id="places"    icon="📍" label="Places"       active={(section === 'places'   || filtered?.backTo === 'places')  } onClick={() => navigate('places')} />
             <NavItem id="things"    icon="📦" label="Things"       active={(section === 'things'   || filtered?.backTo === 'things')  } onClick={() => navigate('things')} />
-            <NavItem id="search"    icon="🔎" label="Search"       active={section === 'search'    && !filtered} onClick={() => navigate('search')} />
-            <NavItem id="assistant" icon="💬" label="Assistant"    active={section === 'assistant' && !filtered} onClick={() => navigate('assistant')} />
+            <NavItem id="animals"   icon="🐾" label="Animals"      active={(section === 'animals'  || filtered?.backTo === 'animals') } onClick={() => navigate('animals')} />
             <NavItem id="explicit"  icon="🔞" label="Explicit"     active={(section === 'explicit' || filtered?.backTo === 'explicit')} onClick={() => navigate('explicit')} />
             <NavItem id="tags"      icon="🏷️" label="All Tags"     active={section === 'tags'      && !filtered} onClick={() => navigate('tags')} />
           </NavGroup>
 
-          <NavGroup label="Tools">
+          <NavGroup label="Manage">
             <NavItem id="writeback" icon="💾" label="Write to Files" active={section === 'writeback' && !filtered} onClick={() => navigate('writeback')} />
             <NavItem id="quality"   icon="🎯" label="Quality"       active={section === 'quality'   && !filtered} onClick={() => navigate('quality')} />
+          </NavGroup>
+
+          <NavGroup label="Library">
+            <div className="p-1">
+              {/* All Photos as collapsible header */}
+              <div
+                className={`group flex items-center pl-1 pr-1 py-1.5 rounded-lg text-sm transition-colors
+                  ${section === 'library' && !filtered ? 'bg-indigo-600/80 text-white' : 'text-gray-400 hover:text-white hover:bg-gray-800'}`}
+              >
+                {/* expand/collapse chevron */}
+                <button
+                  onClick={e => { e.stopPropagation(); setAllPhotosExpanded(v => !v) }}
+                  className="w-5 h-5 shrink-0 flex items-center justify-center text-gray-500 hover:text-white"
+                  aria-label={allPhotosExpanded ? 'Collapse' : 'Expand'}
+                >
+                  {folders.length > 0 ? (allPhotosExpanded ? '▾' : '▸') : <span className="w-4" />}
+                </button>
+
+                {/* All Photos label */}
+                <button onClick={() => navigate('library')} className="flex-1 flex items-center gap-1.5 min-w-0 text-left px-1">
+                  <span className="text-base leading-none shrink-0">📚</span>
+                  <span className="truncate">All Photos</span>
+                </button>
+              </div>
+
+              {/* Expanded content */}
+              {allPhotosExpanded && (
+                <div className="ml-2 mt-1">
+                  {folderLoadError && (
+                    <p className="text-[10px] text-red-400 px-3 py-1">Could not load folders — is the server running?</p>
+                  )}
+                  {!folderLoadError && folders.length === 0 && (
+                    <p className="text-[10px] text-gray-600 px-3 py-1 italic">No folders scanned yet</p>
+                  )}
+                  {folders.map(f => {
+                    const rootName = f.folder_path.split('/').pop() || f.folder_path
+                    return (
+                      <FolderTreeRoot
+                        key={f.id}
+                        folder={f}
+                        subfolders={subfolderMap[f.id] ?? null}
+                        activePathPrefix={filtered?.pathPrefix ?? null}
+                        activeFolderId={filtered?.folderId ?? null}
+                        onRootClick={() => openFiltered({ folder_id: f.id }, `📁 ${rootName}`, 'library', f.id, undefined)}
+                        onSubfolderClick={(path, name) =>
+                          openFiltered({ path_prefix: path }, `📁 ${name}`, 'library', f.id, path)
+                        }
+                        onExpand={() => loadSubfolders(f.id)}
+                        onRemove={() => handleFolderRemove(f)}
+                      />
+                    )
+                  })}
+                </div>
+              )}
+            </div>
           </NavGroup>
         </aside>
 
