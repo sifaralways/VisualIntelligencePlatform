@@ -32,6 +32,7 @@ async def execute_plan(plan: AssistantPlan, state: AssistantState, default_limit
         "COUNT_PHOTOS_OF_PEOPLE": lambda: _count_photos_of_people(plan, state),
         "COUNT_PEOPLE_WITH_PERSON": lambda: _count_people_with_person(plan, state),
         "SHOW_PHOTOS_OF_PEOPLE": lambda: _show_photos_of_people(plan, state, limit),
+        "SHOW_PHOTOS_OF_PEOPLE_IN_LOCATION": lambda: _show_photos_of_people_in_location(plan, state, limit),
         "LIST_OTHER_PEOPLE_IN_PHOTOS_OF_PEOPLE": lambda: _list_other_people_in_photos_of_people(plan, state, limit),
         "LIST_OTHER_PEOPLE_IN_LAST_RESULTS": lambda: _list_other_people_in_last_results(state, limit),
         "LIST_BEST_FRIENDS": lambda: _list_best_friends(plan, state),
@@ -198,6 +199,36 @@ async def _media_ids_for_people(people: list[str], limit: int, min_other_people:
     return [int(r["media_id"]) for r in rows]
 
 
+async def _media_ids_for_people_in_location(people: list[str], location_term: str, limit: int) -> list[int]:
+    if not people or not location_term.strip():
+        return []
+
+    aliases = [f"p{i}" for i in range(len(people))]
+    joins = [
+        f"JOIN v_person_photos {aliases[i]} ON {aliases[i]}.media_id = {aliases[0]}.media_id"
+        for i in range(1, len(aliases))
+    ]
+    where_people = SQL_AND.join(f"{alias}.person_name LIKE ?" for alias in aliases)
+
+    params: list[object] = [f"%{name}%" for name in people]
+    params.append(f"%{location_term}%")
+    params.append(limit)
+
+    sql = (
+        f"SELECT DISTINCT {aliases[0]}.media_id AS media_id, {aliases[0]}.date_taken AS date_taken "
+        f"FROM v_person_photos {aliases[0]} "
+        f"{' '.join(joins)} "
+        f"JOIN v_photos_with_location l ON l.media_id = {aliases[0]}.media_id "
+        f"WHERE {where_people} AND l.place_label LIKE ? "
+        "ORDER BY date_taken DESC "
+        "LIMIT ?"
+    )
+
+    async with get_db() as db:
+        rows = await db.execute_fetchall(sql, tuple(params))
+    return [int(r["media_id"]) for r in rows]
+
+
 async def _count_photos_of_people(plan: AssistantPlan, state: AssistantState) -> ExecutionResult:
     people = _people_from_plan(plan, state)
     if not people:
@@ -261,6 +292,41 @@ async def _show_photos_of_people(plan: AssistantPlan, state: AssistantState, lim
         "action_payload": {"query": plan.query or f"show photos of {' with '.join(people)}"},
         "intent": "SQL_ONLY",
         "explanation": "Deterministic people-set retrieval",
+    }
+    return ExecutionResult(payload=payload, state=new_state)
+
+
+async def _show_photos_of_people_in_location(plan: AssistantPlan, state: AssistantState, limit: int) -> ExecutionResult:
+    people = _people_from_plan(plan, state)
+    location_term = (plan.location_term or "").strip()
+    if not people or not location_term:
+        return await _natural_fallback(plan.query or state.last_user_query or "", state, limit)
+
+    media_ids = await _media_ids_for_people_in_location(people, location_term, limit)
+    if not media_ids:
+        subject = " and ".join(people)
+        payload = {
+            "reply_text": f"I couldn't find photos of {subject} from {location_term}.",
+            "results": [],
+            "count": 0,
+            "action": "none",
+            "action_payload": {},
+        }
+        return ExecutionResult(payload=payload, state=state)
+
+    results = await _hydrate_media_rows(media_ids, sql_matched_ids=set(media_ids))
+    new_state = state.model_copy(deep=True)
+    new_state.last_people = people
+    new_state.last_media_ids = media_ids
+    new_state.last_operation = plan.operation
+    payload = {
+        "reply_text": f"I found {len(results)} matching photo{'s' if len(results) != 1 else ''} from {location_term}. Results are loaded below.",
+        "results": results,
+        "count": len(results),
+        "action": "open_search",
+        "action_payload": {"query": plan.query or f"show photos of {' with '.join(people)} from {location_term}"},
+        "intent": "SQL_ONLY",
+        "explanation": "Deterministic people+location retrieval",
     }
     return ExecutionResult(payload=payload, state=new_state)
 
@@ -536,19 +602,20 @@ async def _list_locations(plan: AssistantPlan, state: AssistantState) -> Executi
     async with get_db() as db:
         rows = await db.execute_fetchall(
             """
-            SELECT DISTINCT l.place_label
+                        SELECT l.place_label, COUNT(DISTINCT l.media_id) AS photo_count
             FROM v_photos_with_location l
             JOIN v_person_photos p ON p.media_id = l.media_id
             WHERE p.person_name LIKE ?
               AND l.place_label IS NOT NULL
               AND l.place_label != ''
-            ORDER BY l.place_label COLLATE NOCASE ASC
+                        GROUP BY l.place_label
+                        ORDER BY photo_count DESC, l.place_label COLLATE NOCASE ASC
             LIMIT 200
             """,
             (f"%{person}%",),
         )
 
-    labels = [str(r["place_label"]) for r in rows]
+        labels = [str(r["place_label"]) for r in rows]
     if not labels:
         payload = {
             "reply_text": f"I couldn't find tagged locations for {person}.",
@@ -559,10 +626,10 @@ async def _list_locations(plan: AssistantPlan, state: AssistantState) -> Executi
         }
         return ExecutionResult(payload=payload, state=state)
 
-    preview = ", ".join(labels[:15])
+    preview = ", ".join(f"{str(r['place_label'])} ({int(r['photo_count'])})" for r in rows[:15])
     suffix = "" if len(labels) <= 15 else f" (+{len(labels)-15} more)"
     payload = {
-        "reply_text": f"I found {len(labels)} locations for {person}: {preview}{suffix}",
+        "reply_text": f"Top locations for {person} ({len(labels)} total): {preview}{suffix}",
         "results": [],
         "count": 0,
         "action": "none",

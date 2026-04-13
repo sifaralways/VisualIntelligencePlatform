@@ -19,7 +19,7 @@ Return JSON only, no markdown fences.
 
 Output JSON schema:
 {
-    "operation": "COUNT_INDEXED_PHOTOS" | "COUNT_NAMED_FACES" | "COUNT_NAMED_PEOPLE" | "COUNT_PHOTOS_OF_PEOPLE" | "COUNT_PEOPLE_WITH_PERSON" | "SHOW_PHOTOS_OF_PEOPLE" | "LIST_OTHER_PEOPLE_IN_PHOTOS_OF_PEOPLE" | "LIST_OTHER_PEOPLE_IN_LAST_RESULTS" | "LIST_BEST_FRIENDS" | "LIST_COMMON_CONTACTS" | "LIST_LOCATIONS" | "LAST_LOCATION" | "FIRST_LOCATION" | "TIMELINE_LOCATIONS" | "LIST_PEOPLE_WITH_PERSON_IN_LOCATION_TIME" | "LIST_LOCATIONS_FOR_LAST_RESULTS" | "FOLLOWUP_SHOW_LAST_RESULTS" | "NATURAL_SEARCH",
+    "operation": "COUNT_INDEXED_PHOTOS" | "COUNT_NAMED_FACES" | "COUNT_NAMED_PEOPLE" | "COUNT_PHOTOS_OF_PEOPLE" | "COUNT_PEOPLE_WITH_PERSON" | "SHOW_PHOTOS_OF_PEOPLE" | "SHOW_PHOTOS_OF_PEOPLE_IN_LOCATION" | "LIST_OTHER_PEOPLE_IN_PHOTOS_OF_PEOPLE" | "LIST_OTHER_PEOPLE_IN_LAST_RESULTS" | "LIST_BEST_FRIENDS" | "LIST_COMMON_CONTACTS" | "LIST_LOCATIONS" | "LAST_LOCATION" | "FIRST_LOCATION" | "TIMELINE_LOCATIONS" | "LIST_PEOPLE_WITH_PERSON_IN_LOCATION_TIME" | "LIST_LOCATIONS_FOR_LAST_RESULTS" | "FOLLOWUP_SHOW_LAST_RESULTS" | "NATURAL_SEARCH",
   "people": string[],
   "person": string | null,
   "person_a": string | null,
@@ -47,6 +47,7 @@ Rules:
 - "who else do they appear with in those photos" => LIST_OTHER_PEOPLE_IN_LAST_RESULTS.
 - "how many photos of X [with Y...]" => COUNT_PHOTOS_OF_PEOPLE.
 - "show photos of X [with Y...]" => SHOW_PHOTOS_OF_PEOPLE.
+- "show photos of X from/in/near PLACE" => SHOW_PHOTOS_OF_PEOPLE_IN_LOCATION and set location_term.
 - For phrases like "at least N other people", set min_other_people=N.
 - Use NATURAL_SEARCH only for broad visual semantics where deterministic ops do not fit.
 """.strip()
@@ -193,7 +194,19 @@ Rules:
 
     def _people_photo_plan(self, message: str, lowered: str, state: AssistantState, limit: int) -> AssistantPlan | None:
         min_other = self._extract_min_other_people(lowered)
+
         people = self._extract_people(message, state)
+
+        location_term = self._extract_location_term(message)
+        if location_term and (people or state.last_people):
+            resolved_people = people or state.last_people
+            return AssistantPlan(
+                operation="SHOW_PHOTOS_OF_PEOPLE_IN_LOCATION",
+                people=resolved_people,
+                location_term=location_term,
+                limit=limit,
+                explanation="Show photos of people in location",
+            )
 
         if re.search(r"show|open|load", lowered) and people:
             return AssistantPlan(
@@ -229,6 +242,25 @@ Rules:
             return AssistantPlan(operation=op, people=merged, limit=limit, explanation="With-followup merge")
         return None
 
+    @staticmethod
+    def _extract_location_term(message: str) -> str | None:
+        patterns = [
+            r"\bfrom\s+([^?.!,]+)",
+            r"\bin\s+([^?.!,]+)",
+            r"\bnear\s+([^?.!,]+)",
+            r"\bby\s+the\s+([^?.!,]+)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, message, flags=re.IGNORECASE)
+            if not m:
+                continue
+            raw = m.group(1).strip().strip("'\"")
+            # Trim common trailing tokens that indicate a new clause.
+            raw = re.split(r"\s+(?:with|and|where|that|which)\b", raw, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+            if raw:
+                return raw
+        return None
+
     def _parse_json(self, content: str) -> dict:
         text = content.strip()
         if text.startswith("```"):
@@ -246,6 +278,12 @@ Rules:
 
     @staticmethod
     def _extract_people(message: str, state: AssistantState) -> list[str]:
+        # Check for "his/her/their photos from/of [location/name]"
+        m_pronoun = re.search(r"\b(?:his|her|their)\s+photos?\b", message, flags=re.IGNORECASE)
+        if m_pronoun and state.last_people:
+            # Extract person from context when pronoun is used
+            return [state.last_people[0]]
+
         m = re.search(r"photos?\s+of\s+(.+)$", message, flags=re.IGNORECASE)
         if m:
             tail = m.group(1).strip().rstrip("?.!")
