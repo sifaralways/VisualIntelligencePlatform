@@ -1,13 +1,17 @@
 """VIP API — Search routes."""
 
 import asyncio
+import json
 import logging
 import os
+import re
 from fastapi import APIRouter
 from pydantic import BaseModel
 from typing import Optional
 import numpy as np
+import httpx
 
+from backend.config import settings
 from backend.database.db import get_db
 from backend.ml.clip_index import ClipFaissIndex
 from backend.ml.query_router import QueryRouter, OllamaUnavailableError
@@ -17,6 +21,59 @@ router = APIRouter()
 _query_router = QueryRouter()
 _clip_index = ClipFaissIndex()
 logger = logging.getLogger(__name__)
+
+
+_SQL_REPAIR_SYSTEM_PROMPT = """
+You repair SQLite SELECT queries for a photo search engine.
+Return JSON only, no markdown fences.
+
+Output schema:
+{
+    "sql": string,
+    "explanation": string
+}
+
+Hard constraints:
+- Output one read-only SELECT/WITH query only.
+- Query must be SQLite compatible.
+- Query must return a column named media_id.
+- No INSERT/UPDATE/DELETE/ALTER/DROP/PRAGMA/ATTACH.
+
+Preferred views:
+- v_photo_full_context(media_id, ...)
+- v_person_photos(person_name, media_id, ...)
+- v_photo_persons_agg(media_id, person_count, person_names, ...)
+- v_photo_tags_flat(media_id, category, label, ...)
+- v_photos_with_location(media_id, place_label, ...)
+- v_photos_active(media_id, ...)
+
+Use LIKE '%name%' for person matching instead of exact equality.
+""".strip()
+
+
+_CONFIDENCE_MIN_EXECUTE = 0.25
+_CONFIDENCE_LOW = 0.45
+_QUERY_STOPWORDS = {
+    "show",
+    "me",
+    "photos",
+    "photo",
+    "images",
+    "image",
+    "with",
+    "from",
+    "in",
+    "of",
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "to",
+    "for",
+    "by",
+    "on",
+}
 
 
 class SearchRequest(BaseModel):
@@ -173,6 +230,218 @@ async def _execute_router_sql(sql: str, limit: int) -> tuple[list[int], str | No
     return deduped, None
 
 
+def _parse_llm_json(content: str) -> dict:
+    text = (content or "").strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+async def _repair_router_sql(original_sql: str, user_query: str, sql_error: str) -> str | None:
+    payload = {
+        "model": settings.ollama_model,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": _SQL_REPAIR_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "user_query": user_query,
+                        "failed_sql": original_sql,
+                        "execution_error": sql_error,
+                    }
+                ),
+            },
+        ],
+        "options": {"temperature": 0.0},
+    }
+    url = f"{settings.ollama_base_url.rstrip('/')}/api/chat"
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(url, json=payload)
+            response.raise_for_status()
+    except Exception as exc:
+        logger.warning("SQL repair unavailable: %s", exc)
+        return None
+
+    content = ((response.json().get("message") or {}).get("content") or "").strip()
+    parsed = _parse_llm_json(content)
+    repaired_sql = _query_router._sanitize_sql(parsed.get("sql"))
+    if not repaired_sql:
+        return None
+    if repaired_sql.strip() == (original_sql or "").strip():
+        return None
+    return repaired_sql
+
+
+async def _execute_router_sql_with_retry(sql: str, limit: int, user_query: str) -> tuple[list[int], str | None, bool]:
+    media_ids, sql_error = await _execute_router_sql(sql, limit)
+    if not sql_error:
+        return media_ids, None, False
+
+    repaired_sql = await _repair_router_sql(sql, user_query, sql_error)
+    if not repaired_sql:
+        return [], sql_error, False
+
+    media_ids, repair_error = await _execute_router_sql(repaired_sql, limit)
+    if repair_error:
+        return [], repair_error, False
+    return media_ids, None, True
+
+
+def _estimate_sql_plan_confidence(query: str, sql: str | None, intent: str) -> tuple[float, list[str]]:
+    if intent == "CLIP_ONLY":
+        return 1.0, ["clip_only"]
+    if not sql:
+        return 0.0, ["missing_sql"]
+
+    score = 1.0
+    reasons: list[str] = []
+    sql_norm = " ".join(sql.lower().split())
+
+    if " media_id" not in f" {sql_norm} ":
+        score -= 0.5
+        reasons.append("missing_media_id_projection")
+    if " where " not in f" {sql_norm} ":
+        score -= 0.2
+        reasons.append("no_where_clause")
+    if re.search(r"\bperson_name\s*=\s*'", sql_norm):
+        score -= 0.25
+        reasons.append("exact_person_name_match")
+    if re.search(r"\blimit\s+\d+", sql_norm) is None:
+        score -= 0.1
+        reasons.append("no_limit_clause")
+    if any(token in sql_norm for token in ("pragma", "attach", "drop", "alter", "delete", "update", "insert")):
+        score = 0.0
+        reasons.append("forbidden_token_present")
+
+    if any(name in query.lower() for name in ("akshat", "aditi", "maryam", "gordon")) and " like " not in f" {sql_norm} ":
+        score -= 0.15
+        reasons.append("person_query_without_like")
+
+    return max(0.0, min(score, 1.0)), reasons
+
+
+def _tokenize_query_for_safe_search(query: str) -> list[str]:
+    parts = re.findall(r"[A-Za-z0-9][A-Za-z0-9'_-]*", (query or ""))
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        token = part.strip("'\"").lower()
+        if len(token) < 3 or token in _QUERY_STOPWORDS:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        tokens.append(token)
+    return tokens[:8]
+
+
+async def _safe_broad_media_ids(query: str, limit: int) -> list[int]:
+    tokens = _tokenize_query_for_safe_search(query)
+    if not tokens:
+        return []
+
+    where_parts: list[str] = []
+    params: list[object] = []
+    for token in tokens:
+        where_parts.append(
+            "(" 
+            "COALESCE(file_path, '') LIKE ? OR "
+            "COALESCE(persons, '') LIKE ? OR "
+            "COALESCE(objects, '') LIKE ? OR "
+            "COALESCE(places, '') LIKE ? OR "
+            "COALESCE(animals, '') LIKE ? OR "
+            "COALESCE(scenes, '') LIKE ?"
+            ")"
+        )
+        like = f"%{token}%"
+        params.extend([like, like, like, like, like, like])
+
+    sql = (
+        "SELECT media_id FROM v_photo_full_context "
+        f"WHERE {' AND '.join(where_parts)} "
+        "ORDER BY date_taken DESC "
+        "LIMIT ?"
+    )
+    params.append(max(1, min(limit, 200)))
+
+    async with get_db() as db:
+        rows = await db.execute_fetchall(sql, tuple(params))
+    return [int(r["media_id"]) for r in rows if r.get("media_id") is not None]
+
+
+async def _safe_fallback_results(query: str, limit: int) -> list[dict]:
+    fallback_ids = await _safe_broad_media_ids(query, limit)
+    return await _hydrate_media_rows(fallback_ids, sql_matched_ids=set(fallback_ids))
+
+
+def _confidence_meta(confidence: float, reasons: list[str], fallback_used: bool) -> dict:
+    return {
+        "confidence": confidence,
+        "confidence_reasons": reasons,
+        "fallback_used": fallback_used,
+    }
+
+
+def _maybe_mark_repaired_explanation(explanation: str, repaired: bool) -> str:
+    return f"{explanation} (auto-repaired SQL)" if repaired else explanation
+
+
+async def _hybrid_safe_fallback_response(plan_explanation: str, query: str, limit: int, confidence: float, reasons: list[str]) -> dict:
+    fallback_results = await _safe_fallback_results(query, limit)
+    out = {
+        "intent": "HYBRID",
+        "explanation": f"{plan_explanation} (low SQL confidence; safe fallback used)",
+        "results": fallback_results,
+        "count": len(fallback_results),
+    }
+    out.update(_confidence_meta(confidence, reasons, True))
+    return out
+
+
+async def _hybrid_invalid_sql_response(plan_explanation: str, query: str, limit: int, confidence: float, reasons: list[str]) -> dict:
+    fallback_results = await _safe_fallback_results(query, limit)
+    out = {
+        "intent": "HYBRID",
+        "explanation": f"{plan_explanation} (planner SQL was invalid)",
+        "results": fallback_results,
+        "count": len(fallback_results),
+        "error": "invalid_sql_plan",
+    }
+    if fallback_results:
+        out["explanation"] = f"{plan_explanation} (planner SQL was invalid; safe fallback used)"
+    out.update(_confidence_meta(confidence, reasons, bool(fallback_results)))
+    return out
+
+
+async def _hybrid_no_candidates_response(plan_explanation: str, query: str, limit: int, confidence: float, reasons: list[str]) -> dict:
+    out = {
+        "intent": "HYBRID",
+        "explanation": plan_explanation,
+        "results": [],
+        "count": 0,
+    }
+    if confidence < _CONFIDENCE_LOW:
+        fallback_results = await _safe_fallback_results(query, limit)
+        if fallback_results:
+            out["results"] = fallback_results
+            out["count"] = len(fallback_results)
+            out["explanation"] = f"{plan_explanation} (low-confidence SQL produced no rows; safe fallback used)"
+            out.update(_confidence_meta(confidence, reasons, True))
+            return out
+    out.update(_confidence_meta(confidence, reasons, False))
+    return out
+
+
 def _extract_media_ids_from_rows(payloads: list[dict]) -> list[int]:
     media_ids: list[int] = []
     for payload in payloads:
@@ -283,32 +552,65 @@ async def natural_search(req: NaturalSearchRequest):
             "error": "ollama_unavailable",
         }
 
+    confidence, reasons = _estimate_sql_plan_confidence(query, plan.sql, plan.intent)
+
     if plan.intent == "SQL_ONLY" and plan.sql:
-        return await _natural_sql_only(plan, limit)
+        return await _natural_sql_only(plan, query, limit, confidence, reasons)
 
     if plan.intent == "CLIP_ONLY":
         return await _natural_clip_only(plan, query, limit)
 
-    return await _natural_hybrid(plan, query, limit)
+    return await _natural_hybrid(plan, query, limit, confidence, reasons)
 
 
-async def _natural_sql_only(plan, limit: int) -> dict:
-    media_ids, sql_error = await _execute_router_sql(plan.sql, limit)
+async def _natural_sql_only(plan, query: str, limit: int, confidence: float, reasons: list[str]) -> dict:
+    if confidence < _CONFIDENCE_MIN_EXECUTE:
+        fallback_results = await _safe_fallback_results(query, limit)
+        out = {
+            "intent": "SQL_ONLY",
+            "explanation": f"{plan.explanation} (low SQL confidence; safe fallback used)",
+            "results": fallback_results,
+            "count": len(fallback_results),
+        }
+        out.update(_confidence_meta(confidence, reasons, True))
+        return out
+
+    media_ids, sql_error, repaired = await _execute_router_sql_with_retry(plan.sql, limit, query)
     if sql_error:
-        return {
+        fallback_results = await _safe_fallback_results(query, limit)
+        out = {
             "intent": "SQL_ONLY",
             "explanation": f"{plan.explanation} (planner SQL was invalid)",
-            "results": [],
-            "count": 0,
+            "results": fallback_results,
+            "count": len(fallback_results),
             "error": "invalid_sql_plan",
         }
+        if fallback_results:
+            out["explanation"] = f"{plan.explanation} (planner SQL was invalid; safe fallback used)"
+        out.update(_confidence_meta(confidence, reasons, bool(fallback_results)))
+        return out
+
     results = await _hydrate_media_rows(media_ids, sql_matched_ids=set(media_ids))
-    return {
+    if not results and confidence < _CONFIDENCE_LOW:
+        fallback_results = await _safe_fallback_results(query, limit)
+        if fallback_results:
+            out = {
+                "intent": "SQL_ONLY",
+                "explanation": f"{plan.explanation} (low-confidence SQL produced no rows; safe fallback used)",
+                "results": fallback_results,
+                "count": len(fallback_results),
+            }
+            out.update(_confidence_meta(confidence, reasons, True))
+            return out
+
+    out = {
         "intent": "SQL_ONLY",
-        "explanation": plan.explanation,
+        "explanation": _maybe_mark_repaired_explanation(plan.explanation, repaired),
         "results": results,
         "count": len(results),
     }
+    out.update(_confidence_meta(confidence, reasons, False))
+    return out
 
 
 async def _natural_clip_only(plan, query: str, limit: int) -> dict:
@@ -343,26 +645,20 @@ async def _natural_clip_only(plan, query: str, limit: int) -> dict:
     }
 
 
-async def _natural_hybrid(plan, query: str, limit: int) -> dict:
+async def _natural_hybrid(plan, query: str, limit: int, confidence: float, reasons: list[str]) -> dict:
     candidate_ids = []
+    if confidence < _CONFIDENCE_MIN_EXECUTE:
+        return await _hybrid_safe_fallback_response(plan.explanation, query, limit, confidence, reasons)
+
     if plan.sql:
-        candidate_ids, sql_error = await _execute_router_sql(plan.sql, max(limit * 4, 120))
+        candidate_ids, sql_error, repaired = await _execute_router_sql_with_retry(plan.sql, max(limit * 4, 120), query)
         if sql_error:
-            return {
-                "intent": "HYBRID",
-                "explanation": f"{plan.explanation} (planner SQL was invalid)",
-                "results": [],
-                "count": 0,
-                "error": "invalid_sql_plan",
-            }
+            return await _hybrid_invalid_sql_response(plan.explanation, query, limit, confidence, reasons)
+        if repaired:
+            plan.explanation = f"{plan.explanation} (auto-repaired SQL)"
 
     if not candidate_ids:
-        return {
-            "intent": "HYBRID",
-            "explanation": plan.explanation,
-            "results": [],
-            "count": 0,
-        }
+        return await _hybrid_no_candidates_response(plan.explanation, query, limit, confidence, reasons)
 
     clip_text = plan.clip_description or query
     text_vec = await _encode_text_clip(clip_text, None)
@@ -405,9 +701,11 @@ async def _natural_hybrid(plan, query: str, limit: int) -> dict:
         clip_scores=clip_scores,
         sql_matched_ids=set(candidate_ids),
     )
-    return {
+    out = {
         "intent": "HYBRID",
         "explanation": plan.explanation,
         "results": results,
         "count": len(results),
     }
+    out.update(_confidence_meta(confidence, reasons, False))
+    return out

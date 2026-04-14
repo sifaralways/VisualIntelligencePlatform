@@ -575,10 +575,21 @@ export interface ChatTopPerson {
   photo_count: number
 }
 
+export interface ChatFaceResult {
+  face_id: number
+  media_id: number
+  cluster_id?: number | null
+  file_path: string
+  date_taken: string | null
+  detection_conf: number
+}
+
 export interface ChatResponse {
   conversation_id: string
   reply_text: string
   results: NaturalSearchResult[]
+  face_results?: ChatFaceResult[]
+  face_total_count?: number
   count: number
   action: 'none' | 'open_search'
   action_payload: ChatActionPayload
