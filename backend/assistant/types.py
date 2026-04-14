@@ -5,6 +5,8 @@ from pydantic import BaseModel, Field
 
 
 Operation = Literal[
+    "LIST_CAPABILITIES",
+    "SHOW_UNNAMED_FACES",
     "COUNT_INDEXED_PHOTOS",
     "COUNT_NAMED_FACES",
     "COUNT_NAMED_PEOPLE",
@@ -45,4 +47,5 @@ class AssistantState(BaseModel):
     last_user_query: str | None = None
     last_operation: str | None = None
     last_people: list[str] = Field(default_factory=list)
+    last_location_term: str | None = None
     last_media_ids: list[int] = Field(default_factory=list)

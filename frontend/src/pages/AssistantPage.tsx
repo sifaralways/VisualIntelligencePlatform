@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { api } from '../api/client'
-import type { ChatResponse, NaturalSearchResult } from '../api/client'
+import type { ChatFaceResult, ChatResponse, NaturalSearchResult, Person } from '../api/client'
 import PhotoDetail from '../components/PhotoDetail'
 
 interface AssistantPageProps {
@@ -24,6 +24,82 @@ export default function AssistantPage({ onOpenSearch }: AssistantPageProps) {
   ])
   const [lastResponse, setLastResponse] = useState<ChatResponse | null>(null)
   const [selected, setSelected] = useState<NaturalSearchResult | null>(null)
+  const [namingFace, setNamingFace] = useState<ChatFaceResult | null>(null)
+  const [nameInput, setNameInput] = useState('')
+  const [knownPersons, setKnownPersons] = useState<Person[]>([])
+  const [knownPersonsLoaded, setKnownPersonsLoaded] = useState(false)
+  const [faceActionBusy, setFaceActionBusy] = useState(false)
+  const [faceActionMessage, setFaceActionMessage] = useState<string>('')
+
+  async function ensureKnownPersonsLoaded(): Promise<Person[]> {
+    if (knownPersonsLoaded) return knownPersons
+    const list = await api.persons.list()
+    setKnownPersons(list)
+    setKnownPersonsLoaded(true)
+    return list
+  }
+
+  function removeResolvedFaceResults(face: ChatFaceResult) {
+    setLastResponse(prev => {
+      if (!prev?.face_results?.length) return prev
+      const nextFaceResults = prev.face_results.filter(f => {
+        if (face.cluster_id != null) return f.cluster_id !== face.cluster_id
+        return f.face_id !== face.face_id
+      })
+      return {
+        ...prev,
+        face_results: nextFaceResults,
+        count: nextFaceResults.length,
+      }
+    })
+  }
+
+  async function handleIgnoreAlways(face: ChatFaceResult) {
+    if (face.cluster_id == null) {
+      setFaceActionMessage('This face is not in a cluster, so Ignore Always is unavailable.')
+      return
+    }
+    setFaceActionBusy(true)
+    try {
+      await api.clusters.ignore(face.cluster_id)
+      removeResolvedFaceResults(face)
+      setFaceActionMessage('Ignored this face cluster. It will be hidden from unnamed faces.')
+    } catch (e: any) {
+      setFaceActionMessage(String(e?.message || e || 'Failed to ignore face cluster'))
+    } finally {
+      setFaceActionBusy(false)
+    }
+  }
+
+  async function handleConfirmName() {
+    if (!namingFace) return
+    const name = nameInput.trim()
+    if (!name) return
+    setFaceActionBusy(true)
+    try {
+      const persons = await ensureKnownPersonsLoaded()
+      const existing = persons.find(p => p.name?.toLowerCase() === name.toLowerCase())
+
+      if (namingFace.cluster_id != null) {
+        if (existing) {
+          await api.persons.addCluster(existing.id, namingFace.cluster_id)
+        } else {
+          await api.persons.fromCluster(namingFace.cluster_id, name)
+        }
+      } else {
+        await api.persons.assignFace(namingFace.face_id, name)
+      }
+      removeResolvedFaceResults(namingFace)
+      setNamingFace(null)
+      setNameInput('')
+      setKnownPersonsLoaded(false)
+      setFaceActionMessage(`Assigned name '${name}' successfully.`)
+    } catch (e: any) {
+      setFaceActionMessage(String(e?.message || e || 'Failed to assign name'))
+    } finally {
+      setFaceActionBusy(false)
+    }
+  }
 
   async function sendMessage() {
     const message = input.trim()
@@ -100,9 +176,84 @@ export default function AssistantPage({ onOpenSearch }: AssistantPageProps) {
 
       {lastResponse && (
         <p className="text-xs text-gray-500">
-          {lastResponse.count} result{lastResponse.count !== 1 ? 's' : ''}
+          {lastResponse.face_results?.length
+            ? (
+                lastResponse.face_total_count && lastResponse.face_total_count > lastResponse.face_results.length
+                  ? `Showing ${lastResponse.face_results.length} of ${lastResponse.face_total_count} unnamed face thumbnails`
+                  : `${lastResponse.face_results.length} unnamed face thumbnail${lastResponse.face_results.length !== 1 ? 's' : ''}`
+              )
+            : `${lastResponse.count} result${lastResponse.count !== 1 ? 's' : ''}`}
           {lastResponse.intent ? ` • Route: ${lastResponse.intent}` : ''}
         </p>
+      )}
+
+      {faceActionMessage && (
+        <p className="text-xs text-indigo-300">{faceActionMessage}</p>
+      )}
+
+      {lastResponse?.face_results?.length ? (
+        <div>
+          <p className="text-xs text-gray-400 mb-2">Unnamed faces</p>
+          <div className="grid grid-cols-[repeat(auto-fill,minmax(110px,1fr))] gap-1.5">
+            {lastResponse.face_results.map(f => (
+              <AssistantFaceTile
+                key={f.face_id}
+                face={f}
+                disabled={faceActionBusy}
+                onPreview={() => setSelected({
+                  media_id: f.media_id,
+                  file_path: f.file_path,
+                  date_taken: f.date_taken,
+                  persons: [],
+                  tags: [],
+                })}
+                onName={() => {
+                  void ensureKnownPersonsLoaded()
+                  setNamingFace(f)
+                  setNameInput('')
+                }}
+                onIgnore={() => { void handleIgnoreAlways(f) }}
+              />
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      {namingFace && (
+        <div className="rounded-lg border border-gray-700 bg-gray-900/80 p-3 space-y-2">
+          <p className="text-xs text-gray-300">Name this unnamed face</p>
+          <input
+            value={nameInput}
+            onChange={e => setNameInput(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && void handleConfirmName()}
+            placeholder="Enter person name"
+            list="assistant-known-persons"
+            className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white outline-none focus:border-indigo-500"
+          />
+          <datalist id="assistant-known-persons">
+            {knownPersons
+              .filter(p => !!p.name)
+              .map(p => (
+                <option key={p.id} value={p.name!} />
+              ))}
+          </datalist>
+          <div className="flex gap-2">
+            <button
+              onClick={() => void handleConfirmName()}
+              disabled={faceActionBusy || !nameInput.trim()}
+              className="text-xs bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded px-2.5 py-1"
+            >
+              Save Name
+            </button>
+            <button
+              onClick={() => { setNamingFace(null); setNameInput('') }}
+              disabled={faceActionBusy}
+              className="text-xs bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-gray-200 rounded px-2.5 py-1"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
       )}
 
       {lastResponse?.results?.length ? (
@@ -120,6 +271,70 @@ export default function AssistantPage({ onOpenSearch }: AssistantPageProps) {
           onClose={() => setSelected(null)}
         />
       )}
+    </div>
+  )
+}
+
+function AssistantFaceTile({
+  face,
+  disabled,
+  onPreview,
+  onName,
+  onIgnore,
+}: {
+  face: ChatFaceResult
+  disabled?: boolean
+  onPreview: () => void
+  onName: () => void
+  onIgnore: () => void
+}) {
+  const [errored, setErrored] = useState(false)
+  const src = api.faces.thumbnailUrl(face.face_id)
+  const filename = face.file_path.split('/').pop() ?? ''
+  const date = face.date_taken ? face.date_taken.slice(0, 10) : null
+
+  return (
+    <div className="space-y-1">
+      <button
+        onClick={onPreview}
+        title={`${filename}${date ? `  •  ${date}` : ''}`}
+        className="relative aspect-square w-full bg-gray-900 rounded overflow-hidden group transition-all focus:outline-none hover:ring-2 hover:ring-indigo-400 focus:ring-2 focus:ring-indigo-400"
+      >
+        {errored ? (
+          <div className="absolute inset-0 flex flex-col items-center justify-center text-gray-600 gap-1">
+            <span className="text-xl">🙂</span>
+            <span className="text-[10px] truncate px-1 max-w-full">Face #{face.face_id}</span>
+          </div>
+        ) : (
+          <img
+            src={src}
+            alt={`Face ${face.face_id}`}
+            loading="lazy"
+            onError={() => setErrored(true)}
+            className="w-full h-full object-cover transition-transform duration-200 group-hover:scale-105"
+          />
+        )}
+        <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/40 to-transparent p-1 opacity-0 group-hover:opacity-100 transition-opacity">
+          <p className="text-white text-[10px] truncate">{filename}</p>
+        </div>
+      </button>
+      <div className="grid grid-cols-2 gap-1">
+        <button
+          onClick={onName}
+          disabled={disabled}
+          className="text-[10px] bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-gray-200 rounded px-1.5 py-1"
+        >
+          Name
+        </button>
+        <button
+          onClick={onIgnore}
+          disabled={disabled || face.cluster_id == null}
+          className="text-[10px] bg-red-900/70 hover:bg-red-800 disabled:opacity-30 text-red-100 rounded px-1.5 py-1"
+          title={face.cluster_id == null ? 'Ignore Always requires a clustered face' : 'Always ignore this cluster'}
+        >
+          Ignore Always
+        </button>
+      </div>
     </div>
   )
 }

@@ -19,7 +19,7 @@ Return JSON only, no markdown fences.
 
 Output JSON schema:
 {
-    "operation": "COUNT_INDEXED_PHOTOS" | "COUNT_NAMED_FACES" | "COUNT_NAMED_PEOPLE" | "COUNT_PHOTOS_OF_PEOPLE" | "COUNT_PEOPLE_WITH_PERSON" | "SHOW_PHOTOS_OF_PEOPLE" | "SHOW_PHOTOS_OF_PEOPLE_IN_LOCATION" | "LIST_OTHER_PEOPLE_IN_PHOTOS_OF_PEOPLE" | "LIST_OTHER_PEOPLE_IN_LAST_RESULTS" | "LIST_BEST_FRIENDS" | "LIST_COMMON_CONTACTS" | "LIST_LOCATIONS" | "LAST_LOCATION" | "FIRST_LOCATION" | "TIMELINE_LOCATIONS" | "LIST_PEOPLE_WITH_PERSON_IN_LOCATION_TIME" | "LIST_LOCATIONS_FOR_LAST_RESULTS" | "FOLLOWUP_SHOW_LAST_RESULTS" | "NATURAL_SEARCH",
+    "operation": "LIST_CAPABILITIES" | "SHOW_UNNAMED_FACES" | "COUNT_INDEXED_PHOTOS" | "COUNT_NAMED_FACES" | "COUNT_NAMED_PEOPLE" | "COUNT_PHOTOS_OF_PEOPLE" | "COUNT_PEOPLE_WITH_PERSON" | "SHOW_PHOTOS_OF_PEOPLE" | "SHOW_PHOTOS_OF_PEOPLE_IN_LOCATION" | "LIST_OTHER_PEOPLE_IN_PHOTOS_OF_PEOPLE" | "LIST_OTHER_PEOPLE_IN_LAST_RESULTS" | "LIST_BEST_FRIENDS" | "LIST_COMMON_CONTACTS" | "LIST_LOCATIONS" | "LAST_LOCATION" | "FIRST_LOCATION" | "TIMELINE_LOCATIONS" | "LIST_PEOPLE_WITH_PERSON_IN_LOCATION_TIME" | "LIST_LOCATIONS_FOR_LAST_RESULTS" | "FOLLOWUP_SHOW_LAST_RESULTS" | "NATURAL_SEARCH",
   "people": string[],
   "person": string | null,
   "person_a": string | null,
@@ -33,6 +33,9 @@ Output JSON schema:
 }
 
 Rules:
+- "what can you do" / "how can you help" / "what commands do you understand" => LIST_CAPABILITIES.
+- "show unnamed/unidentified/unknown faces" => SHOW_UNNAMED_FACES.
+- "show unnamed faces in these/those photos" => SHOW_UNNAMED_FACES (scoped to previous result set).
 - For "show/them/those/show results" follow-ups, use FOLLOWUP_SHOW_LAST_RESULTS.
 - For "where were these photos clicked" or location follow-up over current result set, use LIST_LOCATIONS_FOR_LAST_RESULTS.
 - "best friends / most photographed with" => LIST_BEST_FRIENDS.
@@ -105,6 +108,10 @@ Rules:
         if simple is not None:
             return simple
 
+        unnamed_faces = self._unnamed_faces_plan(message, lowered, limit)
+        if unnamed_faces is not None:
+            return unnamed_faces
+
         location = self._location_plan(message, lowered, limit)
         if location is not None:
             return location
@@ -120,7 +127,17 @@ Rules:
         return AssistantPlan(operation="NATURAL_SEARCH", query=message, limit=limit, explanation="Fallback natural search")
 
     @staticmethod
+    def _unnamed_faces_plan(message: str, lowered: str, limit: int) -> AssistantPlan | None:
+        mentions_face = "face" in lowered or "faces" in lowered
+        mentions_unnamed = any(token in lowered for token in ("unnamed", "unidentified", "unknown"))
+        if not (mentions_face and mentions_unnamed):
+            return None
+        return AssistantPlan(operation="SHOW_UNNAMED_FACES", query=message, limit=limit, explanation="Show unnamed faces")
+
+    @staticmethod
     def _simple_count_or_followup_plan(lowered: str, limit: int) -> AssistantPlan | None:
+        if ("what can you do" in lowered or "how can you help" in lowered or "what command" in lowered and "understand" in lowered or lowered.strip() in {"help", "capabilities"}):
+            return AssistantPlan(operation="LIST_CAPABILITIES", limit=limit, explanation="Assistant capability overview")
         if re.fullmatch(r"(show|open|load)(\s+(them|those|results?))?", lowered):
             return AssistantPlan(operation="FOLLOWUP_SHOW_LAST_RESULTS", limit=limit, explanation="Follow-up show")
         if re.search(r"where\s+were\s+(these|those)\s+photos\s+(clicked|taken)", lowered):
