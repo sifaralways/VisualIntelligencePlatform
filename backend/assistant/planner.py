@@ -11,6 +11,9 @@ from backend.config import settings
 
 logger = logging.getLogger(__name__)
 
+PEOPLE_SPLIT_AND_COMMA = r"\s+and\s+|\s*,\s*"
+PEOPLE_SPLIT_WITH_AND_COMMA = r"\s+with\s+|\s+and\s+|\s*,\s*"
+
 
 class AssistantPlanner:
     _SYSTEM_PROMPT = """
@@ -28,7 +31,9 @@ Output JSON schema:
   "location_term": string | null,
     "year": number | null,
   "min_other_people": number | null,
+    "exact_people_only": boolean,
   "limit": number | null,
+    "offset": number | null,
   "explanation": string
 }
 
@@ -51,6 +56,7 @@ Rules:
 - "how many photos of X [with Y...]" => COUNT_PHOTOS_OF_PEOPLE.
 - "show photos of X [with Y...]" => SHOW_PHOTOS_OF_PEOPLE.
 - "show photos of X from/in/near PLACE" => SHOW_PHOTOS_OF_PEOPLE_IN_LOCATION and set location_term.
+- If the user says "only", "just", or "only with" for people-photo queries, set exact_people_only=true.
 - For phrases like "at least N other people", set min_other_people=N.
 - Use NATURAL_SEARCH only for broad visual semantics where deterministic ops do not fit.
 """.strip()
@@ -211,16 +217,19 @@ Rules:
 
     def _people_photo_plan(self, message: str, lowered: str, state: AssistantState, limit: int) -> AssistantPlan | None:
         min_other = self._extract_min_other_people(lowered)
+        exact_only = self._extract_exact_people_only(lowered)
 
         people = self._extract_people(message, state)
+        explicit_with_people = bool(re.search(r"\bonly\s+with\b|\bwith\b", lowered))
 
         location_term = self._extract_location_term(message)
-        if location_term and (people or state.last_people):
+        if location_term and (people or (state.last_people and not explicit_with_people)):
             resolved_people = people or state.last_people
             return AssistantPlan(
                 operation="SHOW_PHOTOS_OF_PEOPLE_IN_LOCATION",
                 people=resolved_people,
                 location_term=location_term,
+                exact_people_only=exact_only,
                 limit=limit,
                 explanation="Show photos of people in location",
             )
@@ -230,6 +239,7 @@ Rules:
                 operation="SHOW_PHOTOS_OF_PEOPLE",
                 people=people,
                 min_other_people=min_other,
+                exact_people_only=exact_only,
                 limit=limit,
                 explanation="Show photos of people",
             )
@@ -239,6 +249,7 @@ Rules:
                 operation="SHOW_PHOTOS_OF_PEOPLE",
                 people=people,
                 min_other_people=min_other,
+                exact_people_only=exact_only,
                 limit=limit,
                 explanation="Implicit show with min-people constraint",
             )
@@ -248,6 +259,7 @@ Rules:
                 operation="COUNT_PHOTOS_OF_PEOPLE",
                 people=people,
                 min_other_people=min_other,
+                exact_people_only=exact_only,
                 limit=limit,
                 explanation="Count photos of people",
             )
@@ -301,10 +313,24 @@ Rules:
             # Extract person from context when pronoun is used
             return [state.last_people[0]]
 
+        m_only_with = re.search(r"\bonly\s+with\s+(.+)$", message, flags=re.IGNORECASE)
+        if m_only_with:
+            tail = m_only_with.group(1).strip().rstrip("?.!")
+            tail = re.split(r"\s+from\s+|\s+in\s+|\s+near\s+|\s+at\s+", tail, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+            parts = re.split(PEOPLE_SPLIT_AND_COMMA, tail, flags=re.IGNORECASE)
+            return [p.strip().strip("'\"") for p in parts if p.strip()]
+
         m = re.search(r"photos?\s+of\s+(.+)$", message, flags=re.IGNORECASE)
         if m:
             tail = m.group(1).strip().rstrip("?.!")
-            parts = re.split(r"\s+with\s+|\s+and\s+|\s*,\s*", tail, flags=re.IGNORECASE)
+            parts = re.split(PEOPLE_SPLIT_WITH_AND_COMMA, tail, flags=re.IGNORECASE)
+            return [p.strip().strip("'\"") for p in parts if p.strip()]
+
+        m_with = re.search(r"\bphotos?.*\bwith\s+(.+)$", message, flags=re.IGNORECASE)
+        if m_with:
+            tail = m_with.group(1).strip().rstrip("?.!")
+            tail = re.split(r"\s+from\s+|\s+in\s+|\s+near\s+|\s+at\s+", tail, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+            parts = re.split(PEOPLE_SPLIT_AND_COMMA, tail, flags=re.IGNORECASE)
             return [p.strip().strip("'\"") for p in parts if p.strip()]
 
         m_pos = re.search(r"([A-Za-z][A-Za-z\s\-']{1,40})'s\s+photos?", message)
@@ -314,7 +340,7 @@ Rules:
 
         m2 = re.search(r"^\s*(and\s+)?with\s+(.+)$", message, flags=re.IGNORECASE)
         if m2 and state.last_people:
-            extras = [p.strip() for p in re.split(r"\s+and\s+|\s*,\s*", m2.group(2).strip()) if p.strip()]
+            extras = [p.strip() for p in re.split(PEOPLE_SPLIT_AND_COMMA, m2.group(2).strip()) if p.strip()]
             return AssistantPlanner._merge_people(state.last_people, extras)
 
         return []
@@ -324,7 +350,7 @@ Rules:
         m = re.search(r"^\s*(and\s+)?with\s+(.+)$", message, flags=re.IGNORECASE)
         if not m:
             return []
-        return [p.strip() for p in re.split(r"\s+and\s+|\s*,\s*", m.group(2).strip()) if p.strip()]
+        return [p.strip() for p in re.split(PEOPLE_SPLIT_AND_COMMA, m.group(2).strip()) if p.strip()]
 
     @staticmethod
     def _merge_people(base: list[str], extras: list[str]) -> list[str]:
@@ -342,6 +368,10 @@ Rules:
         if not m:
             return None
         return max(0, min(int(m.group(1)), 100))
+
+    @staticmethod
+    def _extract_exact_people_only(lowered: str) -> bool:
+        return bool(re.search(r"\bonly\b|\bjust\b", lowered))
 
     @staticmethod
     def _extract_primary_person(message: str, state: AssistantState) -> str | None:

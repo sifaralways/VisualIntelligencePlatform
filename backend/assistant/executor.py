@@ -4,13 +4,15 @@ import asyncio
 import re
 from dataclasses import dataclass
 
-from backend.assistant.types import AssistantPlan, AssistantState
+from backend.assistant.types import AssistantPlan, AssistantState, PendingPersonClarification
 from backend.api.routes.search import NaturalSearchRequest, natural_search, _hydrate_media_rows
 from backend.database.db import get_db
 
 
 SQL_AND = " AND "
 PERSON_JOINER = " and "
+EXACT_PEOPLE_COUNT_CLAUSE = " AND agg.person_count = ?"
+PERSON_SELECTION_SPLIT = r"\s*,\s*|\s+and\s+"
 PERSON_SCOPE_STOPWORDS = {
     "show",
     "me",
@@ -105,6 +107,205 @@ def _clean_person_candidate(text: str) -> str:
     return " ".join(tokens).strip("'\" ")
 
 
+def _normalized_person_key(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip()).lower()
+
+
+def _person_equals_sql(column: str) -> str:
+    return f"LOWER({column}) = LOWER(?)"
+
+
+def _person_not_equals_sql(column: str) -> str:
+    return f"LOWER({column}) != LOWER(?)"
+
+
+def _person_tokens(text: str) -> list[str]:
+    return [token for token in re.findall(r"[A-Za-z0-9']+", (text or "").lower()) if token]
+
+
+async def _find_person_candidates(raw_name: str, limit: int = 8) -> list[str]:
+    cleaned = _clean_person_candidate(raw_name)
+    tokens = _person_tokens(cleaned)
+    if not cleaned or not tokens:
+        return []
+
+    token_clause = SQL_AND.join("LOWER(name) LIKE ?" for _ in tokens)
+    params: list[object] = [f"%{token}%" for token in tokens]
+    async with get_db() as db:
+        rows = await db.execute_fetchall(
+            f"""
+            SELECT DISTINCT name
+            FROM persons
+            WHERE name IS NOT NULL
+              AND name != ''
+              AND is_merged = 0
+              AND is_ignored = 0
+              AND {token_clause}
+            LIMIT 100
+            """,
+            tuple(params),
+        )
+
+    candidates = [str(row["name"]) for row in rows]
+    raw_key = _normalized_person_key(cleaned)
+
+    def score(name: str) -> tuple[int, int, str]:
+        key = _normalized_person_key(name)
+        if key == raw_key:
+            priority = 0
+        elif key.startswith(f"{raw_key} "):
+            priority = 1
+        elif raw_key in key:
+            priority = 2
+        else:
+            priority = 3
+        return (priority, len(name), key)
+
+    return sorted(candidates, key=score)[:limit]
+
+
+async def _resolve_person_name(
+    raw_name: str,
+    plan: AssistantPlan,
+    field_name: str,
+    field_index: int | None,
+    state: AssistantState,
+) -> tuple[str | None, PendingPersonClarification | None]:
+    cleaned = _clean_person_candidate(raw_name)
+    if not cleaned:
+        return raw_name, None
+
+    candidates = await _find_person_candidates(cleaned)
+    if not candidates:
+        return raw_name, None
+
+    exact_matches = [candidate for candidate in candidates if _normalized_person_key(candidate) == _normalized_person_key(cleaned)]
+    if len(exact_matches) == 1:
+        return exact_matches[0], None
+    if len(candidates) == 1:
+        return candidates[0], None
+
+    pending = PendingPersonClarification(
+        original_message=state.last_user_query or plan.query or "",
+        original_plan=plan.model_copy(deep=True),
+        field_name=field_name,
+        field_index=field_index,
+        requested_name=cleaned,
+        candidate_names=candidates,
+    )
+    return None, pending
+
+
+async def _resolve_plan_people(
+    plan: AssistantPlan,
+    state: AssistantState,
+) -> tuple[AssistantPlan, PendingPersonClarification | None]:
+    resolved = plan.model_copy(deep=True)
+
+    for field_name in ("person", "person_a", "person_b"):
+        value = getattr(resolved, field_name)
+        if not value:
+            continue
+        exact_name, pending = await _resolve_person_name(value, resolved, field_name, None, state)
+        if pending is not None:
+            return resolved, pending
+        setattr(resolved, field_name, exact_name)
+
+    for index, raw_name in enumerate(list(resolved.people)):
+        if not raw_name:
+            continue
+        exact_name, pending = await _resolve_person_name(raw_name, resolved, "people", index, state)
+        if pending is not None:
+            return resolved, pending
+        resolved.people[index] = exact_name or raw_name
+
+    return resolved, None
+
+
+def _build_person_clarification_payload(pending: PendingPersonClarification, invalid: bool = False) -> dict:
+    intro = "Please reply with one number or exact name to continue:" if invalid else "Please reply with one number or exact name so I can continue:"
+    lines = [f"I found multiple matches for '{pending.requested_name}'.", intro]
+    for index, candidate in enumerate(pending.candidate_names, 1):
+        lines.append(f"{index}. {candidate}")
+    return {
+        "reply_text": "\n".join(lines),
+        "results": [],
+        "count": 0,
+        "action": "needs_clarification",
+        "action_payload": {
+            "type": "person_selection",
+            "requested_name": pending.requested_name,
+            "candidates": pending.candidate_names,
+        },
+        "intent": "SQL_ONLY",
+        "explanation": "Ambiguous person name requires clarification",
+    }
+
+
+def _parse_person_clarification_selection(message: str, pending: PendingPersonClarification) -> str | None:
+    text = (message or "").strip()
+    if not text:
+        return None
+
+    if text.isdigit():
+        index = int(text)
+        if 1 <= index <= len(pending.candidate_names):
+            return pending.candidate_names[index - 1]
+
+    parts = [part.strip() for part in re.split(PERSON_SELECTION_SPLIT, text, flags=re.IGNORECASE) if part.strip()]
+    if len(parts) == 1 and parts[0].isdigit():
+        index = int(parts[0])
+        if 1 <= index <= len(pending.candidate_names):
+            return pending.candidate_names[index - 1]
+
+    normalized_map = {_normalized_person_key(candidate): candidate for candidate in pending.candidate_names}
+    normalized_text = _normalized_person_key(text)
+    if normalized_text in normalized_map:
+        return normalized_map[normalized_text]
+
+    for part in parts:
+        normalized_part = _normalized_person_key(part)
+        if normalized_part in normalized_map:
+            return normalized_map[normalized_part]
+
+    return None
+
+
+def _apply_person_clarification(plan: AssistantPlan, pending: PendingPersonClarification, selected_name: str) -> AssistantPlan:
+    updated = plan.model_copy(deep=True)
+    if pending.field_name == "people":
+        if pending.field_index is None or pending.field_index >= len(updated.people):
+            return updated
+        updated.people[pending.field_index] = selected_name
+        return updated
+
+    setattr(updated, pending.field_name, selected_name)
+    return updated
+
+
+async def continue_pending_person_clarification(
+    message: str,
+    state: AssistantState,
+    default_limit: int,
+) -> tuple[ExecutionResult, AssistantPlan] | None:
+    pending = state.pending_person_clarification
+    if pending is None:
+        return None
+
+    selected_name = _parse_person_clarification_selection(message, pending)
+    if selected_name is None:
+        next_state = state.model_copy(deep=True)
+        next_state.pending_person_clarification = pending
+        return ExecutionResult(payload=_build_person_clarification_payload(pending, invalid=True), state=next_state), pending.original_plan
+
+    clarified_plan = _apply_person_clarification(pending.original_plan, pending, selected_name)
+    next_state = state.model_copy(deep=True)
+    next_state.pending_person_clarification = None
+    executed = await execute_plan(clarified_plan, next_state, default_limit)
+    executed.state.pending_person_clarification = None
+    return executed, clarified_plan
+
+
 @dataclass
 class ExecutionResult:
     payload: dict
@@ -118,6 +319,14 @@ def _bounded_limit(plan: AssistantPlan, default_limit: int) -> int:
 
 async def execute_plan(plan: AssistantPlan, state: AssistantState, default_limit: int) -> ExecutionResult:
     limit = _bounded_limit(plan, default_limit)
+    plan, pending = await _resolve_plan_people(plan, state)
+    if pending is not None:
+        next_state = state.model_copy(deep=True)
+        next_state.pending_person_clarification = pending
+        return ExecutionResult(payload=_build_person_clarification_payload(pending), state=next_state)
+
+    state = state.model_copy(deep=True)
+    state.pending_person_clarification = None
 
     simple_handlers = {
         "LIST_CAPABILITIES": lambda: _list_capabilities(state),
@@ -489,7 +698,7 @@ def _people_from_plan(plan: AssistantPlan, state: AssistantState) -> list[str]:
     return state.last_people
 
 
-async def _count_photos_for_people(people: list[str], min_other_people: int | None = None) -> int:
+async def _count_photos_for_people(people: list[str], min_other_people: int | None = None, exact_people_only: bool = False) -> int:
     if not people:
         return 0
 
@@ -498,13 +707,16 @@ async def _count_photos_for_people(people: list[str], min_other_people: int | No
         f"JOIN v_person_photos {aliases[i]} ON {aliases[i]}.media_id = {aliases[0]}.media_id"
         for i in range(1, len(aliases))
     ]
-    where = SQL_AND.join(f"{alias}.person_name LIKE ?" for alias in aliases)
-    params: list[object] = [f"%{name}%" for name in people]
+    where = SQL_AND.join(_person_equals_sql(f"{alias}.person_name") for alias in aliases)
+    params: list[object] = list(people)
 
     having_clause = ""
     if min_other_people is not None:
         having_clause = " AND agg.person_count >= ?"
         params.append(len(people) + int(min_other_people))
+    elif exact_people_only:
+        having_clause = EXACT_PEOPLE_COUNT_CLAUSE
+        params.append(len(people))
 
     sql = (
         f"SELECT COUNT(DISTINCT {aliases[0]}.media_id) AS c "
@@ -519,7 +731,13 @@ async def _count_photos_for_people(people: list[str], min_other_people: int | No
     return int(rows[0]["c"])
 
 
-async def _media_ids_for_people(people: list[str], limit: int, min_other_people: int | None = None) -> list[int]:
+async def _media_ids_for_people(
+    people: list[str],
+    limit: int,
+    min_other_people: int | None = None,
+    exact_people_only: bool = False,
+    offset: int = 0,
+) -> list[int]:
     if not people:
         return []
 
@@ -528,15 +746,19 @@ async def _media_ids_for_people(people: list[str], limit: int, min_other_people:
         f"JOIN v_person_photos {aliases[i]} ON {aliases[i]}.media_id = {aliases[0]}.media_id"
         for i in range(1, len(aliases))
     ]
-    where = SQL_AND.join(f"{alias}.person_name LIKE ?" for alias in aliases)
-    params: list[object] = [f"%{name}%" for name in people]
+    where = SQL_AND.join(_person_equals_sql(f"{alias}.person_name") for alias in aliases)
+    params: list[object] = list(people)
 
     people_clause = ""
     if min_other_people is not None:
         people_clause = " AND agg.person_count >= ?"
         params.append(len(people) + int(min_other_people))
+    elif exact_people_only:
+        people_clause = EXACT_PEOPLE_COUNT_CLAUSE
+        params.append(len(people))
 
     params.append(limit)
+    params.append(max(0, int(offset)))
 
     sql = (
         f"SELECT DISTINCT {aliases[0]}.media_id AS media_id, {aliases[0]}.date_taken AS date_taken "
@@ -545,7 +767,7 @@ async def _media_ids_for_people(people: list[str], limit: int, min_other_people:
         f"JOIN v_photo_persons_agg agg ON agg.media_id = {aliases[0]}.media_id "
         f"WHERE {where}{people_clause} "
         "ORDER BY date_taken DESC "
-        "LIMIT ?"
+        "LIMIT ? OFFSET ?"
     )
 
     async with get_db() as db:
@@ -553,7 +775,13 @@ async def _media_ids_for_people(people: list[str], limit: int, min_other_people:
     return [int(r["media_id"]) for r in rows]
 
 
-async def _media_ids_for_people_in_location(people: list[str], location_term: str, limit: int) -> list[int]:
+async def _media_ids_for_people_in_location(
+    people: list[str],
+    location_term: str,
+    limit: int,
+    exact_people_only: bool = False,
+    offset: int = 0,
+) -> list[int]:
     if not people or not location_term.strip():
         return []
 
@@ -562,20 +790,26 @@ async def _media_ids_for_people_in_location(people: list[str], location_term: st
         f"JOIN v_person_photos {aliases[i]} ON {aliases[i]}.media_id = {aliases[0]}.media_id"
         for i in range(1, len(aliases))
     ]
-    where_people = SQL_AND.join(f"{alias}.person_name LIKE ?" for alias in aliases)
+    where_people = SQL_AND.join(_person_equals_sql(f"{alias}.person_name") for alias in aliases)
 
-    params: list[object] = [f"%{name}%" for name in people]
+    params: list[object] = list(people)
+    people_clause = ""
+    if exact_people_only:
+        people_clause = EXACT_PEOPLE_COUNT_CLAUSE
+        params.append(len(people))
     params.append(f"%{location_term}%")
     params.append(limit)
+    params.append(max(0, int(offset)))
 
     sql = (
         f"SELECT DISTINCT {aliases[0]}.media_id AS media_id, {aliases[0]}.date_taken AS date_taken "
         f"FROM v_person_photos {aliases[0]} "
         f"{' '.join(joins)} "
+        f"JOIN v_photo_persons_agg agg ON agg.media_id = {aliases[0]}.media_id "
         f"JOIN v_photos_with_location l ON l.media_id = {aliases[0]}.media_id "
-        f"WHERE {where_people} AND l.place_label LIKE ? "
+        f"WHERE {where_people}{people_clause} AND l.place_label LIKE ? "
         "ORDER BY date_taken DESC "
-        "LIMIT ?"
+        "LIMIT ? OFFSET ?"
     )
 
     async with get_db() as db:
@@ -583,7 +817,7 @@ async def _media_ids_for_people_in_location(people: list[str], location_term: st
     return [int(r["media_id"]) for r in rows]
 
 
-async def _count_photos_for_people_in_location(people: list[str], location_term: str) -> int:
+async def _count_photos_for_people_in_location(people: list[str], location_term: str, exact_people_only: bool = False) -> int:
     if not people or not location_term.strip():
         return 0
 
@@ -592,16 +826,21 @@ async def _count_photos_for_people_in_location(people: list[str], location_term:
         f"JOIN v_person_photos {aliases[i]} ON {aliases[i]}.media_id = {aliases[0]}.media_id"
         for i in range(1, len(aliases))
     ]
-    where_people = SQL_AND.join(f"{alias}.person_name LIKE ?" for alias in aliases)
-    params: list[object] = [f"%{name}%" for name in people]
+    where_people = SQL_AND.join(_person_equals_sql(f"{alias}.person_name") for alias in aliases)
+    params: list[object] = list(people)
+    people_clause = ""
+    if exact_people_only:
+        people_clause = EXACT_PEOPLE_COUNT_CLAUSE
+        params.append(len(people))
     params.append(f"%{location_term}%")
 
     sql = (
         f"SELECT COUNT(DISTINCT {aliases[0]}.media_id) AS c "
         f"FROM v_person_photos {aliases[0]} "
         f"{' '.join(joins)} "
+        f"JOIN v_photo_persons_agg agg ON agg.media_id = {aliases[0]}.media_id "
         f"JOIN v_photos_with_location l ON l.media_id = {aliases[0]}.media_id "
-        f"WHERE {where_people} AND l.place_label LIKE ?"
+        f"WHERE {where_people}{people_clause} AND l.place_label LIKE ?"
     )
 
     async with get_db() as db:
@@ -634,7 +873,7 @@ async def _count_photos_of_people(plan: AssistantPlan, state: AssistantState) ->
     if not people:
         return await _natural_fallback(plan.query or state.last_user_query or "", state, 100)
 
-    total = await _count_photos_for_people(people, plan.min_other_people)
+    total = await _count_photos_for_people(people, plan.min_other_people, plan.exact_people_only)
     reply = _build_people_photo_count_reply(total, people, plan.min_other_people)
 
     new_state = state.model_copy(deep=True)
@@ -668,7 +907,9 @@ async def _show_photos_of_people(plan: AssistantPlan, state: AssistantState, lim
     if not people:
         return await _natural_fallback(plan.query or state.last_user_query or "", state, limit)
 
-    media_ids = await _media_ids_for_people(people, limit, plan.min_other_people)
+    offset = max(0, int(plan.offset or 0))
+    total = await _count_photos_for_people(people, plan.min_other_people, plan.exact_people_only)
+    media_ids = await _media_ids_for_people(people, limit, plan.min_other_people, plan.exact_people_only, offset)
     if not media_ids:
         payload = {
             "reply_text": "I couldn't find exact matches. You can refine the query or try broader wording.",
@@ -685,11 +926,16 @@ async def _show_photos_of_people(plan: AssistantPlan, state: AssistantState, lim
     new_state.last_media_ids = media_ids
     new_state.last_operation = plan.operation
     payload = {
-        "reply_text": f"I found {len(results)} matching photo{'s' if len(results) != 1 else ''}. Results are loaded below.",
+        "reply_text": f"I found {total} matching photo{'s' if total != 1 else ''}. Showing {offset + 1}-{offset + len(results)}.",
         "results": results,
-        "count": len(results),
+        "count": total,
         "action": "open_search",
-        "action_payload": {"query": plan.query or f"show photos of {' with '.join(people)}"},
+        "action_payload": {
+            "query": plan.query or f"show photos of {' with '.join(people)}",
+            "offset": offset,
+            "next_offset": (offset + len(results)) if (offset + len(results) < total) else None,
+            "has_more": (offset + len(results) < total),
+        },
         "intent": "SQL_ONLY",
         "explanation": "Deterministic people-set retrieval",
     }
@@ -702,7 +948,9 @@ async def _show_photos_of_people_in_location(plan: AssistantPlan, state: Assista
     if not people or not location_term:
         return await _natural_fallback(plan.query or state.last_user_query or "", state, limit)
 
-    media_ids = await _media_ids_for_people_in_location(people, location_term, limit)
+    offset = max(0, int(plan.offset or 0))
+    total = await _count_photos_for_people_in_location(people, location_term, plan.exact_people_only)
+    media_ids = await _media_ids_for_people_in_location(people, location_term, limit, plan.exact_people_only, offset)
     if not media_ids:
         subject = PERSON_JOINER.join(people)
         payload = {
@@ -721,11 +969,16 @@ async def _show_photos_of_people_in_location(plan: AssistantPlan, state: Assista
     new_state.last_media_ids = media_ids
     new_state.last_operation = plan.operation
     payload = {
-        "reply_text": f"I found {len(results)} matching photo{'s' if len(results) != 1 else ''} from {location_term}. Results are loaded below.",
+        "reply_text": f"I found {total} matching photo{'s' if total != 1 else ''} from {location_term}. Showing {offset + 1}-{offset + len(results)}.",
         "results": results,
-        "count": len(results),
+        "count": total,
         "action": "open_search",
-        "action_payload": {"query": plan.query or f"show photos of {' with '.join(people)} from {location_term}"},
+        "action_payload": {
+            "query": plan.query or f"show photos of {' with '.join(people)} from {location_term}",
+            "offset": offset,
+            "next_offset": (offset + len(results)) if (offset + len(results) < total) else None,
+            "has_more": (offset + len(results) < total),
+        },
         "intent": "SQL_ONLY",
         "explanation": "Deterministic people+location retrieval",
     }
@@ -764,14 +1017,14 @@ async def _list_best_friends(plan: AssistantPlan, state: AssistantState) -> Exec
     limit = max(1, min(int(plan.limit or 10), 20))
     async with get_db() as db:
         rows = await db.execute_fetchall(
-            """
+            f"""
             SELECT person_b, shared_photo_count
             FROM v_person_cooccurrence_named
-            WHERE person_a LIKE ?
+            WHERE {_person_equals_sql('person_a')}
             ORDER BY shared_photo_count DESC
             LIMIT ?
             """,
-            (f"%{person}%", limit),
+            (person, limit),
         )
 
     if not rows:
@@ -808,13 +1061,13 @@ async def _count_people_with_person(plan: AssistantPlan, state: AssistantState) 
 
     async with get_db() as db:
         rows = await db.execute_fetchall(
-            """
+                        f"""
             SELECT COUNT(*) AS c
             FROM v_person_cooccurrence_named
-            WHERE person_a LIKE ?
-              AND person_b NOT LIKE ?
+                        WHERE {_person_equals_sql('person_a')}
+                            AND {_person_not_equals_sql('person_b')}
             """,
-            (f"%{person}%", f"%{person}%"),
+                        (person, person),
         )
 
     total = int(rows[0]["c"])
@@ -892,9 +1145,9 @@ async def _list_other_people_from_media_ids(
     exclude_clause = ""
     params: list[object] = list(media_ids)
     if exclude_people:
-        not_like = SQL_AND.join("LOWER(person_name) NOT LIKE ?" for _ in exclude_people)
+        not_like = SQL_AND.join(_person_not_equals_sql("person_name") for _ in exclude_people)
         exclude_clause = f"AND ({not_like})"
-        params.extend([f"%{p.lower()}%" for p in exclude_people])
+        params.extend(exclude_people)
     params.append(include_limit)
 
     async with get_db() as db:
@@ -949,26 +1202,26 @@ async def _list_common_contacts(plan: AssistantPlan, state: AssistantState) -> E
     limit = max(1, min(int(plan.limit or 15), 30))
     async with get_db() as db:
         rows = await db.execute_fetchall(
-            """
+            f"""
             WITH a AS (
                 SELECT person_b AS contact, shared_photo_count AS cnt
                 FROM v_person_cooccurrence_named
-                WHERE person_a LIKE ?
+                WHERE {_person_equals_sql('person_a')}
             ),
             b AS (
                 SELECT person_b AS contact, shared_photo_count AS cnt
                 FROM v_person_cooccurrence_named
-                WHERE person_a LIKE ?
+                WHERE {_person_equals_sql('person_a')}
             )
             SELECT a.contact, a.cnt AS with_a, b.cnt AS with_b, (a.cnt + b.cnt) AS score
             FROM a
             JOIN b ON b.contact = a.contact
-            WHERE a.contact NOT LIKE ?
-              AND a.contact NOT LIKE ?
+            WHERE {_person_not_equals_sql('a.contact')}
+              AND {_person_not_equals_sql('a.contact')}
             ORDER BY score DESC
             LIMIT ?
             """,
-            (f"%{person_a}%", f"%{person_b}%", f"%{person_a}%", f"%{person_b}%", limit),
+            (person_a, person_b, person_a, person_b, limit),
         )
 
     if not rows:
@@ -1002,18 +1255,18 @@ async def _list_locations(plan: AssistantPlan, state: AssistantState) -> Executi
 
     async with get_db() as db:
         rows = await db.execute_fetchall(
-            """
-                        SELECT l.place_label, COUNT(DISTINCT l.media_id) AS photo_count
+            f"""
+            SELECT l.place_label, COUNT(DISTINCT l.media_id) AS photo_count
             FROM v_photos_with_location l
             JOIN v_person_photos p ON p.media_id = l.media_id
-            WHERE p.person_name LIKE ?
+            WHERE {_person_equals_sql('p.person_name')}
               AND l.place_label IS NOT NULL
               AND l.place_label != ''
-                        GROUP BY l.place_label
-                        ORDER BY photo_count DESC, l.place_label COLLATE NOCASE ASC
+            GROUP BY l.place_label
+            ORDER BY photo_count DESC, l.place_label COLLATE NOCASE ASC
             LIMIT 200
             """,
-            (f"%{person}%",),
+            (person,),
         )
 
         labels = [str(r["place_label"]) for r in rows]
@@ -1051,17 +1304,17 @@ async def _last_location(plan: AssistantPlan, state: AssistantState) -> Executio
 
     async with get_db() as db:
         rows = await db.execute_fetchall(
-            """
+                        f"""
             SELECT l.place_label, l.date_taken, l.media_id
             FROM v_photos_with_location l
             JOIN v_person_photos p ON p.media_id = l.media_id
-            WHERE p.person_name LIKE ?
+                        WHERE {_person_equals_sql('p.person_name')}
               AND l.place_label IS NOT NULL
               AND l.place_label != ''
             ORDER BY l.date_taken DESC
             LIMIT 1
             """,
-            (f"%{person}%",),
+            (person,),
         )
 
     if not rows:
@@ -1104,17 +1357,17 @@ async def _first_location(plan: AssistantPlan, state: AssistantState) -> Executi
 
     async with get_db() as db:
         rows = await db.execute_fetchall(
-            """
+            f"""
             SELECT l.place_label, l.date_taken, l.media_id
             FROM v_photos_with_location l
             JOIN v_person_photos p ON p.media_id = l.media_id
-            WHERE p.person_name LIKE ?
+            WHERE {_person_equals_sql('p.person_name')}
               AND l.place_label IS NOT NULL
               AND l.place_label != ''
             ORDER BY l.date_taken ASC
             LIMIT 1
             """,
-            (f"%{person}%",),
+            (person,),
         )
 
     if not rows:
@@ -1158,13 +1411,13 @@ async def _timeline_locations(plan: AssistantPlan, state: AssistantState) -> Exe
     limit = max(1, min(int(plan.limit or 24), 60))
     async with get_db() as db:
         rows = await db.execute_fetchall(
-            """
+                        f"""
             SELECT substr(l.date_taken, 1, 7) AS ym,
                    GROUP_CONCAT(DISTINCT l.place_label) AS places,
                    COUNT(DISTINCT l.media_id) AS photo_count
             FROM v_photos_with_location l
             JOIN v_person_photos p ON p.media_id = l.media_id
-            WHERE p.person_name LIKE ?
+                        WHERE {_person_equals_sql('p.person_name')}
               AND l.place_label IS NOT NULL
               AND l.place_label != ''
               AND l.date_taken IS NOT NULL
@@ -1172,7 +1425,7 @@ async def _timeline_locations(plan: AssistantPlan, state: AssistantState) -> Exe
             ORDER BY ym DESC
             LIMIT ?
             """,
-            (f"%{person}%", limit),
+            (person, limit),
         )
 
     if not rows:
@@ -1207,22 +1460,22 @@ async def _list_people_with_person_in_location_time(plan: AssistantPlan, state: 
     limit = max(1, min(int(plan.limit or 20), 50))
     async with get_db() as db:
         rows = await db.execute_fetchall(
-            """
+                        f"""
             SELECT p2.person_name AS companion, COUNT(DISTINCT p2.media_id) AS shared_photo_count
             FROM v_person_photos p1
             JOIN v_person_photos p2 ON p2.media_id = p1.media_id
             JOIN v_photos_with_location l ON l.media_id = p1.media_id
-            WHERE p1.person_name LIKE ?
+                        WHERE {_person_equals_sql('p1.person_name')}
               AND p2.person_name IS NOT NULL
               AND p2.person_name != ''
-              AND p2.person_name NOT LIKE ?
+                            AND {_person_not_equals_sql('p2.person_name')}
               AND l.place_label LIKE ?
               AND substr(l.date_taken, 1, 4) = ?
             GROUP BY p2.person_name
             ORDER BY shared_photo_count DESC, companion COLLATE NOCASE ASC
             LIMIT ?
             """,
-            (f"%{person}%", f"%{person}%", f"%{plan.location_term}%", str(plan.year), limit),
+            (person, person, f"%{plan.location_term}%", str(plan.year), limit),
         )
 
     if not rows:

@@ -39,8 +39,19 @@ class AssistantPlan(BaseModel):
     location_term: str | None = None
     year: int | None = None
     min_other_people: int | None = None
+    exact_people_only: bool = False
     limit: int | None = None
+    offset: int | None = None
     explanation: str = ""
+
+
+class PendingPersonClarification(BaseModel):
+    original_message: str
+    original_plan: AssistantPlan
+    field_name: Literal["people", "person", "person_a", "person_b"]
+    field_index: int | None = None
+    requested_name: str
+    candidate_names: list[str] = Field(default_factory=list)
 
 
 class AssistantState(BaseModel):
@@ -49,3 +60,4 @@ class AssistantState(BaseModel):
     last_people: list[str] = Field(default_factory=list)
     last_location_term: str | None = None
     last_media_ids: list[int] = Field(default_factory=list)
+    pending_person_clarification: PendingPersonClarification | None = None

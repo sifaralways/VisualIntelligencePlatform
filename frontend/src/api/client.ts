@@ -99,7 +99,13 @@ export const api = {
     ignore: (clusterId: number) =>
       request<{ status: string; cluster_id: number; person_id: number }>(
         `/persons/clusters/${clusterId}/ignore`, { method: 'POST' }
-      ),  },
+      ),
+    ignoreSuggestions: (clusterId: number, action: 'delete' | 'ignore', threshold: number, limit = 8) =>
+      request<IgnoreSuggestionScanResult>(`/persons/clusters/${clusterId}/ignore-suggestions`, {
+        method: 'POST',
+        body: JSON.stringify({ action, threshold, limit }),
+      }),
+  },
 
   // ─── Persons ──────────────────────────────────────────────────────────────
   persons: {
@@ -123,6 +129,8 @@ export const api = {
       }),
     addCluster: (personId: number, clusterId: number) =>
       request(`/persons/${personId}/add-cluster/${clusterId}`, { method: 'POST' }),
+    addIgnoredCluster: (personId: number, clusterId: number) =>
+      request(`/persons/ignored/${personId}/add-cluster/${clusterId}`, { method: 'POST' }),
     mergeSuggestions: (personId: number) =>
       request<MergeSuggestion[]>(`/persons/${personId}/merge-suggestions?limit=1`),
     rejectSuggestion: (personId: number, clusterId: number) =>
@@ -503,6 +511,17 @@ export interface SimilarCluster {
   similarity: number
 }
 
+export interface IgnoreSuggestion extends SimilarCluster {}
+
+export interface IgnoreSuggestionScanResult {
+  status: string
+  action: 'delete' | 'ignore'
+  person_id: number
+  threshold: number
+  auto_ignored: IgnoreSuggestion[]
+  suggestions: IgnoreSuggestion[]
+}
+
 export interface FaceRow {
   id: number
   media_file_id?: number
@@ -563,11 +582,15 @@ export interface NaturalSearchResponse {
 export interface ChatRequest {
   message: string
   limit?: number
+  offset?: number
   conversation_id?: string
 }
 
 export interface ChatActionPayload {
   query?: string
+  offset?: number
+  next_offset?: number | null
+  has_more?: boolean
 }
 
 export interface ChatTopPerson {
