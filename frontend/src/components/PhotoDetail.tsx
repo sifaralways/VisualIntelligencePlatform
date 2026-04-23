@@ -5,7 +5,7 @@
  */
 
 import { useEffect, useRef, useState } from 'react'
-import { api, type TagsByCategory, type FaceRow, type Person } from '../api/client'
+import { api, type TagsByCategory, type FaceRow, type Person, type IgnoreSuggestion } from '../api/client'
 import AnalysisPanel from './AnalysisPanel'
 import ConnectionsGraph from './ConnectionsGraph'
 
@@ -22,6 +22,24 @@ interface Props {
   filePath: string
   onClose: () => void
   onTagRemoved?: () => void
+}
+
+interface IgnoreQueueItem extends IgnoreSuggestion {
+  person_id: number
+  source_cluster_id: number
+  source_thumbnail: string | null
+}
+
+interface IgnoredSource {
+  person_id: number
+  source_cluster_id: number
+  source_thumbnail: string | null
+}
+
+function toThumbUrl(path: string | null | undefined): string | null {
+  if (!path) return null
+  const rel = path.split('/thumbnails/').pop()
+  return rel ? `/thumbnails/${rel}` : null
 }
 
 export default function PhotoDetail({ mediaId, filePath, onClose, onTagRemoved }: Props) {
@@ -41,15 +59,27 @@ export default function PhotoDetail({ mediaId, filePath, onClose, onTagRemoved }
   const [showSuggestions, setShowSuggestions] = useState(false)
   const nameInputRef = useRef<HTMLInputElement>(null)
 
+  // Ignore-all unnamed faces flow
+  const [ignoreAllOfferOpen, setIgnoreAllOfferOpen] = useState(false)
+  const [ignoreAllWorking, setIgnoreAllWorking] = useState(false)
+  const [ignoreAllSuggestThreshold, setIgnoreAllSuggestThreshold] = useState(0.85)
+  const [ignoreAllResult, setIgnoreAllResult] = useState<{ ignoredCount: number; autoIgnored: number; suggestionsFound: number } | null>(null)
+  const [ignoredSources, setIgnoredSources] = useState<IgnoredSource[]>([])
+  const [ignoreSuggestionQueue, setIgnoreSuggestionQueue] = useState<IgnoreQueueItem[]>([])
+  const [ignoreSuggestionBusy, setIgnoreSuggestionBusy] = useState(false)
+
   // Connections graph
   const [connectionsPid,  setConnectionsPid]  = useState<number | null>(null)
   const [connectionsName, setConnectionsName] = useState('')
 
+  // Show ignored faces toggle
+  const [showIgnoredFaces, setShowIgnoredFaces] = useState(false)
+
   const filename = filePath.split('/').pop() ?? ''
   const thumbSrc = api.media.thumbnailUrl(mediaId)
 
-  const loadFaces = () =>
-    api.faces.byMedia(mediaId).catch(() => [] as FaceRow[])
+  const loadFaces = (withIgnored = showIgnoredFaces) =>
+    api.faces.byMedia(mediaId, withIgnored).catch(() => [] as FaceRow[])
 
   useEffect(() => {
     setLoading(true)
@@ -74,6 +104,122 @@ export default function PhotoDetail({ mediaId, filePath, onClose, onTagRemoved }
     } finally {
       setReprocessing(false)
     }
+  }
+
+  const unnamedClusterIds = Array.from(new Set(
+    faces
+      .filter(f => f.person_id == null && f.cluster_id != null)
+      .map(f => f.cluster_id as number),
+  ))
+  const hasUnnamedClusters = unnamedClusterIds.length > 0
+
+  async function ignoreAllUnnamedOnPhoto() {
+    if (!hasUnnamedClusters) return
+    setIgnoreAllWorking(true)
+    setIgnoreAllResult(null)
+    try {
+      const sourceThumbByCluster = new Map<number, string | null>()
+      for (const f of faces) {
+        if (f.person_id == null && f.cluster_id != null && !sourceThumbByCluster.has(f.cluster_id)) {
+          sourceThumbByCluster.set(f.cluster_id, toThumbUrl(f.thumbnail_path))
+        }
+      }
+
+      const sources: IgnoredSource[] = []
+
+      for (const clusterId of unnamedClusterIds) {
+        const result = await api.clusters.ignore(clusterId)
+        sources.push({
+          person_id: result.person_id,
+          source_cluster_id: clusterId,
+          source_thumbnail: sourceThumbByCluster.get(clusterId) ?? null,
+        })
+      }
+
+      setIgnoreAllResult({
+        ignoredCount: unnamedClusterIds.length,
+        autoIgnored: 0,
+        suggestionsFound: 0,
+      })
+      setIgnoredSources(sources)
+      setIgnoreAllOfferOpen(true)
+
+      // Refresh people section state on this photo after ignore mutations.
+      const refreshed = await loadFaces()
+      setFaces(refreshed)
+    } finally {
+      setIgnoreAllWorking(false)
+    }
+  }
+
+  async function runPostIgnoreSuggestions() {
+    if (ignoredSources.length === 0) {
+      setIgnoreAllOfferOpen(false)
+      return
+    }
+
+    setIgnoreAllWorking(true)
+    try {
+      let autoIgnored = 0
+      const queue: IgnoreQueueItem[] = []
+
+      for (const source of ignoredSources) {
+        const result = await api.persons.ignoredSuggestions(
+          source.person_id,
+          ignoreAllSuggestThreshold,
+          8,
+        )
+        autoIgnored += result.auto_ignored.length
+        for (const s of result.suggestions) {
+          queue.push({
+            ...s,
+            person_id: source.person_id,
+            source_cluster_id: source.source_cluster_id,
+            source_thumbnail: source.source_thumbnail,
+          })
+        }
+      }
+
+      setIgnoreAllResult(prev => ({
+        ignoredCount: prev?.ignoredCount ?? ignoredSources.length,
+        autoIgnored,
+        suggestionsFound: queue.length,
+      }))
+      setIgnoreSuggestionQueue(queue)
+      setIgnoreAllOfferOpen(false)
+
+      const refreshed = await loadFaces()
+      setFaces(refreshed)
+    } finally {
+      setIgnoreAllWorking(false)
+    }
+  }
+
+  async function acceptIgnoreSuggestion() {
+    const current = ignoreSuggestionQueue[0]
+    if (!current) return
+    setIgnoreSuggestionBusy(true)
+    try {
+      await api.persons.addIgnoredCluster(current.person_id, current.cluster_id)
+    } catch {
+      // Keep UX moving even if the cluster was already handled in another path.
+    } finally {
+      setIgnoreSuggestionQueue(prev => prev.slice(1))
+      const refreshed = await loadFaces()
+      setFaces(refreshed)
+      setIgnoreSuggestionBusy(false)
+    }
+  }
+
+  function rejectIgnoreSuggestion() {
+    setIgnoreSuggestionQueue(prev => prev.slice(1))
+  }
+
+  async function toggleIgnoredFaces() {
+    const next = !showIgnoredFaces
+    setShowIgnoredFaces(next)
+    const refreshed = await loadFaces(next)
+    setFaces(refreshed)
   }
 
   function startNaming(faceId: number) {
@@ -233,14 +379,29 @@ export default function PhotoDetail({ mediaId, filePath, onClose, onTagRemoved }
                 {!loading && (
                   <>
                     {/* ── People in this photo ── */}
-                    {faces.length > 0 && (
-                      <Section title="People" icon="👤">
+                    {(faces.length > 0 || showIgnoredFaces) && (
+                      <div>
+                        <div className="flex items-center justify-between mb-2">
+                          <p className="text-xs font-semibold text-gray-400 uppercase tracking-widest">👤 People</p>
+                          <button
+                            onClick={toggleIgnoredFaces}
+                            title={showIgnoredFaces ? 'Hide ignored faces' : 'Show ignored faces'}
+                            className={`text-[10px] px-2 py-0.5 rounded-full border transition-colors ${
+                              showIgnoredFaces
+                                ? 'border-amber-600 bg-amber-900/30 text-amber-300 hover:bg-amber-800/40'
+                                : 'border-gray-700 bg-gray-800/50 text-gray-500 hover:text-gray-300 hover:border-gray-600'
+                            }`}
+                          >
+                            {showIgnoredFaces ? '🙈 Hide ignored' : '👁 Show ignored'}
+                          </button>
+                        </div>
                         <div className="flex flex-wrap gap-3">
                           {faces.map(f => {
                             const isEditing = editMode?.faceId === f.id
                             const isSaving  = savingFace === f.id
                             const isRemoving = removingFace === f.id
                             const named = f.person_name != null
+                            const isIgnored = f.is_ignored === true
 
                             return (
                               <div key={f.id} className="flex flex-col items-center gap-1 group/face relative">
@@ -248,19 +409,26 @@ export default function PhotoDetail({ mediaId, filePath, onClose, onTagRemoved }
                                 <div className="relative">
                                   <div
                                     className={`w-16 h-16 rounded-xl overflow-hidden bg-gray-800 border transition-colors ${
-                                      named ? 'border-indigo-700' : 'border-gray-700'
+                                      isIgnored
+                                        ? 'border-amber-600/60'
+                                        : named ? 'border-indigo-700' : 'border-gray-700'
                                     } ${isRemoving ? 'opacity-40' : ''}`}
                                   >
                                     {f.thumbnail_path ? (
                                       <img
                                         src={api.faces.thumbnailUrl(f.id)}
                                         alt={f.person_name ?? 'Unknown'}
-                                        className="w-full h-full object-cover"
+                                        className={`w-full h-full object-cover ${isIgnored ? 'opacity-50 grayscale' : ''}`}
                                       />
                                     ) : (
                                       <span className="flex items-center justify-center h-full text-2xl">👤</span>
                                     )}
                                   </div>
+                                  {isIgnored && (
+                                    <div className="absolute inset-0 flex items-end justify-center pb-1 pointer-events-none">
+                                      <span className="text-[8px] bg-amber-900/80 text-amber-300 border border-amber-700/60 rounded px-1 py-px leading-none">ignored</span>
+                                    </div>
+                                  )}
 
                                   {/* Action buttons — shown on hover when not editing */}
                                   {!isEditing && !isSaving && !isRemoving && (
@@ -347,11 +515,13 @@ export default function PhotoDetail({ mediaId, filePath, onClose, onTagRemoved }
                                   <>
                                     <span
                                       className={`text-[10px] text-center max-w-[4rem] truncate ${
-                                        named ? 'text-gray-200' : 'text-gray-500 italic'
+                                        isIgnored
+                                          ? 'text-amber-500 italic'
+                                          : named ? 'text-gray-200' : 'text-gray-500 italic'
                                       }`}
-                                      title={f.person_name ?? undefined}
+                                      title={isIgnored ? 'Ignored face — name it to un-ignore' : (f.person_name ?? undefined)}
                                     >
-                                      {named ? f.person_name : (f.cluster_id != null ? 'tap ✎ to name' : '?')}
+                                      {named ? f.person_name : (isIgnored ? 'tap ✎ to name' : (f.cluster_id != null ? 'tap ✎ to name' : '?'))}
                                     </span>
                                     {f.sharpness != null && (
                                       <span
@@ -382,7 +552,22 @@ export default function PhotoDetail({ mediaId, filePath, onClose, onTagRemoved }
                             )
                           })}
                         </div>
-                      </Section>
+
+                        <div className="mt-3 pt-3 border-t border-gray-800">
+                          <button
+                            onClick={ignoreAllUnnamedOnPhoto}
+                            disabled={!hasUnnamedClusters || ignoreAllWorking}
+                            className="w-full text-xs px-3 py-2 rounded-lg border border-red-800 bg-red-950/30 text-red-300 hover:text-red-100 hover:border-red-600 hover:bg-red-900/30 transition-colors disabled:opacity-40"
+                            title={hasUnnamedClusters ? 'Ignore all unnamed faces in this photo' : 'No unnamed faces in this photo'}
+                          >
+                            {ignoreAllWorking
+                              ? 'Ignoring unnamed faces…'
+                              : hasUnnamedClusters
+                                ? `Ignore all unnamed faces (${unnamedClusterIds.length})`
+                                : 'No unnamed faces to ignore'}
+                          </button>
+                        </div>
+                      </div>
                     )}
 
                     {/* ML Tags */}
@@ -462,6 +647,132 @@ export default function PhotoDetail({ mediaId, filePath, onClose, onTagRemoved }
         personName={connectionsName}
         onClose={() => setConnectionsPid(null)}
       />
+    )}
+
+    {ignoreAllOfferOpen && (
+      <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+        <div className="bg-gray-900 border border-gray-700 rounded-2xl p-6 max-w-md w-full shadow-2xl">
+          <p className="text-white font-semibold text-base mb-1">Find similar faces too?</p>
+          <p className="text-gray-400 text-sm mb-4">
+            VIP has already ignored all unnamed face clusters in this photo.
+            Do you also want similar-face suggestions for additional ignores?
+          </p>
+
+          <div className="mb-5">
+            <label className="flex items-center justify-between text-xs text-gray-300 mb-2">
+              <span>Auto-ignore threshold</span>
+              <span className="font-semibold text-white">{Math.round(ignoreAllSuggestThreshold * 100)}%</span>
+            </label>
+            <input
+              type="range"
+              min={50}
+              max={95}
+              step={1}
+              value={Math.round(ignoreAllSuggestThreshold * 100)}
+              onChange={e => setIgnoreAllSuggestThreshold(Number(e.target.value) / 100)}
+              className="w-full accent-red-500"
+            />
+            <p className="text-[11px] text-gray-500 mt-1">
+              Applied only if you choose suggestions.
+            </p>
+          </div>
+
+          <div className="flex gap-3">
+            <button
+              onClick={runPostIgnoreSuggestions}
+              disabled={ignoreAllWorking}
+              className="flex-1 bg-red-700 hover:bg-red-600 disabled:opacity-40 text-white rounded-xl py-2.5 text-sm font-semibold transition-colors"
+            >
+              {ignoreAllWorking ? 'Running…' : 'Yes, show suggestions'}
+            </button>
+            <button
+              onClick={() => setIgnoreAllOfferOpen(false)}
+              disabled={ignoreAllWorking}
+              className="flex-1 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-gray-300 rounded-xl py-2.5 text-sm font-medium transition-colors"
+            >
+              No
+            </button>
+          </div>
+
+          <button
+            onClick={() => setIgnoreAllOfferOpen(false)}
+            disabled={ignoreAllWorking}
+            className="mt-3 w-full text-center text-xs text-gray-600 hover:text-gray-400 disabled:opacity-40"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    )}
+
+    {ignoreSuggestionQueue.length > 0 && (
+      <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/75 backdrop-blur-sm p-4">
+        <div className="bg-gray-900 border border-gray-700 rounded-2xl p-7 max-w-md w-full shadow-2xl">
+          <p className="text-white font-semibold text-lg mb-1">Ignore this similar face too?</p>
+          <p className="text-gray-400 text-xs mb-5">
+            Similarity {Math.round(ignoreSuggestionQueue[0].similarity * 100)}% — {ignoreSuggestionQueue.length} suggestion{ignoreSuggestionQueue.length !== 1 ? 's' : ''} remaining.
+          </p>
+          <div className="flex gap-6 items-center justify-center mb-6">
+            <div className="flex flex-col items-center gap-1">
+              <div className="w-24 h-24 rounded-xl overflow-hidden bg-gray-800 border border-red-700">
+                {ignoreSuggestionQueue[0].source_thumbnail
+                  ? <img src={ignoreSuggestionQueue[0].source_thumbnail} alt="source face" className="w-full h-full object-cover" />
+                  : <span className="flex items-center justify-center h-full text-gray-500 text-2xl">?</span>}
+              </div>
+              <span className="text-xs text-red-300 font-medium">Source face</span>
+            </div>
+            <span className="text-gray-500 text-2xl">≈</span>
+            <div className="flex flex-col items-center gap-1">
+              <div className="w-24 h-24 rounded-xl overflow-hidden bg-gray-800 border border-gray-600">
+                {ignoreSuggestionQueue[0].representative_thumbnail
+                  ? <img src={'/thumbnails/' + ignoreSuggestionQueue[0].representative_thumbnail.split('/thumbnails/').pop()} alt="suggested face" className="w-full h-full object-cover" />
+                  : <span className="flex items-center justify-center h-full text-gray-500 text-2xl">?</span>}
+              </div>
+              <span className="text-xs text-gray-500">{ignoreSuggestionQueue[0].member_count} face{ignoreSuggestionQueue[0].member_count !== 1 ? 's' : ''}</span>
+            </div>
+          </div>
+
+          <div className="flex gap-3">
+            <button
+              onClick={acceptIgnoreSuggestion}
+              disabled={ignoreSuggestionBusy}
+              className="flex-1 bg-red-700 hover:bg-red-600 disabled:opacity-40 text-white rounded-xl py-2.5 text-sm font-semibold transition-colors"
+            >
+              {ignoreSuggestionBusy ? 'Ignoring…' : 'Yes, ignore'}
+            </button>
+            <button
+              onClick={rejectIgnoreSuggestion}
+              disabled={ignoreSuggestionBusy}
+              className="flex-1 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-gray-300 rounded-xl py-2.5 text-sm font-medium transition-colors"
+            >
+              No, keep it
+            </button>
+          </div>
+
+          <button
+            onClick={() => setIgnoreSuggestionQueue([])}
+            className="mt-3 w-full text-center text-xs text-gray-600 hover:text-gray-400"
+          >
+            Stop reviewing for now
+          </button>
+        </div>
+      </div>
+    )}
+
+    {ignoreAllResult && ignoreSuggestionQueue.length === 0 && (
+      <div className="fixed bottom-4 right-4 z-[60] max-w-sm rounded-xl border border-red-800 bg-red-950/40 px-4 py-3 shadow-2xl">
+        <p className="text-sm text-red-200">
+          Ignored {ignoreAllResult.ignoredCount} unnamed face cluster{ignoreAllResult.ignoredCount !== 1 ? 's' : ''}.
+          {ignoreAllResult.autoIgnored > 0 ? ` Auto-ignored ${ignoreAllResult.autoIgnored} similar cluster${ignoreAllResult.autoIgnored !== 1 ? 's' : ''}.` : ''}
+          {ignoreAllResult.suggestionsFound > 0 ? ` Reviewed ${ignoreAllResult.suggestionsFound} suggestion${ignoreAllResult.suggestionsFound !== 1 ? 's' : ''}.` : ''}
+        </p>
+        <button
+          onClick={() => setIgnoreAllResult(null)}
+          className="mt-2 text-xs text-red-400 hover:text-red-200"
+        >
+          Dismiss
+        </button>
+      </div>
     )}
     </>
   )

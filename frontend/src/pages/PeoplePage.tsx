@@ -6,7 +6,7 @@
  * Unnamed clusters: shown first, sorted by size.
  */
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api/client'
 import type { Cluster, Person, MergeSuggestion, FaceRow, SimilarCluster, MergePersonsResult, FindSimilarSuggestion, FindSimilarAllResult, IgnoredPerson, IgnoreSuggestion } from '../api/client'
 import ConnectionsGraph from '../components/ConnectionsGraph'
@@ -237,6 +237,12 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   const [bulkNameInput, setBulkNameInput] = useState('')
   const [bulkNameSuggestions, setBulkNameSuggestions] = useState(false)
   const lastSelectedIdxRef = useRef<number>(-1)
+
+  // Keep a stable, prefiltered list for autocomplete paths.
+  const namedPersonNames = useMemo(
+    () => persons.filter(p => p.name).map(p => p.name!),
+    [persons],
+  )
 
   function toggleSelect(id: number) {
     setSelected(prev => {
@@ -1167,7 +1173,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
             {clusters.map((c, idx) => (
               <ClusterTile key={c.id} cluster={c}
                 isNaming={!selectMode && namingId === c.id} nameInput={nameInput} saving={saving}
-                personNames={persons.filter(p => p.name).map(p => p.name!)}
+                personNames={namedPersonNames}
                 selectMode={selectMode}
                 isSelected={selected.has(c.id)}
                 onToggleSelect={(shiftHeld) => rangeSelect(idx, shiftHeld)}
@@ -1202,9 +1208,8 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
                       className="w-full bg-gray-800 border border-indigo-500 rounded-lg px-3 py-1.5 text-sm text-white outline-none min-w-[180px]"
                     />
                     {bulkNameSuggestions && bulkNameInput.trim().length > 0 && (() => {
-                      const matches = persons
-                        .filter(p => p.name && p.name.toLowerCase().includes(bulkNameInput.toLowerCase()))
-                        .map(p => p.name!)
+                      const query = bulkNameInput.toLowerCase()
+                      const matches = namedPersonNames.filter(n => n.toLowerCase().includes(query))
                       return matches.length > 0 ? (
                         <ul
                           onMouseDown={e => e.preventDefault()}
@@ -1851,7 +1856,7 @@ function ClusterTile({ cluster, isNaming, nameInput, saving, personNames, select
   const thumb = cluster.representative_thumbnail
   const thumbUrl = thumb ? '/thumbnails/' + thumb.split('/thumbnails/').pop() : null
 
-  const filteredNames = nameInput.trim().length > 0
+  const filteredNames = (isNaming && showSuggestions && nameInput.trim().length > 0)
     ? personNames.filter(n => n.toLowerCase().includes(nameInput.toLowerCase()))
     : []
 

@@ -1,6 +1,6 @@
 """VIP API — Faces routes (thumbnail serving + face management)."""
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 from pathlib import Path
 
@@ -75,19 +75,39 @@ async def get_cluster_faces(cluster_id: int, limit: int = 20):
 
 
 @router.get("/media/{media_id}")
-async def get_faces_for_media(media_id: int):
+async def get_faces_for_media(
+    media_id: int,
+    include_ignored: bool = Query(False, alias="include_ignored"),
+):
     """Return all faces detected in a specific media file, with person names."""
     import json as _json
     async with get_db() as db:
-        rows = await db.execute_fetchall("""
-            SELECT f.id, f.thumbnail_path, f.detection_conf,
-                   f.cluster_id, f.person_id, p.name AS person_name,
-                   f.face_attributes
-            FROM faces f
-            LEFT JOIN persons p ON p.id = f.person_id AND p.is_merged = 0
-            WHERE f.media_file_id = ?
-            ORDER BY f.detection_conf DESC
-        """, (media_id,))
+        if include_ignored:
+            # Return all faces including those assigned to ignored persons.
+            # is_ignored=1 faces are returned with person_name=NULL (they have no real name).
+            rows = await db.execute_fetchall("""
+                SELECT f.id, f.thumbnail_path, f.detection_conf,
+                       f.cluster_id, f.person_id,
+                       CASE WHEN p.is_ignored = 0 THEN p.name ELSE NULL END AS person_name,
+                       f.face_attributes,
+                       COALESCE(p.is_ignored, 0) AS is_ignored
+                FROM faces f
+                LEFT JOIN persons p ON p.id = f.person_id AND p.is_merged = 0
+                WHERE f.media_file_id = ?
+                ORDER BY f.detection_conf DESC
+            """, (media_id,))
+        else:
+            rows = await db.execute_fetchall("""
+                SELECT f.id, f.thumbnail_path, f.detection_conf,
+                       f.cluster_id, f.person_id, p.name AS person_name,
+                       f.face_attributes,
+                       0 AS is_ignored
+                FROM faces f
+                LEFT JOIN persons p ON p.id = f.person_id AND p.is_merged = 0 AND p.is_ignored = 0
+                WHERE f.media_file_id = ?
+                  AND (f.person_id IS NULL OR p.id IS NOT NULL)
+                ORDER BY f.detection_conf DESC
+            """, (media_id,))
     result = []
     for r in rows:
         d = dict(r)
@@ -101,6 +121,7 @@ async def get_faces_for_media(media_id: int):
             except Exception:
                 pass
         d["sharpness"] = sharpness
+        d["is_ignored"] = bool(d["is_ignored"])
         del d["face_attributes"]
         result.append(d)
     return result

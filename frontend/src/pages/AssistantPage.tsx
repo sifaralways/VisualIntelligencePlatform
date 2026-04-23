@@ -30,6 +30,8 @@ export default function AssistantPage({ onOpenSearch }: AssistantPageProps) {
   const [knownPersonsLoaded, setKnownPersonsLoaded] = useState(false)
   const [faceActionBusy, setFaceActionBusy] = useState(false)
   const [faceActionMessage, setFaceActionMessage] = useState<string>('')
+  const [lastUserMessage, setLastUserMessage] = useState<string>('')
+  const [loadingMore, setLoadingMore] = useState(false)
 
   async function ensureKnownPersonsLoaded(): Promise<Person[]> {
     if (knownPersonsLoaded) return knownPersons
@@ -108,6 +110,7 @@ export default function AssistantPage({ onOpenSearch }: AssistantPageProps) {
     setMessages(prev => [...prev, { role: 'user', text: message }])
     setInput('')
     setLoading(true)
+    setLastUserMessage(message)
     try {
       const res = await api.chat.message({ message, limit: 100, conversation_id: conversationId || undefined })
       setLastResponse(res)
@@ -121,6 +124,38 @@ export default function AssistantPage({ onOpenSearch }: AssistantPageProps) {
       setLastResponse(null)
     } finally {
       setLoading(false)
+    }
+  }
+
+  async function loadMore() {
+    if (!lastResponse || loadingMore) return
+    const nextOffset = lastResponse.action_payload?.next_offset
+    if (nextOffset == null) return
+
+    setLoadingMore(true)
+    try {
+      const res = await api.chat.message({
+        message: lastUserMessage,
+        limit: 100,
+        offset: nextOffset,
+        conversation_id: conversationId || undefined,
+      })
+      // Append results/face_results rather than replacing
+      setLastResponse(prev => {
+        if (!prev) return res
+        return {
+          ...res,
+          results: [...prev.results, ...res.results],
+          face_results: res.face_results
+            ? [...(prev.face_results ?? []), ...res.face_results]
+            : prev.face_results,
+          count: res.count,
+        }
+      })
+    } catch {
+      // Silently ignore load-more failures
+    } finally {
+      setLoadingMore(false)
     }
   }
 
@@ -216,6 +251,15 @@ export default function AssistantPage({ onOpenSearch }: AssistantPageProps) {
               />
             ))}
           </div>
+          {lastResponse.action_payload?.has_more && (
+            <button
+              onClick={() => void loadMore()}
+              disabled={loadingMore}
+              className="mt-3 w-full text-xs py-2 rounded-lg border border-gray-700 bg-gray-800/60 text-gray-300 hover:text-white hover:bg-gray-700 hover:border-gray-600 disabled:opacity-40 transition-colors"
+            >
+              {loadingMore ? 'Loading…' : `Load more faces (showing ${lastResponse.face_results.length}${lastResponse.face_total_count ? ` of ${lastResponse.face_total_count}` : ''})`}
+            </button>
+          )}
         </div>
       ) : null}
 
@@ -257,10 +301,21 @@ export default function AssistantPage({ onOpenSearch }: AssistantPageProps) {
       )}
 
       {lastResponse?.results?.length ? (
-        <div className="grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-1">
-          {lastResponse.results.map(r => (
-            <AssistantTile key={r.media_id} result={r} onClick={() => setSelected(r)} />
-          ))}
+        <div>
+          <div className="grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-1">
+            {lastResponse.results.map(r => (
+              <AssistantTile key={r.media_id} result={r} onClick={() => setSelected(r)} />
+            ))}
+          </div>
+          {lastResponse.action_payload?.has_more && (
+            <button
+              onClick={() => void loadMore()}
+              disabled={loadingMore}
+              className="mt-3 w-full text-xs py-2 rounded-lg border border-gray-700 bg-gray-800/60 text-gray-300 hover:text-white hover:bg-gray-700 hover:border-gray-600 disabled:opacity-40 transition-colors"
+            >
+              {loadingMore ? 'Loading…' : `Load more photos (showing ${lastResponse.results.length} of ${lastResponse.count})`}
+            </button>
+          )}
         </div>
       ) : null}
 

@@ -276,6 +276,11 @@ class IgnoreSuggestionRequest(BaseModel):
     limit: int = 8
 
 
+class IgnoredPersonSuggestionRequest(BaseModel):
+    threshold: float = 0.85
+    limit: int = 8
+
+
 @router.get("")
 async def list_persons():
     """All persons — named and unnamed (clusters awaiting a name)."""
@@ -624,6 +629,66 @@ async def unignore_person(person_id: int):
         )
 
     return {"status": "restored", "person_id": person_id}
+
+
+@router.post("/ignored/{person_id}/suggestions")
+async def ignored_person_suggestions(person_id: int, request: IgnoredPersonSuggestionRequest):
+    """
+    For an already-ignored person, find visually similar unnamed clusters.
+
+    Used by the Photo Detail "Ignore all unnamed faces" flow where the primary
+    ignore action happens first and similar-face suggestions are offered after.
+    """
+    threshold = max(_SUGGEST_THRESHOLD, min(0.99, float(request.threshold or 0.85)))
+    limit = max(1, min(int(request.limit or 8), 24))
+
+    async with get_db() as db:
+        row = await (
+            await db.execute(
+                """
+                SELECT id, is_ignored, centroid
+                FROM persons
+                WHERE id=? AND is_merged=0
+                """,
+                (person_id,),
+            )
+        ).fetchone()
+        if not row or not row["is_ignored"]:
+            raise HTTPException(status_code=404, detail="Ignored person not found")
+        if not row["centroid"]:
+            return {
+                "status": "ok",
+                "action": "ignore",
+                "person_id": person_id,
+                "threshold": threshold,
+                "auto_ignored": [],
+                "suggestions": [],
+            }
+
+        source_vec = _normalise_vector(np.frombuffer(row["centroid"], dtype=np.float32))
+        scored = await _score_similar_unnamed_clusters(
+            db,
+            source_vec,
+            rejected_for_person_id=person_id,
+        )
+
+        auto_ignored: list[dict] = []
+        suggestions: list[dict] = []
+        for item in scored:
+            if item["similarity"] >= threshold:
+                await _assign_cluster_to_ignored_person(db, person_id, int(item["cluster_id"]))
+                auto_ignored.append(item)
+            elif item["similarity"] >= _SUGGEST_THRESHOLD and len(suggestions) < limit:
+                suggestions.append(item)
+
+    return {
+        "status": "ok",
+        "action": "ignore",
+        "person_id": person_id,
+        "threshold": threshold,
+        "auto_ignored": auto_ignored,
+        "suggestions": suggestions,
+    }
 
 
 @router.delete("/{person_id}")
@@ -1065,9 +1130,16 @@ async def connections_graph(person_id: int, depth: int = 2):
             raise HTTPException(status_code=404, detail="Person not found")
 
         center_thumb = await (await db.execute(
-            "SELECT thumbnail_path FROM faces "
-            "WHERE person_id=? AND thumbnail_path IS NOT NULL LIMIT 1",
-            (person_id,),
+            """
+            SELECT COALESCE(pf.thumbnail_path,
+                           (SELECT f.thumbnail_path FROM faces f
+                            WHERE f.person_id=? AND f.thumbnail_path IS NOT NULL LIMIT 1)
+                  ) AS thumbnail_path
+            FROM persons p
+            LEFT JOIN faces pf ON pf.id = p.portrait_face_id
+            WHERE p.id=?
+            """,
+            (person_id, person_id),
         )).fetchone()
 
         center_nid = f"p_{person_id}"
@@ -1091,7 +1163,7 @@ async def connections_graph(person_id: int, depth: int = 2):
                 p.name,
                 p.photo_count,
                 pc.count AS shared_photos,
-                MIN(f.thumbnail_path) AS thumbnail
+                COALESCE(pf.thumbnail_path, MIN(f.thumbnail_path)) AS thumbnail
             FROM person_cooccurrence pc
             JOIN persons p
               ON p.id = CASE
@@ -1100,6 +1172,7 @@ async def connections_graph(person_id: int, depth: int = 2):
                 END
             LEFT JOIN faces f
               ON f.person_id = p.id AND f.thumbnail_path IS NOT NULL
+            LEFT JOIN faces pf ON pf.id = p.portrait_face_id
             WHERE (pc.person_a_id = ? OR pc.person_b_id = ?)
               AND p.is_merged  = 0
               AND p.is_ignored = 0
@@ -1192,10 +1265,11 @@ async def connections_graph(person_id: int, depth: int = 2):
                 new_ids_list = list(new_person_ids)
                 p2_rows = await db.execute_fetchall(f"""
                     SELECT p.id, p.name, p.photo_count,
-                           MIN(f.thumbnail_path) AS thumbnail
+                           COALESCE(pf.thumbnail_path, MIN(f.thumbnail_path)) AS thumbnail
                     FROM persons p
                     LEFT JOIN faces f
                       ON f.person_id = p.id AND f.thumbnail_path IS NOT NULL
+                    LEFT JOIN faces pf ON pf.id = p.portrait_face_id
                     WHERE p.id IN ({ph2})
                       AND p.is_merged  = 0
                       AND p.is_ignored = 0
@@ -1250,7 +1324,7 @@ async def frequently_with(person_id: int, limit: int = 10):
                 p.name,
                 pc.count          AS shared_photos,
                 pc.last_seen_at,
-                MIN(f.thumbnail_path) AS representative_thumbnail
+                COALESCE(pf.thumbnail_path, MIN(f.thumbnail_path)) AS representative_thumbnail
             FROM person_cooccurrence pc
             JOIN persons p
               ON  p.id = CASE
@@ -1258,6 +1332,7 @@ async def frequently_with(person_id: int, limit: int = 10):
                     ELSE pc.person_a_id
                   END
             LEFT JOIN faces f ON f.person_id = p.id
+            LEFT JOIN faces pf ON pf.id = p.portrait_face_id
             WHERE (pc.person_a_id = ? OR pc.person_b_id = ?)
               AND p.name IS NOT NULL
               AND p.is_merged  = 0

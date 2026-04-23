@@ -138,6 +138,11 @@ export const api = {
     listIgnored: () => request<IgnoredPerson[]>('/persons/ignored'),
     unignore: (personId: number) =>
       request<{ status: string; person_id: number }>(`/persons/${personId}/unignore`, { method: 'POST' }),
+    ignoredSuggestions: (personId: number, threshold: number, limit = 8) =>
+      request<IgnoreSuggestionScanResult>(`/persons/ignored/${personId}/suggestions`, {
+        method: 'POST',
+        body: JSON.stringify({ threshold, limit }),
+      }),
     findSimilarAll: (autoThreshold: number) =>
       request<FindSimilarAllResult>('/persons/find-similar-all', {
         method: 'POST',
@@ -165,7 +170,8 @@ export const api = {
   faces: {
     byCluster: (clusterId: number) => request<FaceRow[]>(`/faces/cluster/${clusterId}`),
     byPerson: (personId: number) => request<FaceRow[]>(`/persons/${personId}/faces`),
-    byMedia: (mediaId: number) => request<FaceRow[]>(`/faces/media/${mediaId}`),
+    byMedia: (mediaId: number, includeIgnored = false) =>
+      request<FaceRow[]>(`/faces/media/${mediaId}${includeIgnored ? '?include_ignored=true' : ''}`),
     removeFromCluster: (faceId: number) =>
       request(`/faces/${faceId}/from-cluster`, { method: 'DELETE' }),
     removeFromPerson: (faceId: number) =>
@@ -532,6 +538,7 @@ export interface FaceRow {
   cluster_id?: number | null
   date_taken?: string | null
   sharpness?: number | null
+  is_ignored?: boolean
 }
 
 export interface SearchRequest {
