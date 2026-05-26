@@ -320,9 +320,14 @@ def _normalise(raw: dict[str, Any]) -> dict[str, Any]:
     # XMP:Location — free-text location (IPTC Core)
     xmp_location = _get("Location", "XMP:Location")
 
-    # XMP-mwg-rs:RegionInfo — MWG face region structs (Name + bbox per face)
-    # ExifTool returns this as a dict: {"AppliedToDimensions": {...}, "RegionList": [...]}
+    # XMP-mwg-rs face regions may appear as either:
+    # 1) RegionInfo struct: {AppliedToDimensions, RegionList}
+    # 2) Flat RegionList array field (without RegionInfo wrapper)
     xmp_region_info = raw.get("RegionInfo") or raw.get("XMP-mwg-rs:RegionInfo")
+    if xmp_region_info is None:
+        region_list = raw.get("RegionList") or raw.get("XMP-mwg-rs:RegionList")
+        if isinstance(region_list, list):
+            xmp_region_info = {"RegionList": region_list}
 
     return {
         "file_path":       raw.get("SourceFile"),

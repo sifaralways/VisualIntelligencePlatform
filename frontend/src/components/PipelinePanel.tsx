@@ -25,6 +25,7 @@ export default function PipelinePanel({ profileId, collapsed, onToggle, onPipeli
   const [status, setStatus]       = useState<string>('idle')
   const [events, setEvents]       = useState<WsEvent[]>([])
   const [forceRetag, setForceRetag] = useState(false)
+  const [useExistingVipData, setUseExistingVipData] = useState(true)
   const wsRef  = useRef<WebSocket | null>(null)
   const logRef = useRef<HTMLDivElement>(null)
 
@@ -73,7 +74,7 @@ export default function PipelinePanel({ profileId, collapsed, onToggle, onPipeli
     setEvents([])
     setStatus('running')
     try {
-      await api.pipeline.scan(folder.trim())
+      await api.pipeline.scan(folder.trim(), false, useExistingVipData)
     } catch {
       setStatus('error')
     }
@@ -164,6 +165,15 @@ export default function PipelinePanel({ profileId, collapsed, onToggle, onPipeli
           placeholder="/Volumes/Photos"
           className="w-full bg-gray-800 border border-gray-700 rounded-lg px-2.5 py-1.5 text-xs text-white outline-none focus:border-indigo-500 transition-colors"
         />
+        <label className="text-[11px] text-gray-300 inline-flex items-center gap-1.5 select-none">
+          <input
+            type="checkbox"
+            checked={useExistingVipData}
+            onChange={e => setUseExistingVipData(e.target.checked)}
+            className="accent-indigo-500"
+          />
+          Use existing VIP data if found
+        </label>
         <div className="flex gap-1.5">
           <button
             onClick={startScan}

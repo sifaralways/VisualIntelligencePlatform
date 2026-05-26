@@ -29,6 +29,7 @@ def _state(profile_id: str) -> dict:
 class ScanRequest(BaseModel):
     folder: str
     force_reprocess: bool = False
+    use_existing_vip_data: bool = True
 
 
 class RescanRequest(BaseModel):
@@ -70,7 +71,13 @@ async def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
         """, (str(folder),))
 
     pipeline_state.update({"status": "running", "folder": str(folder), "error": None})
-    background_tasks.add_task(run_in_profile, profile_id, _run_pipeline, str(folder))
+    background_tasks.add_task(
+        run_in_profile,
+        profile_id,
+        _run_pipeline,
+        str(folder),
+        req.use_existing_vip_data,
+    )
 
     return {"status": "started", "folder": str(folder)}
 
@@ -175,12 +182,12 @@ async def get_status():
     return _state(get_current_profile_id())
 
 
-async def _run_pipeline(folder: str) -> None:
+async def _run_pipeline(folder: str, use_existing_vip_data: bool = True) -> None:
     from backend.pipeline.ingest import run_ingest
     profile_id = get_current_profile_id()
     pipeline_state = _state(profile_id)
     try:
-        await run_ingest(folder)
+        await run_ingest(folder, use_existing_vip_data=use_existing_vip_data)
         # Update scan_state with final file count and idle status
         async with get_db() as db:
             await db.execute("""

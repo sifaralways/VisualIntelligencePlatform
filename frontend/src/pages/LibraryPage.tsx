@@ -20,6 +20,7 @@ export default function LibraryPage({ onScanStarted }: Props) {
   const [scanning,     setScanning]     = useState(false)
   const [scanMsg,      setScanMsg]      = useState<string | null>(null)
   const [scanError,    setScanError]    = useState<string | null>(null)
+  const [useExistingVipData, setUseExistingVipData] = useState(true)
 
   // Check if library has any photos on mount
   useEffect(() => {
@@ -32,7 +33,7 @@ export default function LibraryPage({ onScanStarted }: Props) {
     setScanMsg(null)
     setScanError(null)
     try {
-      await api.pipeline.scan(folder.trim())
+      await api.pipeline.scan(folder.trim(), false, useExistingVipData)
       setScanMsg('Pipeline started! Switch to the Pipeline tab to monitor progress.')
       onScanStarted?.()
     } catch (e: unknown) {
@@ -59,6 +60,15 @@ export default function LibraryPage({ onScanStarted }: Props) {
       >
         {scanning ? 'Starting…' : '⚙️ Scan'}
       </button>
+      <label className="text-xs text-gray-300 inline-flex items-center gap-1.5 ml-1 select-none">
+        <input
+          type="checkbox"
+          checked={useExistingVipData}
+          onChange={e => setUseExistingVipData(e.target.checked)}
+          className="accent-indigo-500"
+        />
+        Use existing VIP data if found
+      </label>
       {scanMsg   && <p className="text-green-400 text-xs w-full">{scanMsg}</p>}
       {scanError && <p className="text-red-400  text-xs w-full">{scanError}</p>}
     </div>
@@ -97,6 +107,15 @@ export default function LibraryPage({ onScanStarted }: Props) {
               {scanning ? '…' : 'Scan'}
             </button>
           </div>
+          <label className="text-xs text-gray-300 inline-flex items-center gap-1.5 select-none">
+            <input
+              type="checkbox"
+              checked={useExistingVipData}
+              onChange={e => setUseExistingVipData(e.target.checked)}
+              className="accent-indigo-500"
+            />
+            Use existing VIP data if found
+          </label>
           {scanMsg   && <p className="text-green-400 text-sm">{scanMsg}</p>}
           {scanError && <p className="text-red-400  text-sm">{scanError}</p>}
           <p className="text-xs text-gray-500">

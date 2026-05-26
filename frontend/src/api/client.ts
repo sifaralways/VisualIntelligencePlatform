@@ -97,10 +97,14 @@ export const api = {
   },
 
   pipeline: {
-    scan: (folder: string, forceReprocess = false) =>
+    scan: (folder: string, forceReprocess = false, useExistingVipData = true) =>
       request('/pipeline/scan', {
         method: 'POST',
-        body: JSON.stringify({ folder, force_reprocess: forceReprocess }),
+        body: JSON.stringify({
+          folder,
+          force_reprocess: forceReprocess,
+          use_existing_vip_data: useExistingVipData,
+        }),
       }),
     rescan: (forceRetag = false) =>
       request<{ status: string; folder: string }>('/pipeline/rescan', {

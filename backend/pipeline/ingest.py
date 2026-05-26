@@ -203,7 +203,8 @@ async def run_reprocess(force_retag: bool = False) -> None:
     # Step 5b: If the user requested a full re-tag, run Phase 4 now.
     # (tags_done was already reset to 0 at the top of this function.)
     if force_retag:
-        await _phase_tag()
+        tagged_ids = await _phase_tag()
+        await _phase_florence(tagged_ids)
 
     # Keep CLIP embeddings current for natural-language visual search.
     await _phase_clip_index()
@@ -382,7 +383,8 @@ async def run_single_reprocess(media_id: int) -> None:
             (media_id,),
         )
 
-    await _phase_tag(scoped_ids)
+    tagged_ids = await _phase_tag(scoped_ids)
+    await _phase_florence(tagged_ids)
     await _phase_analyse(media_ids=scoped_ids)
 
     await broadcast("pipeline_complete", folder=f"[reprocess photo {media_id}]")
@@ -490,7 +492,8 @@ async def run_batch_reprocess(media_ids: list[int]) -> None:
             valid_ids,
         )
 
-    await _phase_tag(scoped_ids)
+    tagged_ids = await _phase_tag(scoped_ids)
+    await _phase_florence(tagged_ids)
     await _phase_analyse(media_ids=scoped_ids)
 
     await broadcast("pipeline_complete", folder=label)
@@ -708,13 +711,17 @@ async def run_clip_index_rebuild() -> None:
 # ---------------------------------------------------------------------------
 # Main pipeline entry point
 # ---------------------------------------------------------------------------
-async def run_ingest(folder: str) -> None:
+async def run_ingest(folder: str, use_existing_vip_data: bool = True) -> None:
     """
     Full ingest pipeline for a given folder path.
     Called by the API route /api/pipeline/scan
     """
     folder_path = Path(folder).resolve()
-    logger.info("=== Pipeline start: %s ===", folder_path)
+    logger.info(
+        "=== Pipeline start: %s (use_existing_vip_data=%s) ===",
+        folder_path,
+        use_existing_vip_data,
+    )
 
     await broadcast("pipeline_start", folder=str(folder_path))
 
@@ -725,7 +732,7 @@ async def run_ingest(folder: str) -> None:
     _ensure_models()
 
     # -- Phase 1: Scan, hash, EXIF -----------------------------------------
-    await _phase_scan(folder_path)
+    await _phase_scan(folder_path, use_existing_vip_data=use_existing_vip_data)
 
     # -- Phase 2: Extract previews + detect + embed -------------------------
     await _phase_embed()
@@ -762,15 +769,21 @@ async def run_ingest(folder: str) -> None:
     # the external_exif snapshot (captured at first INSERT) and matches
     # the stored MWG face regions back to the freshly-detected face clusters
     # by bounding-box centre proximity, then re-assigns person names.
-    await _phase_restore_vip_names()
+    if use_existing_vip_data:
+        await _phase_restore_vip_names()
+    else:
+        logger.info("Phase 3c skipped: treating imports as new photos (VIP history disabled)")
 
-    # -- Phase 4: Tag (objects, animals, geography, places) -----------------
-    await _phase_tag()
+    # -- Phase 4: Core tagging (objects/animals/geography/places/explicit) --
+    tagged_ids = await _phase_tag()
+
+    # -- Phase 5: Florence enrichment (caption/OCR/region) ------------------
+    await _phase_florence(tagged_ids)
 
     # -- Phase 4b: Build per-photo CLIP vector index -------------------------
     await _phase_clip_index()
 
-    # -- Phase 5: Build analysis documents (Rekognition-format JSON) --------
+    # -- Phase 6: Build analysis documents (Rekognition-format JSON) --------
     await _phase_analyse()
 
     # Sync denormalised photo_count on all active persons
@@ -800,7 +813,7 @@ _HASH_CONCURRENCY = 8     # simultaneous SHA-256 read streams
 _TAG_BATCH_SIZE   = 16    # images per YOLO GPU forward pass in Phase 4
 
 
-async def _phase_scan(folder: Path) -> None:
+async def _phase_scan(folder: Path, use_existing_vip_data: bool = True) -> None:
     logger.info("Phase 1: Scanning %s", folder)
     await broadcast("phase_start", phase="scan")
 
@@ -892,7 +905,7 @@ async def _phase_scan(folder: Path) -> None:
                     # (RAW+JPEG pairs, camera firmware duplication, or files
                     # shared across folders can all carry the same identifier).
                     # In those cases fall back to a fresh UUID.
-                    _candidate_id = meta.get("xmp_identifier")
+                    _candidate_id = meta.get("xmp_identifier") if use_existing_vip_data else None
                     if _candidate_id:
                         _taken = await (await db.execute(
                             "SELECT 1 FROM media_files WHERE vip_id=?", (_candidate_id,)
@@ -905,15 +918,15 @@ async def _phase_scan(folder: Path) -> None:
                     # existed in the file *before* VIP touches it.  This snapshot
                     # drives the "VIP History" / "External History" display.
                     _ext: dict = {}
-                    if meta.get("xmp_identifier"):
+                    if use_existing_vip_data and meta.get("xmp_identifier"):
                         _ext["identifier"] = meta["xmp_identifier"]
-                    if meta.get("xmp_persons"):
+                    if use_existing_vip_data and meta.get("xmp_persons"):
                         _ext["persons"] = meta["xmp_persons"]
                     if meta.get("xmp_keywords"):
                         _ext["keywords"] = meta["xmp_keywords"]
                     if meta.get("xmp_location"):
                         _ext["location"] = meta["xmp_location"]
-                    if meta.get("xmp_region_info"):
+                    if use_existing_vip_data and meta.get("xmp_region_info"):
                         _ext["region_info"] = meta["xmp_region_info"]
                     external_exif_json = json.dumps(_ext) if _ext else None
 
@@ -2102,26 +2115,170 @@ async def _phase_restore_vip_names(media_ids: set[int] | None = None) -> None:
             for pid in touched_person_ids:
                 await update_person_centroid(db, pid)
 
+    # ------------------------------------------------------------------
+    # Fallback for legacy files with PersonInImage but no MWG face regions.
+    #
+    # Some historical writes include only a photo-level person list and omit
+    # per-face region boxes. In that case, we cannot do geometric matching.
+    # We infer cluster->name links conservatively from repeated co-occurrence
+    # patterns across VIP-history photos and only assign high-confidence pairs.
+    # ------------------------------------------------------------------
+    if media_ids:
+        placeholders = ",".join("?" * len(media_ids))
+        history_rows_query = f"""
+            SELECT mf.id AS media_id, mf.external_exif
+            FROM media_files mf
+            WHERE mf.external_exif IS NOT NULL
+              AND mf.external_exif LIKE '%"identifier"%'
+              AND mf.external_exif LIKE '%"persons"%'
+              AND mf.ingest_state IN ('embedded', 'clustered', 'tagged')
+              AND mf.id IN ({placeholders})
+        """
+        history_rows_params = tuple(sorted(media_ids))
+    else:
+        history_rows_query = """
+            SELECT mf.id AS media_id, mf.external_exif
+            FROM media_files mf
+            WHERE mf.external_exif IS NOT NULL
+              AND mf.external_exif LIKE '%"identifier"%'
+              AND mf.external_exif LIKE '%"persons"%'
+              AND mf.ingest_state IN ('embedded', 'clustered', 'tagged')
+        """
+        history_rows_params: tuple[Any, ...] = ()
+
+    async with get_db() as db:
+        history_rows = await db.execute_fetchall(history_rows_query, history_rows_params)
+
+    media_persons: dict[int, list[str]] = {}
+    candidate_media_ids: set[int] = set()
+    for row in history_rows:
+        try:
+            ext = json.loads(row["external_exif"])
+        except Exception:
+            continue
+        if ext.get("region_info"):
+            continue
+        persons_list = [str(p).strip() for p in (ext.get("persons") or []) if str(p).strip()]
+        if not persons_list:
+            continue
+        media_id = int(row["media_id"])
+        media_persons[media_id] = persons_list
+        candidate_media_ids.add(media_id)
+
+    if candidate_media_ids:
+        placeholders = ",".join("?" * len(candidate_media_ids))
+        async with get_db() as db:
+            face_rows = await db.execute_fetchall(
+                f"""
+                SELECT media_file_id, cluster_id
+                FROM faces
+                WHERE person_id IS NULL
+                  AND cluster_id IS NOT NULL
+                  AND media_file_id IN ({placeholders})
+                """,
+                tuple(sorted(candidate_media_ids)),
+            )
+
+        media_clusters: dict[int, set[int]] = {}
+        cluster_media_count: dict[int, int] = {}
+        cluster_name_votes: dict[tuple[int, str], int] = {}
+
+        for r in face_rows:
+            media_id = int(r["media_file_id"])
+            cid = int(r["cluster_id"])
+            media_clusters.setdefault(media_id, set()).add(cid)
+
+        for media_id, clusters in media_clusters.items():
+            names = media_persons.get(media_id) or []
+            if not names:
+                continue
+            for cid in clusters:
+                cluster_media_count[cid] = cluster_media_count.get(cid, 0) + 1
+                for name in names:
+                    key = (cid, name)
+                    cluster_name_votes[key] = cluster_name_votes.get(key, 0) + 1
+
+        inferred: list[tuple[int, str]] = []
+        for cid, seen_media in cluster_media_count.items():
+            scored: list[tuple[str, int]] = []
+            for (vote_cid, name), votes in cluster_name_votes.items():
+                if vote_cid == cid:
+                    scored.append((name, votes))
+            if not scored:
+                continue
+            scored.sort(key=lambda x: x[1], reverse=True)
+            best_name, best_votes = scored[0]
+            second_votes = scored[1][1] if len(scored) > 1 else 0
+
+            # Conservative acceptance: enough evidence, clear winner, and
+            # appears in most photos where this cluster is seen.
+            if best_votes < 2:
+                continue
+            if best_votes < (second_votes + 2):
+                continue
+            if (best_votes / max(seen_media, 1)) < 0.6:
+                continue
+
+            inferred.append((cid, best_name))
+
+        if inferred:
+            touched_person_ids: set[int] = set()
+            async with get_db() as db:
+                for cid, person_name in inferred:
+                    person_row = await (await db.execute(
+                        "SELECT id FROM persons WHERE name=? AND is_merged=0 LIMIT 1",
+                        (person_name,),
+                    )).fetchone()
+                    if person_row:
+                        person_id = int(person_row["id"])
+                    else:
+                        cursor = await db.execute(
+                            """
+                            INSERT INTO persons (uuid, name, named_at)
+                            VALUES (?, ?, datetime('now'))
+                            """,
+                            (str(uuid.uuid4()), person_name),
+                        )
+                        person_id = int(cursor.lastrowid)
+
+                    await db.execute("UPDATE clusters SET person_id=? WHERE id=?", (person_id, cid))
+                    await db.execute(
+                        "UPDATE faces SET person_id=? WHERE cluster_id=? AND person_id IS NULL",
+                        (person_id, cid),
+                    )
+                    await db.execute(
+                        """
+                        INSERT OR REPLACE INTO writeback_queue (media_file_id)
+                        SELECT DISTINCT media_file_id FROM faces WHERE cluster_id=?
+                        """,
+                        (cid,),
+                    )
+                    touched_person_ids.add(person_id)
+                    restored += 1
+
+                for pid in touched_person_ids:
+                    await update_person_centroid(db, pid)
+
+            logger.info(
+                "Phase 3c fallback: inferred %d cluster-name assignment(s) from PersonInImage history",
+                len(inferred),
+            )
+
     logger.info("Phase 3c complete: %d face name(s) restored from VIP History", restored)
 
 
 # ---------------------------------------------------------------------------
-# Phase 4: Tag — objects, animals, geography, places
+# Phase 4: Core tagging — objects, animals, geography, places, explicit
 # ---------------------------------------------------------------------------
-async def _phase_tag(media_ids: set[int] | None = None) -> None:
+async def _phase_tag(media_ids: set[int] | None = None) -> set[int]:
     phase_started = time.perf_counter()
     concurrency = int(settings_store.get("tag_concurrency"))
-    florence_concurrency = max(
-        1,
-        min(concurrency, int(settings_store.get("florence_concurrency") or 1)),
-    )
     scope = "all pending files" if not media_ids else f"{len(media_ids)} selected file(s)"
     logger.info(
-        "Phase 4: Tagging (objects, animals, geography, places) "
-        "[scope=%s, concurrency=%d, florence_concurrency=%d, yolo_batch=%d]",
+        "Phase 4: Core tagging (objects, animals, geography, places) "
+        "[scope=%s, concurrency=%d, yolo_batch=%d]",
         scope,
         concurrency,
-        florence_concurrency,
         _TAG_BATCH_SIZE,
     )
     await broadcast("phase_start", phase="tag")
@@ -2129,8 +2286,6 @@ async def _phase_tag(media_ids: set[int] | None = None) -> None:
     # Load tagging models lazily (first pipeline run only)
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _tagger.load)
-    if bool(int(settings_store.get("florence_enabled") or 0)):
-        await loop.run_in_executor(None, _florence.load)
 
     # Files that have not been tagged yet (tags_done = 0) and are at least
     # in the embedded/clustered/tagged state (i.e. past Phase 2).
@@ -2164,15 +2319,13 @@ async def _phase_tag(media_ids: set[int] | None = None) -> None:
     logger.info("Phase 4: %d files to tag", total)
     if total == 0:
         await broadcast("phase_complete", phase="tag", tagged=0)
-        return
+        return set()
 
     sem = asyncio.Semaphore(concurrency)
-    florence_sem = asyncio.Semaphore(florence_concurrency)
     _counter = [0]
     _tagger_seconds = [0.0]
-    _florence_seconds = [0.0]
-    _florence_wait_seconds = [0.0]
     _batches = [0]
+    _processed_ids: set[int] = set()
 
     async def _process_batch(batch: list) -> None:
         async with sem:
@@ -2195,20 +2348,6 @@ async def _phase_tag(media_ids: set[int] | None = None) -> None:
             tag_results = await loop.run_in_executor(None, _tagger.tag_batch, items)
             _tagger_seconds[0] += time.perf_counter() - _tagger_started
 
-            _florence_wait_started = time.perf_counter()
-            if _florence.available:
-                async with florence_sem:
-                    _florence_wait_seconds[0] += time.perf_counter() - _florence_wait_started
-                    _florence_started = time.perf_counter()
-                    florence_results = await loop.run_in_executor(
-                        None,
-                        _florence.analyze_batch,
-                        preview_paths,
-                    )
-                    _florence_seconds[0] += time.perf_counter() - _florence_started
-            else:
-                florence_results = [None] * len(preview_paths)
-
             # Batch-persist all tags and state transitions in one DB write.
             async with get_db() as db:
                 # Clear all model-generated tag categories for this batch so
@@ -2217,16 +2356,14 @@ async def _phase_tag(media_ids: set[int] | None = None) -> None:
                     placeholders = ",".join("?" * len(media_ids))
                     await db.execute(
                         f"DELETE FROM media_tags "
-                        f"WHERE category IN ('object', 'animal', 'geography', 'place', 'explicit', 'caption', 'ocr', 'region') "
+                        f"WHERE category IN ('object', 'animal', 'geography', 'place', 'explicit') "
                         f"AND media_file_id IN ({placeholders})",
                         media_ids,
                     )
 
                 tag_rows: list[tuple] = []
                 gps_resolved_ids: list[int] = []   # files that got a GPS-resolved place label
-                for media_id, result, florence_result, (gps_lat, gps_lon) in zip(
-                    media_ids, tag_results, florence_results, gps_data
-                ):
+                for media_id, result, (gps_lat, gps_lon) in zip(media_ids, tag_results, gps_data):
                     for label in result.objects:
                         tag_rows.append((media_id, "object", label, None, "yolov11"))
                     for label in result.animals:
@@ -2244,13 +2381,6 @@ async def _phase_tag(media_ids: set[int] | None = None) -> None:
                             gps_resolved_ids.append(media_id)
                     for label in result.explicit_labels:
                         tag_rows.append((media_id, "explicit", label, None, "nudenet"))
-                    if florence_result is not None:
-                        if florence_result.caption:
-                            tag_rows.append((media_id, "caption", florence_result.caption, None, "florence2"))
-                        for line in florence_result.ocr_lines:
-                            tag_rows.append((media_id, "ocr", line, None, "florence2"))
-                        for region in florence_result.region_descriptions:
-                            tag_rows.append((media_id, "region", region, None, "florence2"))
 
                 if tag_rows:
                     await db.executemany("""
@@ -2282,6 +2412,7 @@ async def _phase_tag(media_ids: set[int] | None = None) -> None:
 
             _counter[0] += len(batch)
             _batches[0] += 1
+            _processed_ids.update(media_ids)
             await broadcast("tag_progress", done=_counter[0], total=total)
 
     # Chunk rows into YOLO-batch-sized groups and fan them out concurrently.
@@ -2292,26 +2423,169 @@ async def _phase_tag(media_ids: set[int] | None = None) -> None:
     processed = max(_counter[0], 1)
     wall_s_per_photo = wall_seconds / processed
     tagger_s_per_photo = _tagger_seconds[0] / processed
-    florence_s_per_photo = _florence_seconds[0] / processed
-    florence_wait_s_per_photo = _florence_wait_seconds[0] / processed
     logger.info(
         "Phase 4 timing: wall=%.2fs (%.3fs/photo), batches=%d, "
-        "tagger=%.2fs total (%.3fs/photo), "
-        "florence_compute=%.2fs total (%.3fs/photo), "
-        "florence_wait=%.2fs total (%.3fs/photo)",
+        "tagger=%.2fs total (%.3fs/photo)",
         wall_seconds,
         wall_s_per_photo,
         _batches[0],
         _tagger_seconds[0],
         tagger_s_per_photo,
-        _florence_seconds[0],
-        florence_s_per_photo,
-        _florence_wait_seconds[0],
-        florence_wait_s_per_photo,
     )
 
     await broadcast("phase_complete", phase="tag", tagged=_counter[0])
     logger.info("Phase 4 complete: %d files tagged", _counter[0])
+    return _processed_ids
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Florence enrichment — caption, OCR, region
+# ---------------------------------------------------------------------------
+async def _phase_florence(media_ids: set[int] | None = None) -> set[int]:
+    if not media_ids:
+        return set()
+
+    if not bool(int(settings_store.get("florence_enabled") or 0)):
+        logger.info("Phase 5: Florence disabled — skipping enrichment")
+        await broadcast("phase_complete", phase="florence", tagged=0)
+        return set()
+
+    phase_started = time.perf_counter()
+    scope = f"{len(media_ids)} selected file(s)"
+    florence_concurrency = max(
+        1,
+        min(int(settings_store.get("tag_concurrency")), int(settings_store.get("florence_concurrency") or 1)),
+    )
+    logger.info(
+        "Phase 5: Florence enrichment (caption/OCR/region) "
+        "[scope=%s, florence_concurrency=%d, batch=%d]",
+        scope,
+        florence_concurrency,
+        _TAG_BATCH_SIZE,
+    )
+    await broadcast("phase_start", phase="florence")
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _florence.load)
+    if not _florence.available:
+        logger.warning("Phase 5: Florence model unavailable — skipping enrichment")
+        await broadcast("phase_complete", phase="florence", tagged=0)
+        return set()
+
+    placeholders = ",".join("?" * len(media_ids))
+    async with get_db() as db:
+        rows = await db.execute_fetchall(
+            f"""
+            SELECT id, file_path
+            FROM media_files
+            WHERE is_stub = 0
+              AND ingest_state IN ('tagged')
+              AND id IN ({placeholders})
+            """,
+            tuple(sorted(media_ids)),
+        )
+
+    total = len(rows)
+    logger.info("Phase 5: %d files to enrich", total)
+    if total == 0:
+        await broadcast("phase_complete", phase="florence", tagged=0)
+        return set()
+
+    sem = asyncio.Semaphore(florence_concurrency)
+    _counter = [0]
+    _compute_seconds = [0.0]
+    _wait_seconds = [0.0]
+    _batches = [0]
+    _processed_ids: set[int] = set()
+
+    async def _process_batch(batch: list) -> None:
+        wait_started = time.perf_counter()
+        async with sem:
+            _wait_seconds[0] += time.perf_counter() - wait_started
+
+            preview_paths: list[Path] = []
+            batch_media_ids = [row["id"] for row in batch]
+            for row in batch:
+                path = Path(row["file_path"])
+                pp = settings.preview_dir / f"{path.stem}_{_hash_path(path)}.jpg"
+                if not pp.exists():
+                    pp = await extract_preview(path) or pp
+                preview_paths.append(pp)
+
+            compute_started = time.perf_counter()
+            florence_results = await loop.run_in_executor(None, _florence.analyze_batch, preview_paths)
+            _compute_seconds[0] += time.perf_counter() - compute_started
+
+            async with get_db() as db:
+                if batch_media_ids:
+                    ph = ",".join("?" * len(batch_media_ids))
+                    await db.execute(
+                        f"DELETE FROM media_tags "
+                        f"WHERE category IN ('caption', 'ocr', 'region') "
+                        f"AND media_file_id IN ({ph})",
+                        batch_media_ids,
+                    )
+
+                tag_rows: list[tuple] = []
+                changed_ids: list[int] = []
+                for media_id, florence_result in zip(batch_media_ids, florence_results):
+                    before = len(tag_rows)
+                    if florence_result is not None:
+                        if florence_result.caption:
+                            tag_rows.append((media_id, "caption", florence_result.caption, None, "florence2"))
+                        for line in florence_result.ocr_lines:
+                            tag_rows.append((media_id, "ocr", line, None, "florence2"))
+                        for region in florence_result.region_descriptions:
+                            tag_rows.append((media_id, "region", region, None, "florence2"))
+                    if len(tag_rows) > before:
+                        changed_ids.append(media_id)
+
+                if tag_rows:
+                    await db.executemany(
+                        """
+                        INSERT OR IGNORE INTO media_tags
+                            (media_file_id, category, label, confidence, model)
+                        VALUES (?,?,?,?,?)
+                        """,
+                        tag_rows,
+                    )
+
+                if changed_ids:
+                    await db.executemany(
+                        "INSERT OR REPLACE INTO writeback_queue (media_file_id) VALUES (?)",
+                        [(mid,) for mid in changed_ids],
+                    )
+
+            for pp in preview_paths:
+                if pp.exists():
+                    await delete_preview(pp)
+
+            _counter[0] += len(batch)
+            _batches[0] += 1
+            _processed_ids.update(batch_media_ids)
+            await broadcast("florence_progress", done=_counter[0], total=total)
+
+    batches = [rows[i : i + _TAG_BATCH_SIZE] for i in range(0, len(rows), _TAG_BATCH_SIZE)]
+    await asyncio.gather(*[_process_batch(b) for b in batches])
+
+    wall_seconds = max(time.perf_counter() - phase_started, 0.001)
+    processed = max(_counter[0], 1)
+    logger.info(
+        "Phase 5 timing: wall=%.2fs (%.3fs/photo), batches=%d, "
+        "florence_compute=%.2fs total (%.3fs/photo), "
+        "florence_wait=%.2fs total (%.3fs/photo)",
+        wall_seconds,
+        wall_seconds / processed,
+        _batches[0],
+        _compute_seconds[0],
+        _compute_seconds[0] / processed,
+        _wait_seconds[0],
+        _wait_seconds[0] / processed,
+    )
+
+    await broadcast("phase_complete", phase="florence", tagged=_counter[0])
+    logger.info("Phase 5 complete: %d files enriched", _counter[0])
+    return _processed_ids
 
 
 def _encode_clip_photo_embedding(preview_path: Path, landmark) -> np.ndarray | None:

@@ -10,6 +10,7 @@ export default function PipelinePage() {
   const [folder, setFolder] = useState('')
   const [status, setStatus] = useState<string>('idle')
   const [events, setEvents] = useState<WsEvent[]>([])
+  const [useExistingVipData, setUseExistingVipData] = useState(true)
   const wsRef = useRef<WebSocket | null>(null)
   const logRef = useRef<HTMLDivElement>(null)
 
@@ -40,7 +41,7 @@ export default function PipelinePage() {
     setEvents([])
     setStatus('running')
     try {
-      await api.pipeline.scan(folder.trim())
+      await api.pipeline.scan(folder.trim(), false, useExistingVipData)
     } catch (e) {
       setStatus('error')
     }
@@ -106,6 +107,15 @@ export default function PipelinePage() {
             Refresh
           </button>
         </div>
+        <label className="mt-2 text-xs text-gray-300 inline-flex items-center gap-1.5 select-none">
+          <input
+            type="checkbox"
+            checked={useExistingVipData}
+            onChange={e => setUseExistingVipData(e.target.checked)}
+            className="accent-indigo-500"
+          />
+          Use existing VIP data if found
+        </label>
       </div>
 
       {/* Rescan all existing library photos */}

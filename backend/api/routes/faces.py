@@ -1,5 +1,9 @@
 """VIP API — Faces routes (thumbnail serving + face management)."""
 
+import json
+import math
+import uuid
+
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 from pathlib import Path
@@ -36,6 +40,211 @@ async def _requeue_as_singleton(db, face_id: int) -> None:
         await db.execute(
             "UPDATE faces SET cluster_id=? WHERE id=?", (new_cluster_id, face_id)
         )
+
+
+def _min_center_distance_with_orientation_variants(
+    face_cx: float,
+    face_cy: float,
+    region_cx: float,
+    region_cy: float,
+) -> float:
+    """
+    Return the minimum centre distance over common orientation transforms.
+
+    VIP detects faces on orientation-corrected previews, while historic XMP
+    regions may be stored in a different orientation basis for some RAW files.
+    """
+    variants = (
+        (region_cx, region_cy),
+        (1.0 - region_cx, region_cy),
+        (region_cx, 1.0 - region_cy),
+        (1.0 - region_cx, 1.0 - region_cy),
+        (region_cy, 1.0 - region_cx),
+        (1.0 - region_cy, region_cx),
+    )
+    return min(math.hypot(face_cx - x, face_cy - y) for x, y in variants)
+
+
+def _extract_named_regions_from_history(ext: dict) -> list[dict[str, float | str | None]]:
+    named_regions: list[dict[str, float | str | None]] = []
+    region_info = ext.get("region_info")
+    if isinstance(region_info, dict):
+        for r in region_info.get("RegionList", []):
+            name = str(r.get("Name") or "").strip()
+            area = r.get("Area", {})
+            if not name or not isinstance(area, dict) or area.get("Unit") != "normalized":
+                continue
+            try:
+                named_regions.append(
+                    {
+                        "name": name,
+                        "cx": float(area.get("X", 0)),
+                        "cy": float(area.get("Y", 0)),
+                    }
+                )
+            except Exception:
+                continue
+
+    persons_list = [str(p).strip() for p in (ext.get("persons") or []) if str(p).strip()]
+    if not named_regions and len(persons_list) == 1:
+        return [{"name": persons_list[0], "cx": None, "cy": None}]
+    return named_regions
+
+
+def _find_best_face_for_region(region: dict[str, float | str | None], unmatched_faces: list[dict]) -> tuple[dict | None, float]:
+    if region["cx"] is None or region["cy"] is None:
+        return None, float("inf")
+
+    rcx = float(region["cx"])
+    rcy = float(region["cy"])
+    best_face: dict | None = None
+    best_dist = float("inf")
+    for f in unmatched_faces:
+        if f["bbox_x"] is None:
+            continue
+        fcx = float(f["bbox_x"]) + float(f["bbox_w"] or 0) / 2.0
+        fcy = float(f["bbox_y"]) + float(f["bbox_h"] or 0) / 2.0
+        dist = _min_center_distance_with_orientation_variants(fcx, fcy, rcx, rcy)
+        if dist < best_dist:
+            best_dist = dist
+            best_face = f
+    return best_face, best_dist
+
+
+def _single_face_fallback_match(
+    named_regions: list[dict[str, float | str | None]],
+    unmatched_faces: list[dict],
+) -> list[tuple[str, int, int | None]]:
+    if len(unmatched_faces) != 1:
+        return []
+
+    unique_names = sorted(
+        {
+            str(r.get("name") or "").strip()
+            for r in named_regions
+            if str(r.get("name") or "").strip()
+        }
+    )
+    if len(unique_names) != 1:
+        return []
+
+    f = unmatched_faces[0]
+    return [(unique_names[0], int(f["face_id"]), f["cluster_id"])]
+
+
+def _match_history_regions_to_faces(
+    named_regions: list[dict[str, float | str | None]],
+    unmatched_faces: list[dict],
+) -> list[tuple[str, int, int | None]]:
+    matched: list[tuple[str, int, int | None]] = []
+    for region in named_regions:
+        if not unmatched_faces:
+            break
+        if region["cx"] is None or region["cy"] is None:
+            if len(unmatched_faces) == 1:
+                f = unmatched_faces.pop(0)
+                matched.append((str(region["name"]), int(f["face_id"]), f["cluster_id"]))
+            continue
+
+        best_face, best_dist = _find_best_face_for_region(region, unmatched_faces)
+
+        if best_face is not None and best_dist <= 0.18:
+            matched.append((str(region["name"]), int(best_face["face_id"]), best_face["cluster_id"]))
+            unmatched_faces = [f for f in unmatched_faces if f["face_id"] != best_face["face_id"]]
+
+    if matched:
+        return matched
+    return _single_face_fallback_match(named_regions, unmatched_faces)
+
+
+async def _get_or_create_person_id(db, person_name: str) -> int:
+    existing_person = await (
+        await db.execute(
+            "SELECT id FROM persons WHERE name=? AND is_merged=0 AND COALESCE(is_ignored, 0)=0 LIMIT 1",
+            (person_name,),
+        )
+    ).fetchone()
+    if existing_person:
+        return int(existing_person["id"])
+
+    cursor = await db.execute(
+        """
+        INSERT INTO persons (uuid, name, named_at)
+        VALUES (?, ?, datetime('now'))
+        """,
+        (str(uuid.uuid4()), person_name),
+    )
+    return int(cursor.lastrowid)
+
+
+async def _apply_history_matches(
+    db,
+    media_id: int,
+    matched: list[tuple[str, int, int | None]],
+) -> None:
+    touched_person_ids: set[int] = set()
+    for person_name, face_id, cluster_id in matched:
+        person_id = await _get_or_create_person_id(db, person_name)
+        await db.execute("UPDATE faces SET person_id=? WHERE id=?", (person_id, face_id))
+        touched_person_ids.add(person_id)
+
+        if cluster_id is not None:
+            await db.execute("UPDATE clusters SET person_id=? WHERE id=?", (person_id, cluster_id))
+            await db.execute(
+                "UPDATE faces SET person_id=? WHERE cluster_id=? AND person_id IS NULL",
+                (person_id, cluster_id),
+            )
+
+        await db.execute(
+            "INSERT OR REPLACE INTO writeback_queue (media_file_id) VALUES (?)",
+            (media_id,),
+        )
+
+    for pid in touched_person_ids:
+        await update_person_centroid(db, pid)
+
+
+async def _restore_vip_history_names_for_media(db, media_id: int) -> None:
+    """Reconcile unnamed faces for one photo using stored VIP history."""
+    media_row = await (
+        await db.execute(
+            "SELECT external_exif FROM media_files WHERE id=?", (media_id,)
+        )
+    ).fetchone()
+    if not media_row or not media_row["external_exif"]:
+        return
+
+    try:
+        ext = json.loads(media_row["external_exif"])
+    except Exception:
+        return
+
+    if not ext.get("identifier"):
+        return
+
+    named_regions = _extract_named_regions_from_history(ext)
+    if not named_regions:
+        return
+
+    face_rows = await db.execute_fetchall(
+        """
+        SELECT f.id AS face_id, f.cluster_id,
+               f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h,
+               f.person_id
+        FROM faces f
+        WHERE f.media_file_id = ?
+        """,
+        (media_id,),
+    )
+    unmatched_faces = [dict(r) for r in face_rows if r["person_id"] is None]
+    if not unmatched_faces:
+        return
+
+    matched = _match_history_regions_to_faces(named_regions, unmatched_faces)
+    if not matched:
+        return
+
+    await _apply_history_matches(db, media_id, matched)
 
 
 @router.get("/{face_id}/thumbnail")
@@ -87,6 +296,8 @@ async def get_faces_for_media(
     """Return all faces detected in a specific media file, with person names."""
     import json as _json
     async with get_db() as db:
+        await _restore_vip_history_names_for_media(db, media_id)
+
         if include_ignored:
             # Return all faces including those assigned to ignored persons.
             # is_ignored=1 faces are returned with person_name=NULL (they have no real name).
