@@ -19,7 +19,7 @@ import './index.css'
 // View state machine
 // ---------------------------------------------------------------------------
 
-type SidebarSection = 'library' | 'people' | 'animals' | 'places' | 'things' | 'search' | 'assistant' | 'tags' | 'writeback' | 'quality' | 'explicit'
+type SidebarSection = 'library' | 'people' | 'animals' | 'places' | 'things' | 'search' | 'assistant' | 'assistant_v2' | 'tags' | 'writeback' | 'quality' | 'explicit'
 
 interface FilteredView {
   title: string
@@ -520,6 +520,19 @@ export default function App() {
               setSection('search')
               setFiltered(null)
             }}
+            mode="v1"
+          />
+        )
+        break
+      case 'assistant_v2':
+        mainContent = (
+          <AssistantPage
+            onOpenSearch={(query) => {
+              setActiveSearchQuery(query)
+              setSection('search')
+              setFiltered(null)
+            }}
+            mode="v2"
           />
         )
         break
@@ -586,6 +599,7 @@ export default function App() {
         >
           <NavGroup label="Browse">
             <NavItem id="assistant" icon="💬" label="Assistant"    active={section === 'assistant' && !filtered} onClick={() => navigate('assistant')} />
+            <NavItem id="assistant_v2" icon="🧪" label="Assistant V2" active={section === 'assistant_v2' && !filtered} onClick={() => navigate('assistant_v2')} />
             <NavItem id="people"    icon="👤" label="People"       active={(section === 'people'   || filtered?.backTo === 'people')  } onClick={() => navigate('people')} />
             <NavItem id="places"    icon="📍" label="Places"       active={(section === 'places'   || filtered?.backTo === 'places')  } onClick={() => navigate('places')} />
             <NavItem id="things"    icon="📦" label="Things"       active={(section === 'things'   || filtered?.backTo === 'things')  } onClick={() => navigate('things')} />

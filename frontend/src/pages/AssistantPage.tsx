@@ -1,10 +1,18 @@
 import { useState } from 'react'
 import { api } from '../api/client'
-import type { ChatFaceResult, ChatResponse, NaturalSearchResult, Person } from '../api/client'
+import type {
+  ChatFaceResult,
+  ChatResponse,
+  ChatV2Response,
+  NaturalSearchResult,
+  Person,
+  ToolCallTrace,
+} from '../api/client'
 import PhotoDetail from '../components/PhotoDetail'
 
 interface AssistantPageProps {
   onOpenSearch: (query: string) => void
+  mode?: 'v1' | 'v2'
 }
 
 interface ChatMessage {
@@ -12,7 +20,56 @@ interface ChatMessage {
   text: string
 }
 
-export default function AssistantPage({ onOpenSearch }: AssistantPageProps) {
+interface AssistantUiResponse {
+  conversation_id: string
+  reply_text: string
+  results: NaturalSearchResult[]
+  face_results?: ChatFaceResult[]
+  face_total_count?: number
+  count: number
+  intent?: 'SQL_ONLY' | 'CLIP_ONLY' | 'HYBRID'
+  explanation?: string
+  action_payload: {
+    query?: string
+    offset?: number
+    next_offset?: number | null
+    has_more?: boolean
+  }
+  open_search: boolean
+  tool_trace?: ToolCallTrace[]
+}
+
+function normalizeV1Response(res: ChatResponse): AssistantUiResponse {
+  return {
+    conversation_id: res.conversation_id,
+    reply_text: res.reply_text,
+    results: res.results,
+    face_results: res.face_results,
+    face_total_count: res.face_total_count,
+    count: res.count,
+    intent: res.intent,
+    explanation: res.explanation,
+    action_payload: res.action_payload,
+    open_search: res.action === 'open_search',
+  }
+}
+
+function normalizeV2Response(res: ChatV2Response): AssistantUiResponse {
+  return {
+    conversation_id: res.conversation_id,
+    reply_text: res.reply_text,
+    results: res.results,
+    face_results: res.face_results,
+    count: res.count,
+    intent: res.intent,
+    explanation: res.explanation,
+    action_payload: res.action_payload,
+    open_search: res.action_type === 'open_search',
+    tool_trace: res.tool_trace,
+  }
+}
+
+export default function AssistantPage({ onOpenSearch, mode = 'v1' }: AssistantPageProps) {
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [conversationId, setConversationId] = useState<string>('')
@@ -22,7 +79,7 @@ export default function AssistantPage({ onOpenSearch }: AssistantPageProps) {
       text: 'Ask me about your library: counts, top people, or photo searches.',
     },
   ])
-  const [lastResponse, setLastResponse] = useState<ChatResponse | null>(null)
+  const [lastResponse, setLastResponse] = useState<AssistantUiResponse | null>(null)
   const [selected, setSelected] = useState<NaturalSearchResult | null>(null)
   const [namingFace, setNamingFace] = useState<ChatFaceResult | null>(null)
   const [nameInput, setNameInput] = useState('')
@@ -112,7 +169,9 @@ export default function AssistantPage({ onOpenSearch }: AssistantPageProps) {
     setLoading(true)
     setLastUserMessage(message)
     try {
-      const res = await api.chat.message({ message, limit: 100, conversation_id: conversationId || undefined })
+      const res = mode === 'v2'
+        ? normalizeV2Response(await api.chat.messageV2({ message, limit: 100, conversation_id: conversationId || undefined }))
+        : normalizeV1Response(await api.chat.message({ message, limit: 100, conversation_id: conversationId || undefined }))
       setLastResponse(res)
       setMessages(prev => [...prev, { role: 'assistant', text: res.reply_text }])
       setConversationId(res.conversation_id || conversationId)
@@ -134,12 +193,19 @@ export default function AssistantPage({ onOpenSearch }: AssistantPageProps) {
 
     setLoadingMore(true)
     try {
-      const res = await api.chat.message({
-        message: lastUserMessage,
-        limit: 100,
-        offset: nextOffset,
-        conversation_id: conversationId || undefined,
-      })
+      const res = mode === 'v2'
+        ? normalizeV2Response(await api.chat.messageV2({
+            message: lastUserMessage,
+            limit: 100,
+            offset: nextOffset,
+            conversation_id: conversationId || undefined,
+          }))
+        : normalizeV1Response(await api.chat.message({
+            message: lastUserMessage,
+            limit: 100,
+            offset: nextOffset,
+            conversation_id: conversationId || undefined,
+          }))
       // Append results/face_results rather than replacing
       setLastResponse(prev => {
         if (!prev) return res
@@ -161,7 +227,7 @@ export default function AssistantPage({ onOpenSearch }: AssistantPageProps) {
 
   return (
     <div className="flex flex-col gap-4 h-full">
-      <h1 className="text-xl font-semibold">Assistant</h1>
+      <h1 className="text-xl font-semibold">{mode === 'v2' ? 'Assistant V2' : 'Assistant'}</h1>
 
       <div className="rounded-xl border border-gray-800 bg-gray-900/60 p-3 h-72 overflow-y-auto space-y-3">
         {messages.map((m, idx) => (
@@ -200,7 +266,7 @@ export default function AssistantPage({ onOpenSearch }: AssistantPageProps) {
         </button>
       </div>
 
-      {lastResponse?.action === 'open_search' && lastResponse.action_payload?.query && (
+      {lastResponse?.open_search && lastResponse.action_payload?.query && (
         <button
           onClick={() => onOpenSearch(lastResponse.action_payload?.query || '')}
           className="self-start text-xs bg-gray-800 hover:bg-gray-700 text-gray-200 rounded-lg px-3 py-1.5"
@@ -219,8 +285,28 @@ export default function AssistantPage({ onOpenSearch }: AssistantPageProps) {
               )
             : `${lastResponse.count} result${lastResponse.count !== 1 ? 's' : ''}`}
           {lastResponse.intent ? ` • Route: ${lastResponse.intent}` : ''}
+          {mode === 'v2' ? ' • API: V2' : ' • API: V1'}
         </p>
       )}
+
+      {mode === 'v2' && lastResponse?.tool_trace?.length ? (
+        <div className="rounded-lg border border-gray-800 bg-gray-900/50 p-2.5">
+          <p className="text-[11px] text-gray-400 mb-1.5">Tool trace</p>
+          <div className="space-y-1.5">
+            {lastResponse.tool_trace.map((trace, idx) => (
+              <div key={`${trace.tool_name}-${idx}`} className="text-[11px] text-gray-300">
+                <span className="text-indigo-300">{idx + 1}.</span>{' '}
+                <span className="font-medium">{trace.tool_name}</span>{' '}
+                <span className={trace.status === 'ok' ? 'text-emerald-300' : 'text-red-300'}>
+                  {trace.status}
+                </span>{' '}
+                <span className="text-gray-500">({trace.latency_ms} ms)</span>
+                {trace.notes ? <span className="text-gray-400"> • {trace.notes}</span> : null}
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
 
       {faceActionMessage && (
         <p className="text-xs text-indigo-300">{faceActionMessage}</p>

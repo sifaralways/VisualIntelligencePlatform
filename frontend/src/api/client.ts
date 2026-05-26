@@ -263,6 +263,11 @@ export const api = {
         method: 'POST',
         body: JSON.stringify(params),
       }),
+    messageV2: (params: ChatRequest) =>
+      request<ChatV2Response>('/chat/v2/message', {
+        method: 'POST',
+        body: JSON.stringify(params),
+      }),
   },
 
   // ─── Writeback ────────────────────────────────────────────────────────────
@@ -703,6 +708,28 @@ export interface ChatResponse {
   explanation?: string
   error?: string
   top_people?: ChatTopPerson[]
+}
+
+export interface ToolCallTrace {
+  tool_name: string
+  status: 'ok' | 'error'
+  latency_ms: number
+  notes?: string
+  input?: Record<string, unknown>
+}
+
+export interface ChatV2Response {
+  version: 'v2'
+  conversation_id: string
+  reply_text: string
+  action_type: 'none' | 'open_search' | 'clarification' | 'tool_error'
+  action_payload: ChatActionPayload
+  results: NaturalSearchResult[]
+  face_results?: ChatFaceResult[]
+  count: number
+  intent?: 'SQL_ONLY' | 'CLIP_ONLY' | 'HYBRID'
+  explanation?: string
+  tool_trace?: ToolCallTrace[]
 }
 
 export interface WritebackPreview {
