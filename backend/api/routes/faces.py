@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 from pathlib import Path
 
+from backend.config import settings
 from backend.database.db import get_db
 from backend.pipeline.centroid import update_person_centroid
 
@@ -48,7 +49,11 @@ async def get_face_thumbnail(face_id: int):
     if not row or not row["thumbnail_path"]:
         raise HTTPException(status_code=404, detail="Thumbnail not found")
 
-    path = Path(row["thumbnail_path"])
+    raw_path = Path(row["thumbnail_path"])
+
+    # Profile migration moved thumbnails under per-profile directories.
+    # Legacy DB rows may still point at the old shared root path.
+    path = raw_path if raw_path.exists() else (settings.thumbnail_dir / raw_path.name)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Thumbnail file missing on disk")
 

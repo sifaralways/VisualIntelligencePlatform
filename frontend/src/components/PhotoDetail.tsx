@@ -20,6 +20,9 @@ type EditMode =
 interface Props {
   mediaId: number
   filePath: string
+  canGoPrev?: boolean
+  canGoNext?: boolean
+  onNavigate?: (delta: number) => void
   onClose: () => void
   onTagRemoved?: () => void
 }
@@ -42,7 +45,15 @@ function toThumbUrl(path: string | null | undefined): string | null {
   return rel ? `/thumbnails/${rel}` : null
 }
 
-export default function PhotoDetail({ mediaId, filePath, onClose, onTagRemoved }: Props) {
+export default function PhotoDetail({
+  mediaId,
+  filePath,
+  canGoPrev = false,
+  canGoNext = false,
+  onNavigate,
+  onClose,
+  onTagRemoved,
+}: Props) {
   const [tags,    setTags]    = useState<TagsByCategory | null>(null)
   const [faces,   setFaces]   = useState<FaceRow[]>([])
   const [persons, setPersons] = useState<Person[]>([])
@@ -302,17 +313,56 @@ export default function PhotoDetail({ mediaId, filePath, onClose, onTagRemoved }
     onTagRemoved?.()
   }
 
-  // Close on Escape — but only if no edit is in progress
+  // Close on Escape; Arrow keys navigate photos when not typing in an input.
   useEffect(() => {
+    const isTypingTarget = (target: EventTarget | null): boolean => {
+      const el = target as HTMLElement | null
+      if (!el) return false
+      const tag = el.tagName
+      return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable
+    }
+
     const handler = (e: KeyboardEvent) => {
+      if (isTypingTarget(e.target)) return
+
       if (e.key === 'Escape') {
         if (editMode) { cancelEdit(); return }
         onClose()
+        return
+      }
+
+      if (!onNavigate) return
+
+      if (e.key === 'ArrowLeft') {
+        if (!canGoPrev) return
+        e.preventDefault()
+        onNavigate(-1)
+        return
+      }
+
+      if (e.key === 'ArrowRight') {
+        if (!canGoNext) return
+        e.preventDefault()
+        onNavigate(1)
+        return
+      }
+
+      if (e.key === 'ArrowUp') {
+        if (!canGoPrev) return
+        e.preventDefault()
+        onNavigate(-10)
+        return
+      }
+
+      if (e.key === 'ArrowDown') {
+        if (!canGoNext) return
+        e.preventDefault()
+        onNavigate(10)
       }
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [onClose, editMode]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [onClose, editMode, onNavigate, canGoPrev, canGoNext])
 
   // Autocomplete: persons whose name includes the current input
   const nameSuggestions = nameInput.trim().length > 0
