@@ -9,6 +9,7 @@ from typing import Any
 from PIL import Image
 
 from backend.config import settings
+from backend.database.settings_store import get as get_setting
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,8 @@ _CAPTION_MAX_NEW_TOKENS = 256
 _OCR_MAX_NEW_TOKENS = 128
 _REGION_MAX_NEW_TOKENS = 192
 _NUMERIC_ONLY_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
+_DEFAULT_INFERENCE_BATCH_SIZE = 8
+_DEFAULT_NUM_BEAMS = 1
 
 
 @dataclass
@@ -113,11 +116,133 @@ class FlorenceAnalyzer:
             return FlorenceResult()
 
     def analyze_batch(self, image_paths: list[Path]) -> list[FlorenceResult]:
-        return [self.analyze(image_path) for image_path in image_paths]
+        if not image_paths:
+            return []
+        if not self._available or self._model is None or self._processor is None:
+            return [FlorenceResult() for _ in image_paths]
+
+        results = [FlorenceResult() for _ in image_paths]
+        valid_entries = self._load_valid_entries(image_paths)
+
+        if not valid_entries:
+            return results
+
+        batch_size = max(1, int(get_setting("florence_inference_batch_size") or _DEFAULT_INFERENCE_BATCH_SIZE))
+        num_beams = max(1, int(get_setting("florence_num_beams") or _DEFAULT_NUM_BEAMS))
+        for start in range(0, len(valid_entries), batch_size):
+            chunk = valid_entries[start : start + batch_size]
+            self._analyze_chunk(chunk, image_paths, results, num_beams)
+
+        return results
+
+    def _load_valid_entries(self, image_paths: list[Path]) -> list[tuple[int, Image.Image, tuple[int, int]]]:
+        valid_entries: list[tuple[int, Image.Image, tuple[int, int]]] = []
+        for idx, image_path in enumerate(image_paths):
+            if not image_path.exists():
+                continue
+            try:
+                with Image.open(image_path).convert("RGB") as img:
+                    copy = img.copy()
+                    valid_entries.append((idx, copy, (copy.width, copy.height)))
+            except Exception as exc:
+                logger.warning("Florence image load failed for %s: %s", image_path.name, exc)
+        return valid_entries
+
+    def _analyze_chunk(
+        self,
+        chunk: list[tuple[int, Image.Image, tuple[int, int]]],
+        image_paths: list[Path],
+        results: list[FlorenceResult],
+        num_beams: int,
+    ) -> None:
+        indices = [entry[0] for entry in chunk]
+        images = [entry[1] for entry in chunk]
+        sizes = [entry[2] for entry in chunk]
+        try:
+            caption_values = self._run_task_batch(
+                images,
+                sizes,
+                _CAPTION_TASK,
+                max_new_tokens=_CAPTION_MAX_NEW_TOKENS,
+                num_beams=num_beams,
+            )
+            ocr_values = self._run_task_batch(
+                images,
+                sizes,
+                _OCR_TASK,
+                max_new_tokens=_OCR_MAX_NEW_TOKENS,
+                num_beams=num_beams,
+            )
+            region_values = self._run_task_batch(
+                images,
+                sizes,
+                _REGION_TASK,
+                max_new_tokens=_REGION_MAX_NEW_TOKENS,
+                num_beams=num_beams,
+            )
+            for i, idx in enumerate(indices):
+                results[idx] = FlorenceResult(
+                    caption=self._normalize_caption(caption_values[i]),
+                    ocr_lines=self._normalize_lines(ocr_values[i]),
+                    region_descriptions=self._normalize_lines(
+                        region_values[i],
+                        drop_numeric_only=True,
+                    ),
+                )
+        except Exception as exc:
+            names = ", ".join(image_paths[i].name for i in indices)
+            logger.warning("Florence batch inference failed for [%s]: %s", names, exc)
+        finally:
+            for image in images:
+                image.close()
+
+    def _run_task_batch(
+        self,
+        images: list[Image.Image],
+        image_sizes: list[tuple[int, int]],
+        task_prompt: str,
+        max_new_tokens: int = 128,
+        num_beams: int = _DEFAULT_NUM_BEAMS,
+    ) -> list[Any]:
+        import torch
+
+        if not images:
+            return []
+
+        prompts = [task_prompt] * len(images)
+        inputs = self._processor(text=prompts, images=images, return_tensors="pt", padding=True)
+        device_inputs = {
+            key: value.to(self._device) if hasattr(value, "to") else value
+            for key, value in inputs.items()
+        }
+        with torch.inference_mode():
+            generated_ids = self._model.generate(
+                **device_inputs,
+                max_new_tokens=max_new_tokens,
+                num_beams=num_beams,
+                early_stopping=bool(num_beams > 1),
+                do_sample=False,
+            )
+        generated_texts = self._processor.batch_decode(generated_ids, skip_special_tokens=False)
+
+        outputs: list[Any] = []
+        for generated_text, image_size in zip(generated_texts, image_sizes):
+            try:
+                outputs.append(
+                    self._processor.post_process_generation(
+                        generated_text,
+                        task=task_prompt,
+                        image_size=image_size,
+                    )
+                )
+            except Exception:
+                outputs.append(generated_text)
+        return outputs
 
     def _run_task(self, image: Image.Image, task_prompt: str, max_new_tokens: int = 128) -> Any:
         import torch
 
+        num_beams = max(1, int(get_setting("florence_num_beams") or _DEFAULT_NUM_BEAMS))
         inputs = self._processor(text=task_prompt, images=image, return_tensors="pt")
         device_inputs = {
             key: value.to(self._device) if hasattr(value, "to") else value
@@ -125,10 +250,10 @@ class FlorenceAnalyzer:
         }
         with torch.no_grad():
             generated_ids = self._model.generate(
-                input_ids=device_inputs.get("input_ids"),
-                pixel_values=device_inputs.get("pixel_values"),
+                **device_inputs,
                 max_new_tokens=max_new_tokens,
-                num_beams=3,
+                num_beams=num_beams,
+                early_stopping=bool(num_beams > 1),
                 do_sample=False,
             )
         generated_text = self._processor.batch_decode(generated_ids, skip_special_tokens=False)[0]

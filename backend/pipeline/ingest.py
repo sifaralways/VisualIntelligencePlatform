@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import unicodedata
 import uuid
 from pathlib import Path
@@ -2108,12 +2109,20 @@ async def _phase_restore_vip_names(media_ids: set[int] | None = None) -> None:
 # Phase 4: Tag — objects, animals, geography, places
 # ---------------------------------------------------------------------------
 async def _phase_tag(media_ids: set[int] | None = None) -> None:
+    phase_started = time.perf_counter()
     concurrency = int(settings_store.get("tag_concurrency"))
+    florence_concurrency = max(
+        1,
+        min(concurrency, int(settings_store.get("florence_concurrency") or 1)),
+    )
     scope = "all pending files" if not media_ids else f"{len(media_ids)} selected file(s)"
     logger.info(
         "Phase 4: Tagging (objects, animals, geography, places) "
-        "[scope=%s, concurrency=%d, yolo_batch=%d]",
-        scope, concurrency, _TAG_BATCH_SIZE,
+        "[scope=%s, concurrency=%d, florence_concurrency=%d, yolo_batch=%d]",
+        scope,
+        concurrency,
+        florence_concurrency,
+        _TAG_BATCH_SIZE,
     )
     await broadcast("phase_start", phase="tag")
 
@@ -2158,7 +2167,12 @@ async def _phase_tag(media_ids: set[int] | None = None) -> None:
         return
 
     sem = asyncio.Semaphore(concurrency)
+    florence_sem = asyncio.Semaphore(florence_concurrency)
     _counter = [0]
+    _tagger_seconds = [0.0]
+    _florence_seconds = [0.0]
+    _florence_wait_seconds = [0.0]
+    _batches = [0]
 
     async def _process_batch(batch: list) -> None:
         async with sem:
@@ -2177,12 +2191,23 @@ async def _phase_tag(media_ids: set[int] | None = None) -> None:
             # One YOLO GPU forward pass for up to _TAG_BATCH_SIZE images,
             # followed by per-image scene / landmark / geo models.
             items = [(pp, gps[0], gps[1]) for pp, gps in zip(preview_paths, gps_data)]
+            _tagger_started = time.perf_counter()
             tag_results = await loop.run_in_executor(None, _tagger.tag_batch, items)
-            florence_results = (
-                await loop.run_in_executor(None, _florence.analyze_batch, preview_paths)
-                if _florence.available
-                else [None] * len(preview_paths)
-            )
+            _tagger_seconds[0] += time.perf_counter() - _tagger_started
+
+            _florence_wait_started = time.perf_counter()
+            if _florence.available:
+                async with florence_sem:
+                    _florence_wait_seconds[0] += time.perf_counter() - _florence_wait_started
+                    _florence_started = time.perf_counter()
+                    florence_results = await loop.run_in_executor(
+                        None,
+                        _florence.analyze_batch,
+                        preview_paths,
+                    )
+                    _florence_seconds[0] += time.perf_counter() - _florence_started
+            else:
+                florence_results = [None] * len(preview_paths)
 
             # Batch-persist all tags and state transitions in one DB write.
             async with get_db() as db:
@@ -2256,11 +2281,34 @@ async def _phase_tag(media_ids: set[int] | None = None) -> None:
                     await delete_preview(pp)
 
             _counter[0] += len(batch)
+            _batches[0] += 1
             await broadcast("tag_progress", done=_counter[0], total=total)
 
     # Chunk rows into YOLO-batch-sized groups and fan them out concurrently.
     batches = [rows[i : i + _TAG_BATCH_SIZE] for i in range(0, len(rows), _TAG_BATCH_SIZE)]
     await asyncio.gather(*[_process_batch(b) for b in batches])
+
+    wall_seconds = max(time.perf_counter() - phase_started, 0.001)
+    processed = max(_counter[0], 1)
+    wall_s_per_photo = wall_seconds / processed
+    tagger_s_per_photo = _tagger_seconds[0] / processed
+    florence_s_per_photo = _florence_seconds[0] / processed
+    florence_wait_s_per_photo = _florence_wait_seconds[0] / processed
+    logger.info(
+        "Phase 4 timing: wall=%.2fs (%.3fs/photo), batches=%d, "
+        "tagger=%.2fs total (%.3fs/photo), "
+        "florence_compute=%.2fs total (%.3fs/photo), "
+        "florence_wait=%.2fs total (%.3fs/photo)",
+        wall_seconds,
+        wall_s_per_photo,
+        _batches[0],
+        _tagger_seconds[0],
+        tagger_s_per_photo,
+        _florence_seconds[0],
+        florence_s_per_photo,
+        _florence_wait_seconds[0],
+        florence_wait_s_per_photo,
+    )
 
     await broadcast("phase_complete", phase="tag", tagged=_counter[0])
     logger.info("Phase 4 complete: %d files tagged", _counter[0])

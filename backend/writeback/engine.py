@@ -551,12 +551,18 @@ async def _build_fields_batch(media_ids: list[int]) -> dict[int, dict]:
         animals: list[str]   = []
         geography: list[str] = []
         places: list[str]    = []
+        captions: list[str]  = []
+        ocr_lines: list[str] = []
+        region_lines: list[str] = []
         for t in tag_list:
             cat, label = t["category"], t["label"]
             if cat == "object":       objects.append(label)
             elif cat == "animal":     animals.append(label)
             elif cat == "geography":  geography.append(label)
             elif cat == "place":      places.append(label)
+            elif cat == "caption":    captions.append(label)
+            elif cat == "ocr":        ocr_lines.append(label)
+            elif cat == "region":     region_lines.append(label)
 
         hierarchical_subjects: list[str] | None = None
         doc = docs_by_mid.get(media_id, {})
@@ -575,6 +581,9 @@ async def _build_fields_batch(media_ids: list[int]) -> dict[int, dict]:
             gps_lon=gps_lon,
             vip_id=vip_id,
             hierarchical_subjects=hierarchical_subjects,
+            florence_caption=(captions[0] if captions else None),
+            florence_ocr_lines=ocr_lines or None,
+            florence_region_lines=region_lines or None,
         )
 
     return result
@@ -647,6 +656,9 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
     animals: list[str] = []
     geography: list[str] = []
     places: list[str] = []
+    captions: list[str] = []
+    ocr_lines: list[str] = []
+    region_lines: list[str] = []
     for t in tag_rows:
         cat, label = t["category"], t["label"]
         if cat == "object":
@@ -657,6 +669,12 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
             geography.append(label)
         elif cat == "place":
             places.append(label)
+        elif cat == "caption":
+            captions.append(label)
+        elif cat == "ocr":
+            ocr_lines.append(label)
+        elif cat == "region":
+            region_lines.append(label)
 
     # Build hierarchical subjects from effective document labels
     hierarchical_subjects: list[str] | None = None
@@ -675,6 +693,9 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
         gps_lon=gps_lon,
         vip_id=vip_id,
         hierarchical_subjects=hierarchical_subjects,
+        florence_caption=(captions[0] if captions else None),
+        florence_ocr_lines=ocr_lines or None,
+        florence_region_lines=region_lines or None,
     )
 
 

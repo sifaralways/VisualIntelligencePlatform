@@ -190,6 +190,32 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         ),
         "group": "System",
     },
+    "florence_concurrency": {
+        "value": 1, "type": "int", "min": 1, "max": 4, "step": 1,
+        "label": "Florence parallel workers",
+        "description": (
+            "How many Florence batch jobs run at once during Phase 4. "
+            "Start with 1 for stability. Increase to 2 only if florence_wait is low and memory headroom is healthy."
+        ),
+        "group": "System",
+    },
+    "florence_inference_batch_size": {
+        "value": 8, "type": "int", "min": 1, "max": 16, "step": 1,
+        "label": "Florence micro-batch size",
+        "description": (
+            "Images processed together inside one Florence generation call. "
+            "Higher values can improve MPS utilization but increase memory use."
+        ),
+        "group": "System",
+    },
+    "florence_num_beams": {
+        "value": 1, "type": "int", "min": 1, "max": 4, "step": 1,
+        "label": "Florence beam width",
+        "description": (
+            "Generation beam width for Florence. 1 is fastest. Higher values may improve text quality but can be much slower."
+        ),
+        "group": "System",
+    },
     "exif_batch_size": {
         "value": 500, "type": "int", "min": 10, "max": 1000, "step": 10,
         "label": "Phase 1 ExifTool batch size",
