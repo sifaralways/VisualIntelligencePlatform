@@ -42,6 +42,8 @@ export default function App() {
   const [profileLoading, setProfileLoading] = useState(true)
   const [profileError, setProfileError] = useState<string | null>(null)
   const [newProfileName, setNewProfileName] = useState('')
+  const [newProfilePassword, setNewProfilePassword] = useState('')
+  const [newProfilePasswordConfirm, setNewProfilePasswordConfirm] = useState('')
   const [copySettingsFromProfileId, setCopySettingsFromProfileId] = useState('')
   const [creatingProfile, setCreatingProfile] = useState(false)
   const [profileActionBusy, setProfileActionBusy] = useState(false)
@@ -196,10 +198,10 @@ export default function App() {
     }
   }, [])
 
-  const activateProfile = useCallback(async (profileId: string) => {
+  const activateProfile = useCallback(async (profileId: string, password?: string): Promise<boolean> => {
     setProfileError(null)
     try {
-      const active = await api.profiles.select(profileId)
+      const active = await api.profiles.select(profileId, password)
       setCurrentProfileId(active.id)
       setSelectedProfile(active)
       setProfiles(prev => prev.map(profile => ({
@@ -208,28 +210,40 @@ export default function App() {
       })))
       resetProfileViewState()
       setProfilePickerOpen(false)
+      return true
     } catch (e: unknown) {
       setProfileError(e instanceof Error ? e.message : 'Could not switch profile')
+      return false
     }
   }, [resetProfileViewState])
 
   const createAndActivateProfile = useCallback(async () => {
     const name = newProfileName.trim()
     if (!name) return
+    if (newProfilePassword.trim() && newProfilePassword !== newProfilePasswordConfirm) {
+      setProfileError('Password and confirm password must match')
+      return
+    }
     setCreatingProfile(true)
     setProfileError(null)
     try {
-      const created = await api.profiles.create(name, copySettingsFromProfileId || undefined)
+      const created = await api.profiles.create(
+        name,
+        copySettingsFromProfileId || undefined,
+        newProfilePassword.trim() || undefined,
+      )
       setProfiles(prev => [...prev, created])
       setNewProfileName('')
+      setNewProfilePassword('')
+      setNewProfilePasswordConfirm('')
       setCopySettingsFromProfileId('')
-      await activateProfile(created.id)
+      await activateProfile(created.id, newProfilePassword.trim() || undefined)
     } catch (e: unknown) {
       setProfileError(e instanceof Error ? e.message : 'Could not create profile')
     } finally {
       setCreatingProfile(false)
     }
-  }, [activateProfile, copySettingsFromProfileId, newProfileName])
+  }, [activateProfile, copySettingsFromProfileId, newProfileName, newProfilePassword, newProfilePasswordConfirm])
 
   const renameProfile = useCallback(async (profileId: string, name: string) => {
     setProfileActionBusy(true)
@@ -261,6 +275,38 @@ export default function App() {
       setProfileActionBusy(false)
     }
   }, [resetProfileViewState])
+
+  const setProfilePassword = useCallback(async (profileId: string, password: string, currentPassword?: string): Promise<boolean> => {
+    setProfileActionBusy(true)
+    setProfileError(null)
+    try {
+      const updated = await api.profiles.setPassword(profileId, password, currentPassword)
+      setProfiles(prev => prev.map(profile => profile.id === profileId ? updated : profile))
+      setSelectedProfile(prev => prev && prev.id === profileId ? updated : prev)
+      return true
+    } catch (e: unknown) {
+      setProfileError(e instanceof Error ? e.message : 'Could not update profile password')
+      return false
+    } finally {
+      setProfileActionBusy(false)
+    }
+  }, [])
+
+  const clearProfilePassword = useCallback(async (profileId: string, currentPassword?: string): Promise<boolean> => {
+    setProfileActionBusy(true)
+    setProfileError(null)
+    try {
+      const updated = await api.profiles.setPassword(profileId, null, currentPassword)
+      setProfiles(prev => prev.map(profile => profile.id === profileId ? updated : profile))
+      setSelectedProfile(prev => prev && prev.id === profileId ? updated : prev)
+      return true
+    } catch (e: unknown) {
+      setProfileError(e instanceof Error ? e.message : 'Could not remove profile password')
+      return false
+    } finally {
+      setProfileActionBusy(false)
+    }
+  }, [])
 
   useEffect(() => {
     refreshProfiles()
@@ -367,16 +413,22 @@ export default function App() {
       <ProfilePickerModal
         profiles={profiles}
         newProfileName={newProfileName}
+        newProfilePassword={newProfilePassword}
+        newProfilePasswordConfirm={newProfilePasswordConfirm}
         copySettingsFromProfileId={copySettingsFromProfileId}
         creatingProfile={creatingProfile}
         profileActionBusy={profileActionBusy}
         error={profileError}
         onProfileNameChange={setNewProfileName}
+        onProfilePasswordChange={setNewProfilePassword}
+        onProfilePasswordConfirmChange={setNewProfilePasswordConfirm}
         onCopySettingsFromProfileIdChange={setCopySettingsFromProfileId}
         onSelect={activateProfile}
         onCreate={createAndActivateProfile}
         onRename={renameProfile}
         onDelete={deleteProfile}
+        onSetPassword={setProfilePassword}
+        onClearPassword={clearProfilePassword}
       />
     )
   }
@@ -777,16 +829,22 @@ export default function App() {
           profiles={profiles}
           activeProfileId={selectedProfile.id}
           newProfileName={newProfileName}
+          newProfilePassword={newProfilePassword}
+          newProfilePasswordConfirm={newProfilePasswordConfirm}
           copySettingsFromProfileId={copySettingsFromProfileId}
           creatingProfile={creatingProfile}
           profileActionBusy={profileActionBusy}
           error={profileError}
           onProfileNameChange={setNewProfileName}
+          onProfilePasswordChange={setNewProfilePassword}
+          onProfilePasswordConfirmChange={setNewProfilePasswordConfirm}
           onCopySettingsFromProfileIdChange={setCopySettingsFromProfileId}
           onSelect={activateProfile}
           onCreate={createAndActivateProfile}
           onRename={renameProfile}
           onDelete={deleteProfile}
+          onSetPassword={setProfilePassword}
+          onClearPassword={clearProfilePassword}
           onClose={() => setProfilePickerOpen(false)}
         />
       )}
@@ -798,38 +856,155 @@ function ProfilePickerModal({
   profiles,
   activeProfileId,
   newProfileName,
+  newProfilePassword,
+  newProfilePasswordConfirm,
   copySettingsFromProfileId,
   creatingProfile,
   profileActionBusy,
   error,
   onProfileNameChange,
+  onProfilePasswordChange,
+  onProfilePasswordConfirmChange,
   onCopySettingsFromProfileIdChange,
   onSelect,
   onCreate,
   onRename,
   onDelete,
+  onSetPassword,
+  onClearPassword,
   onClose,
 }: {
   profiles: ProfileSummary[]
   activeProfileId?: string
   newProfileName: string
+  newProfilePassword: string
+  newProfilePasswordConfirm: string
   copySettingsFromProfileId: string
   creatingProfile: boolean
   profileActionBusy: boolean
   error: string | null
   onProfileNameChange: (value: string) => void
+  onProfilePasswordChange: (value: string) => void
+  onProfilePasswordConfirmChange: (value: string) => void
   onCopySettingsFromProfileIdChange: (value: string) => void
-  onSelect: (profileId: string) => void
+  onSelect: (profileId: string, password?: string) => Promise<boolean>
   onCreate: () => void
   onRename: (profileId: string, name: string) => void
   onDelete: (profileId: string) => void
+  onSetPassword: (profileId: string, password: string, currentPassword?: string) => Promise<boolean>
+  onClearPassword: (profileId: string, currentPassword?: string) => Promise<boolean>
   onClose?: () => void
 }) {
+  const [passwordDialog, setPasswordDialog] = useState<
+    | {
+      mode: 'unlock' | 'set' | 'change' | 'remove'
+      profile: ProfileSummary
+    }
+    | null
+  >(null)
+  const [currentPasswordInput, setCurrentPasswordInput] = useState('')
+  const [newPasswordInput, setNewPasswordInput] = useState('')
+  const [confirmPasswordInput, setConfirmPasswordInput] = useState('')
+  const [passwordDialogError, setPasswordDialogError] = useState<string | null>(null)
+  const [showCurrentPassword, setShowCurrentPassword] = useState(false)
+  const [showNewPassword, setShowNewPassword] = useState(false)
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false)
+  const [showCreatePassword, setShowCreatePassword] = useState(false)
+  const [showCreatePasswordConfirm, setShowCreatePasswordConfirm] = useState(false)
+
+  function openPasswordDialog(
+    mode: 'unlock' | 'set' | 'change' | 'remove',
+    profile: ProfileSummary,
+  ) {
+    setPasswordDialog({ mode, profile })
+    setCurrentPasswordInput('')
+    setNewPasswordInput('')
+    setConfirmPasswordInput('')
+    setPasswordDialogError(null)
+    setShowCurrentPassword(false)
+    setShowNewPassword(false)
+    setShowConfirmPassword(false)
+  }
+
+  function closePasswordDialog() {
+    setPasswordDialog(null)
+    setPasswordDialogError(null)
+  }
+
+  function validatePasswordInputs(mode: 'unlock' | 'set' | 'change' | 'remove'): string | null {
+    const current = currentPasswordInput.trim()
+    const next = newPasswordInput.trim()
+    const confirm = confirmPasswordInput.trim()
+
+    if ((mode === 'unlock' || mode === 'remove' || mode === 'change') && !current) {
+      return 'Current password is required'
+    }
+    if (mode === 'set' || mode === 'change') {
+      if (!next) return 'New password is required'
+      if (next.length < 4) return 'Password must be at least 4 characters'
+      if (next !== confirm) return 'Password and confirm password must match'
+    }
+    return null
+  }
+
+  async function submitPasswordDialog() {
+    if (!passwordDialog) return
+    const validationError = validatePasswordInputs(passwordDialog.mode)
+    if (validationError) {
+      setPasswordDialogError(validationError)
+      return
+    }
+
+    const current = currentPasswordInput.trim()
+    const next = newPasswordInput.trim()
+
+    if (passwordDialog.mode === 'unlock') {
+      const ok = await onSelect(passwordDialog.profile.id, current)
+      if (ok) closePasswordDialog()
+      return
+    }
+    if (passwordDialog.mode === 'set') {
+      const ok = await onSetPassword(passwordDialog.profile.id, next)
+      if (ok) closePasswordDialog()
+      return
+    }
+    if (passwordDialog.mode === 'change') {
+      const ok = await onSetPassword(passwordDialog.profile.id, next, current)
+      if (ok) closePasswordDialog()
+      return
+    }
+    const ok = await onClearPassword(passwordDialog.profile.id, current)
+    if (ok) closePasswordDialog()
+  }
+
+  const createPasswordError = newProfilePassword.trim() && newProfilePassword !== newProfilePasswordConfirm
+    ? 'Password and confirm password must match'
+    : null
+
+  function handleSelect(profile: ProfileSummary) {
+    if (!profile.is_password_protected) {
+      onSelect(profile.id)
+      return
+    }
+    openPasswordDialog('unlock', profile)
+  }
+
   function handleRename(profile: ProfileSummary, event: React.MouseEvent) {
     event.stopPropagation()
     const nextName = window.prompt('Rename profile', profile.name)?.trim()
     if (!nextName || nextName === profile.name) return
     onRename(profile.id, nextName)
+  }
+
+  function handleSetPassword(profile: ProfileSummary, event: React.MouseEvent) {
+    event.stopPropagation()
+    openPasswordDialog(profile.is_password_protected ? 'change' : 'set', profile)
+  }
+
+  function handleClearPassword(profile: ProfileSummary, event: React.MouseEvent) {
+    event.stopPropagation()
+    if (!profile.is_password_protected) return
+    openPasswordDialog('remove', profile)
   }
 
   function handleDelete(profile: ProfileSummary, event: React.MouseEvent) {
@@ -867,7 +1042,7 @@ function ProfilePickerModal({
               {profiles.map(profile => (
                 <button
                   key={profile.id}
-                  onClick={() => onSelect(profile.id)}
+                  onClick={() => handleSelect(profile)}
                   disabled={profileActionBusy}
                   className={`w-full rounded-xl border px-4 py-3 text-left transition-colors ${
                     activeProfileId === profile.id
@@ -879,6 +1054,7 @@ function ProfilePickerModal({
                     <span className="font-medium text-white">{profile.name}</span>
                     <div className="flex items-center gap-2 text-[10px] uppercase tracking-wider text-gray-500 shrink-0">
                       {profile.is_default && <span>Default</span>}
+                      {profile.is_password_protected && <span>Protected</span>}
                       {activeProfileId === profile.id && <span className="text-indigo-300">Active</span>}
                     </div>
                   </div>
@@ -890,6 +1066,22 @@ function ProfilePickerModal({
                     >
                       Rename
                     </button>
+                    <button
+                      onClick={(e) => handleSetPassword(profile, e)}
+                      disabled={profileActionBusy}
+                      className="rounded-md border border-gray-700 px-2 py-1 text-[11px] text-gray-300 hover:bg-gray-800 disabled:opacity-40"
+                    >
+                      {profile.is_password_protected ? 'Change Password' : 'Add Password'}
+                    </button>
+                    {profile.is_password_protected && (
+                      <button
+                        onClick={(e) => handleClearPassword(profile, e)}
+                        disabled={profileActionBusy}
+                        className="rounded-md border border-amber-800 px-2 py-1 text-[11px] text-amber-300 hover:bg-amber-900/30 disabled:opacity-40"
+                      >
+                        Remove Password
+                      </button>
+                    )}
                     {!profile.is_default && (
                       <button
                         onClick={(e) => handleDelete(profile, e)}
@@ -916,6 +1108,24 @@ function ProfilePickerModal({
                 placeholder="e.g. Family Archive"
                 className="w-full rounded-lg border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-white outline-none focus:border-indigo-500"
               />
+              <PasswordField
+                value={newProfilePassword}
+                onChange={onProfilePasswordChange}
+                onKeyDownEnter={onCreate}
+                placeholder="Optional profile password"
+                show={showCreatePassword}
+                onToggleShow={() => setShowCreatePassword(v => !v)}
+              />
+              {newProfilePassword.trim() && (
+                <PasswordField
+                  value={newProfilePasswordConfirm}
+                  onChange={onProfilePasswordConfirmChange}
+                  onKeyDownEnter={onCreate}
+                  placeholder="Confirm profile password"
+                  show={showCreatePasswordConfirm}
+                  onToggleShow={() => setShowCreatePasswordConfirm(v => !v)}
+                />
+              )}
               <select
                 value={copySettingsFromProfileId}
                 onChange={e => onCopySettingsFromProfileIdChange(e.target.value)}
@@ -928,17 +1138,150 @@ function ProfilePickerModal({
               </select>
               <button
                 onClick={onCreate}
-                disabled={creatingProfile || profileActionBusy || !newProfileName.trim()}
+                disabled={creatingProfile || profileActionBusy || !newProfileName.trim() || !!createPasswordError}
                 className="w-full rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500 disabled:opacity-40"
               >
                 {creatingProfile ? 'Creating…' : 'Create and open'}
               </button>
               <p className="text-xs text-gray-500">A new profile starts empty unless you copy admin settings from an existing profile.</p>
+              {createPasswordError && <p className="text-xs text-red-400">{createPasswordError}</p>}
               {error && <p className="text-xs text-red-400">{error}</p>}
             </div>
           </div>
         </div>
+
+        {passwordDialog && (
+          <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+            <div className="w-full max-w-md rounded-2xl border border-gray-800 bg-gray-950 shadow-2xl overflow-hidden">
+              <div className="flex items-center justify-between border-b border-gray-800 px-5 py-4">
+                <div>
+                  <h3 className="text-base font-semibold text-white">
+                    {passwordDialog.mode === 'unlock' && 'Unlock Profile'}
+                    {passwordDialog.mode === 'set' && 'Add Profile Password'}
+                    {passwordDialog.mode === 'change' && 'Change Profile Password'}
+                    {passwordDialog.mode === 'remove' && 'Remove Profile Password'}
+                  </h3>
+                  <p className="text-xs text-gray-400 mt-0.5">{passwordDialog.profile.name}</p>
+                </div>
+                <button
+                  onClick={closePasswordDialog}
+                  className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-gray-800"
+                >
+                  ✕
+                </button>
+              </div>
+
+              <div className="px-5 py-4 space-y-3">
+                {(passwordDialog.mode === 'unlock' || passwordDialog.mode === 'change' || passwordDialog.mode === 'remove') && (
+                  <PasswordField
+                    value={currentPasswordInput}
+                    onChange={setCurrentPasswordInput}
+                    onKeyDownEnter={submitPasswordDialog}
+                    placeholder={passwordDialog.mode === 'unlock' ? 'Enter password' : 'Current password'}
+                    show={showCurrentPassword}
+                    onToggleShow={() => setShowCurrentPassword(v => !v)}
+                    autoFocus
+                  />
+                )}
+
+                {(passwordDialog.mode === 'set' || passwordDialog.mode === 'change') && (
+                  <>
+                    <PasswordField
+                      value={newPasswordInput}
+                      onChange={setNewPasswordInput}
+                      onKeyDownEnter={submitPasswordDialog}
+                      placeholder="New password"
+                      show={showNewPassword}
+                      onToggleShow={() => setShowNewPassword(v => !v)}
+                      autoFocus={passwordDialog.mode === 'set'}
+                    />
+                    <PasswordField
+                      value={confirmPasswordInput}
+                      onChange={setConfirmPasswordInput}
+                      onKeyDownEnter={submitPasswordDialog}
+                      placeholder="Confirm new password"
+                      show={showConfirmPassword}
+                      onToggleShow={() => setShowConfirmPassword(v => !v)}
+                    />
+                  </>
+                )}
+
+                {passwordDialogError && <p className="text-xs text-red-400">{passwordDialogError}</p>}
+
+                <div className="pt-1 flex gap-2">
+                  <button
+                    onClick={closePasswordDialog}
+                    className="flex-1 rounded-lg border border-gray-700 bg-gray-900 px-4 py-2 text-sm text-gray-200 hover:bg-gray-800"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={submitPasswordDialog}
+                    className="flex-1 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500"
+                  >
+                    {passwordDialog.mode === 'unlock' && 'Unlock'}
+                    {passwordDialog.mode === 'set' && 'Set Password'}
+                    {passwordDialog.mode === 'change' && 'Update Password'}
+                    {passwordDialog.mode === 'remove' && 'Remove Password'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
+    </div>
+  )
+}
+
+function PasswordField({
+  value,
+  onChange,
+  onKeyDownEnter,
+  placeholder,
+  show,
+  onToggleShow,
+  autoFocus,
+}: {
+  value: string
+  onChange: (value: string) => void
+  onKeyDownEnter: () => void
+  placeholder: string
+  show: boolean
+  onToggleShow: () => void
+  autoFocus?: boolean
+}) {
+  return (
+    <div className="relative">
+      <input
+        type={show ? 'text' : 'password'}
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        onKeyDown={e => { if (e.key === 'Enter') onKeyDownEnter() }}
+        placeholder={placeholder}
+        autoFocus={autoFocus}
+        className="w-full rounded-lg border border-gray-700 bg-gray-950 px-3 py-2 pr-10 text-sm text-white outline-none focus:border-indigo-500"
+      />
+      <button
+        type="button"
+        onClick={onToggleShow}
+        className="absolute inset-y-0 right-0 w-10 flex items-center justify-center text-gray-400 hover:text-white"
+        aria-label={show ? 'Hide password' : 'Show password'}
+      >
+        {show ? (
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M3 3L21 21" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/>
+            <path d="M10.58 10.58A2 2 0 0 0 13.42 13.42" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/>
+            <path d="M9.88 5.09A10.94 10.94 0 0 1 12 4.9C16.2 4.9 19.7 7.48 21 11.1C20.51 12.47 19.71 13.68 18.68 14.65" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/>
+            <path d="M6.38 6.39C4.45 7.5 2.95 9.11 2 11.1C3.3 14.72 6.8 17.3 11 17.3C12.02 17.3 12.99 17.15 13.9 16.87" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/>
+          </svg>
+        ) : (
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M2 12C3.3 8.38 6.8 5.8 11 5.8C15.2 5.8 18.7 8.38 20 12C18.7 15.62 15.2 18.2 11 18.2C6.8 18.2 3.3 15.62 2 12Z" stroke="currentColor" strokeWidth="1.8"/>
+            <circle cx="11" cy="12" r="2.6" stroke="currentColor" strokeWidth="1.8"/>
+          </svg>
+        )}
+      </button>
     </div>
   )
 }

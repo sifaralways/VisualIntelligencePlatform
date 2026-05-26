@@ -46,17 +46,19 @@ export const api = {
   profiles: {
     list: () => request<ProfileSummary[]>('/profiles'),
     active: () => request<ProfileSummary>('/profiles/active'),
-    create: (name: string, copySettingsFromProfileId?: string) =>
+    create: (name: string, copySettingsFromProfileId?: string, password?: string) =>
       request<ProfileSummary>('/profiles', {
         method: 'POST',
         body: JSON.stringify({
           name,
           copy_settings_from_profile_id: copySettingsFromProfileId ?? null,
+          password: password ?? null,
         }),
       }),
-    select: (profileId: string) =>
+    select: (profileId: string, password?: string) =>
       request<ProfileSummary>(`/profiles/${encodeURIComponent(profileId)}/select`, {
         method: 'POST',
+        body: JSON.stringify({ password: password ?? null }),
       }),
     rename: (profileId: string, name: string) =>
       request<ProfileSummary>(`/profiles/${encodeURIComponent(profileId)}`, {
@@ -66,6 +68,14 @@ export const api = {
     delete: (profileId: string) =>
       request<{ status: string; id: string; name: string }>(`/profiles/${encodeURIComponent(profileId)}`, {
         method: 'DELETE',
+      }),
+    setPassword: (profileId: string, password: string | null, currentPassword?: string) =>
+      request<ProfileSummary>(`/profiles/${encodeURIComponent(profileId)}/password`, {
+        method: 'POST',
+        body: JSON.stringify({
+          password,
+          current_password: currentPassword ?? null,
+        }),
       }),
   },
 
@@ -396,6 +406,7 @@ export interface MediaFilter {
 export interface ProfileSummary {
   id: string
   name: string
+  is_password_protected: boolean
   is_default: boolean
   is_active: boolean
   created_at: string

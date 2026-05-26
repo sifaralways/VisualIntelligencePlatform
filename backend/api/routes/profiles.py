@@ -14,6 +14,7 @@ from backend.profiles import (
     list_profiles,
     rename_profile,
     run_in_profile,
+    set_profile_password,
     select_profile,
 )
 
@@ -23,16 +24,27 @@ router = APIRouter()
 class CreateProfileRequest(BaseModel):
     name: str
     copy_settings_from_profile_id: str | None = None
+    password: str | None = None
+
+
+class SelectProfileRequest(BaseModel):
+    password: str | None = None
 
 
 class RenameProfileRequest(BaseModel):
     name: str
 
 
+class SetProfilePasswordRequest(BaseModel):
+    password: str | None = None
+    current_password: str | None = None
+
+
 def _serialize(profile) -> dict:
     return {
         "id": profile.id,
         "name": profile.name,
+        "is_password_protected": profile.is_password_protected,
         "is_default": profile.is_default,
         "is_active": profile.is_active,
         "created_at": profile.created_at,
@@ -56,7 +68,7 @@ async def create_new_profile(req: CreateProfileRequest):
         raise HTTPException(status_code=404, detail="Source profile not found")
 
     try:
-        profile = create_profile(req.name)
+        profile = create_profile(req.name, req.password)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -68,10 +80,13 @@ async def create_new_profile(req: CreateProfileRequest):
 
 
 @router.post("/{profile_id}/select")
-async def select(profile_id: str):
+async def select(profile_id: str, req: SelectProfileRequest | None = None):
     if get_profile(profile_id) is None:
         raise HTTPException(status_code=404, detail="Profile not found")
-    profile = select_profile(profile_id)
+    try:
+        profile = select_profile(profile_id, req.password if req else None)
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
     await run_in_profile(profile.id, init_db)
     await run_in_profile(profile.id, load_cache)
     return _serialize(profile)
@@ -101,3 +116,16 @@ async def delete(profile_id: str):
         "id": deleted.id,
         "name": deleted.name,
     }
+
+
+@router.post("/{profile_id}/password")
+async def set_password(profile_id: str, req: SetProfilePasswordRequest):
+    try:
+        profile = set_profile_password(profile_id, req.password, req.current_password)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return _serialize(profile)

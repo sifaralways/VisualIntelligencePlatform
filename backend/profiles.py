@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import contextvars
+import hashlib
+import hmac
 import inspect
 import logging
+import secrets
 import re
 import shutil
 import sqlite3
@@ -43,6 +46,7 @@ class ProfileRecord:
     data_dir: Path
     created_at: str
     last_opened_at: str | None
+    is_password_protected: bool = False
     is_default: bool = False
     is_active: bool = False
 
@@ -61,6 +65,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             id              TEXT PRIMARY KEY,
             name            TEXT NOT NULL UNIQUE,
             data_dir        TEXT NOT NULL UNIQUE,
+            password_hash   TEXT,
             is_default      INTEGER NOT NULL DEFAULT 0,
             created_at      TEXT NOT NULL DEFAULT (datetime('now')),
             last_opened_at  TEXT
@@ -76,7 +81,40 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    columns = {
+        str(row["name"]) for row in conn.execute("PRAGMA table_info(profiles)").fetchall()
+    }
+    if "password_hash" not in columns:
+        conn.execute("ALTER TABLE profiles ADD COLUMN password_hash TEXT")
     conn.commit()
+
+
+def _hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    iterations = 480000
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        iterations,
+    )
+    return f"pbkdf2_sha256${iterations}${salt}${digest.hex()}"
+
+
+def _verify_password(password: str, encoded: str) -> bool:
+    try:
+        algorithm, rounds, salt, expected = encoded.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        digest = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt.encode("utf-8"),
+            int(rounds),
+        )
+        return hmac.compare_digest(digest.hex(), expected)
+    except Exception:
+        return False
 
 
 def _slugify(name: str) -> str:
@@ -94,7 +132,7 @@ def _load_cache(conn: sqlite3.Connection) -> None:
     active_id = str(active_row["value"]) if active_row and active_row["value"] else None
 
     rows = conn.execute(
-        "SELECT id, name, data_dir, created_at, last_opened_at, is_default FROM profiles ORDER BY created_at, name"
+        "SELECT id, name, data_dir, password_hash, created_at, last_opened_at, is_default FROM profiles ORDER BY created_at, name"
     ).fetchall()
     cache: dict[str, ProfileRecord] = {}
     for row in rows:
@@ -105,6 +143,7 @@ def _load_cache(conn: sqlite3.Connection) -> None:
             data_dir=Path(str(row["data_dir"])),
             created_at=str(row["created_at"]),
             last_opened_at=str(row["last_opened_at"]) if row["last_opened_at"] else None,
+            is_password_protected=bool(row["password_hash"]),
             is_default=bool(row["is_default"]),
             is_active=(profile_id == active_id),
         )
@@ -241,12 +280,18 @@ def get_active_profile() -> ProfileRecord:
     return _profiles_cache[_active_profile_id]
 
 
-def select_profile(profile_id: str) -> ProfileRecord:
+def select_profile(profile_id: str, password: str | None = None) -> ProfileRecord:
     with _connect_registry() as conn:
         _ensure_schema(conn)
-        row = conn.execute("SELECT 1 FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        row = conn.execute(
+            "SELECT password_hash FROM profiles WHERE id=?",
+            (profile_id,),
+        ).fetchone()
         if not row:
             raise KeyError(profile_id)
+        encoded = str(row["password_hash"]) if row["password_hash"] else None
+        if encoded and not (password and _verify_password(password, encoded)):
+            raise PermissionError("Invalid profile password")
         _set_active_profile(conn, profile_id)
         _load_cache(conn)
     profile = _profiles_cache[profile_id]
@@ -254,10 +299,13 @@ def select_profile(profile_id: str) -> ProfileRecord:
     return profile
 
 
-def create_profile(name: str) -> ProfileRecord:
+def create_profile(name: str, password: str | None = None) -> ProfileRecord:
     clean_name = (name or "").strip()
     if not clean_name:
         raise ValueError("Profile name is required")
+    clean_password = (password or "").strip() or None
+    if clean_password is not None and len(clean_password) < 4:
+        raise ValueError("Password must be at least 4 characters")
 
     with _connect_registry() as conn:
         _ensure_schema(conn)
@@ -272,8 +320,13 @@ def create_profile(name: str) -> ProfileRecord:
         data_dir = PROFILES_ROOT / profile_id
         data_dir.mkdir(parents=True, exist_ok=True)
         conn.execute(
-            "INSERT INTO profiles (id, name, data_dir, is_default) VALUES (?, ?, ?, 0)",
-            (profile_id, clean_name, str(data_dir)),
+            "INSERT INTO profiles (id, name, data_dir, password_hash, is_default) VALUES (?, ?, ?, ?, 0)",
+            (
+                profile_id,
+                clean_name,
+                str(data_dir),
+                _hash_password(clean_password) if clean_password else None,
+            ),
         )
         conn.commit()
         _load_cache(conn)
@@ -350,6 +403,37 @@ def delete_profile(profile_id: str) -> ProfileRecord:
         return deleted_profile
 
     raise KeyError(profile_id)
+
+
+def set_profile_password(
+    profile_id: str,
+    password: str | None,
+    current_password: str | None = None,
+) -> ProfileRecord:
+    clean_password = (password or "").strip() or None
+    if clean_password is not None and len(clean_password) < 4:
+        raise ValueError("Password must be at least 4 characters")
+
+    with _connect_registry() as conn:
+        _ensure_schema(conn)
+        row = conn.execute(
+            "SELECT password_hash FROM profiles WHERE id=?",
+            (profile_id,),
+        ).fetchone()
+        if not row:
+            raise KeyError(profile_id)
+
+        existing_hash = str(row["password_hash"]) if row["password_hash"] else None
+        if existing_hash and not (current_password and _verify_password(current_password, existing_hash)):
+            raise PermissionError("Invalid current password")
+
+        conn.execute(
+            "UPDATE profiles SET password_hash=? WHERE id=?",
+            (_hash_password(clean_password) if clean_password else None, profile_id),
+        )
+        conn.commit()
+        _load_cache(conn)
+    return _profiles_cache[profile_id]
 
 
 def copy_admin_settings(source_profile_id: str, target_profile_id: str) -> int:
