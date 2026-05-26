@@ -205,9 +205,12 @@ _CATEGORY_SOURCE: dict[str, str] = {
     "animal":    "bioclip",
     "geography": "places365",
     "place":     "clip",
+    "caption":   "florence2",
+    "ocr":       "florence2",
+    "region":    "florence2",
 }
 
-MODEL_VERSION = "yolo11s/places365/bioclip/insightface-buffalo_l"
+MODEL_VERSION = "yolo11s/places365/bioclip/insightface-buffalo_l/florence2"
 
 
 def _lookup_taxonomy(label: str) -> tuple[list[str], str, list[str]]:
@@ -287,11 +290,26 @@ async def build_analysis_document(
     """, (media_id,))
 
     labels: list[dict] = []
+    generated_text = {
+        "captions": [],
+        "ocr_lines": [],
+        "region_descriptions": [],
+    }
     for t in tag_rows:
         cat        = t["category"]          # object | animal | geography | place
         label_name = t["label"]
         raw_conf   = t["confidence"]
         source     = _CATEGORY_SOURCE.get(cat, t["model"] or "unknown")
+
+        if cat == "caption":
+            generated_text["captions"].append(label_name)
+            continue
+        if cat == "ocr":
+            generated_text["ocr_lines"].append(label_name)
+            continue
+        if cat == "region":
+            generated_text["region_descriptions"].append(label_name)
+            continue
 
         confidence = raw_conf if raw_conf is not None else _DEFAULT_CONFIDENCE.get(source, 0.70)
         labels.append(_label_entry(label_name, confidence, source))
@@ -382,6 +400,7 @@ async def build_analysis_document(
         "image_size":     {"width": row["width"], "height": row["height"]},
         "file_format":    row["file_format"],
         "Labels":         labels,
+        "GeneratedText":  generated_text,
         "Faces":          faces,
         "Geography":      geography,
         "model_version":  MODEL_VERSION,

@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # Parameter catalogue — single source of truth for defaults + UI metadata
 # ---------------------------------------------------------------------------
 # Each entry: default value, type, min, max, step, human label, description, group.
-# type is one of "float" | "int".
+# type is one of "float" | "int" | "bool".
 
 DEFAULTS: dict[str, dict[str, Any]] = {
     "face_detection_mode": {
@@ -209,6 +209,76 @@ DEFAULTS: dict[str, dict[str, Any]] = {
             "0.65 is a reliable default. Takes effect on the next scan."
         ),
         "group": "Content Safety",
+    },
+    "object_detector_enabled": {
+        "value": 1, "type": "bool", "min": 0, "max": 1, "step": 1,
+        "label": "Object detector enabled",
+        "description": "Enable YOLO-based object and animal base detection during Phase 4 tagging.",
+        "group": "ML Modules",
+        "options": [
+            {"value": 0, "label": "Off"},
+            {"value": 1, "label": "On"},
+        ],
+    },
+    "scene_classifier_enabled": {
+        "value": 1, "type": "bool", "min": 0, "max": 1, "step": 1,
+        "label": "Scene classifier enabled",
+        "description": "Enable Places365 scene and geography tagging.",
+        "group": "ML Modules",
+        "options": [
+            {"value": 0, "label": "Off"},
+            {"value": 1, "label": "On"},
+        ],
+    },
+    "landmark_recogniser_enabled": {
+        "value": 1, "type": "bool", "min": 0, "max": 1, "step": 1,
+        "label": "Landmark recogniser enabled",
+        "description": "Enable landmark recognition using GLDv2 or OpenCLIP fallback.",
+        "group": "ML Modules",
+        "options": [
+            {"value": 0, "label": "Off"},
+            {"value": 1, "label": "On"},
+        ],
+    },
+    "species_classifier_enabled": {
+        "value": 1, "type": "bool", "min": 0, "max": 1, "step": 1,
+        "label": "Species classifier enabled",
+        "description": "Enable BioCLIP species classification when an animal is detected.",
+        "group": "ML Modules",
+        "options": [
+            {"value": 0, "label": "Off"},
+            {"value": 1, "label": "On"},
+        ],
+    },
+    "geo_resolver_enabled": {
+        "value": 1, "type": "bool", "min": 0, "max": 1, "step": 1,
+        "label": "Geo resolver enabled",
+        "description": "Enable GPS-to-place resolution for photos with location coordinates.",
+        "group": "ML Modules",
+        "options": [
+            {"value": 0, "label": "Off"},
+            {"value": 1, "label": "On"},
+        ],
+    },
+    "explicit_detector_enabled": {
+        "value": 1, "type": "bool", "min": 0, "max": 1, "step": 1,
+        "label": "Explicit detector enabled",
+        "description": "Enable NudeNet explicit-content detection during tagging.",
+        "group": "ML Modules",
+        "options": [
+            {"value": 0, "label": "Off"},
+            {"value": 1, "label": "On"},
+        ],
+    },
+    "florence_enabled": {
+        "value": 0, "type": "bool", "min": 0, "max": 1, "step": 1,
+        "label": "Florence enabled",
+        "description": "Enable Florence-2 captioning and OCR enrichment during Phase 4 tagging.",
+        "group": "ML Modules",
+        "options": [
+            {"value": 0, "label": "Off"},
+            {"value": 1, "label": "On"},
+        ],
     },
     "exif_batch_timeout": {
         "value": 300, "type": "int", "min": 30, "max": 3600, "step": 30,

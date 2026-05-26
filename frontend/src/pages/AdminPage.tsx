@@ -80,6 +80,87 @@ const ACTIONS = [
 ] as const
 
 type Scope = (typeof ACTIONS)[number]['scope']
+type AdminTab = 'overview' | 'settings' | 'ml' | 'remote'
+
+type MlCapability = {
+  functionLabel: string
+  modelLabel: string
+  settingKey?: string
+  notes?: string
+}
+
+const ML_CAPABILITIES: MlCapability[] = [
+  {
+    functionLabel: 'Face detection and embeddings',
+    modelLabel: 'InsightFace antelopev2',
+    notes: 'Core face detection, attributes, and recognition embeddings.',
+  },
+  {
+    functionLabel: 'Object detection',
+    modelLabel: 'YOLOv8 Open Images V7',
+    settingKey: 'object_detector_enabled',
+    notes: 'Base object and animal detection for Phase 4 tagging.',
+  },
+  {
+    functionLabel: 'Scene classification',
+    modelLabel: 'Places365 ResNet-50',
+    settingKey: 'scene_classifier_enabled',
+    notes: 'Geography and built-environment scene tagging.',
+  },
+  {
+    functionLabel: 'Landmark recognition',
+    modelLabel: 'OpenCLIP ViT-L/14 or GLDv2 EfficientNet-B4',
+    settingKey: 'landmark_recogniser_enabled',
+    notes: 'Known landmark and famous place recognition.',
+  },
+  {
+    functionLabel: 'Species classification',
+    modelLabel: 'BioCLIP',
+    settingKey: 'species_classifier_enabled',
+    notes: 'Species-level animal classification when an animal is detected.',
+  },
+  {
+    functionLabel: 'Geo resolution',
+    modelLabel: 'GeoResolver via MapKit/Nominatim',
+    settingKey: 'geo_resolver_enabled',
+    notes: 'GPS coordinate resolution into place names.',
+  },
+  {
+    functionLabel: 'Explicit content detection',
+    modelLabel: 'NudeNet',
+    settingKey: 'explicit_detector_enabled',
+    notes: 'Explicit-content safety tagging.',
+  },
+  {
+    functionLabel: 'Dense captioning and OCR',
+    modelLabel: 'Microsoft Florence-2 Large',
+    settingKey: 'florence_enabled',
+    notes: 'Optional caption and OCR enrichment during Phase 4 tagging.',
+  },
+  {
+    functionLabel: 'Assistant planner',
+    modelLabel: 'Qwen3 14B',
+    notes: 'V2 planning and orchestration model.',
+  },
+  {
+    functionLabel: 'Assistant SQL agent and legacy LLM tasks',
+    modelLabel: 'Qwen2.5-Coder 14B',
+    notes: 'SQL planning, repairs, and legacy assistant paths.',
+  },
+]
+
+function TabButton({ active, label, onClick }: { active: boolean; label: string; onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+        active ? 'bg-indigo-600 text-white' : 'bg-gray-900 text-gray-400 hover:bg-gray-800 hover:text-gray-200'
+      }`}
+    >
+      {label}
+    </button>
+  )
+}
 
 // ─── Stat card ─────────────────────────────────────────────────────────────
 
@@ -408,6 +489,7 @@ function ContactsMatchPanel() {
 // ─── Main component ─────────────────────────────────────────────────────────
 
 export default function AdminPage() {
+  const [activeTab, setActiveTab] = useState<AdminTab>('overview')
   const [stats, setStats] = useState<Stats | null>(null)
   const [loading, setLoading] = useState(true)
   const [confirm, setConfirm] = useState<Scope | null>(null)
@@ -525,10 +607,29 @@ export default function AdminPage() {
 
   const confirmAction = ACTIONS.find(a => a.scope === confirm)
 
+  const settingsByKey = useMemo(() => {
+    const map = new Map<string, AppSetting>()
+    for (const setting of settings) map.set(setting.key, setting)
+    return map
+  }, [settings])
+
+  function toggleSetting(key: string, enabled: boolean) {
+    setSettingsEdits(prev => ({ ...prev, [key]: enabled ? 1 : 0 }))
+  }
+
   return (
     <div className="max-w-3xl">
       <p className="text-sm text-gray-500 mb-6">Database stats and selective data reset.</p>
 
+      <div className="flex flex-wrap gap-2 mb-6">
+        <TabButton active={activeTab === 'overview'} label="Overview" onClick={() => setActiveTab('overview')} />
+        <TabButton active={activeTab === 'settings'} label="Settings" onClick={() => setActiveTab('settings')} />
+        <TabButton active={activeTab === 'ml'} label="ML" onClick={() => setActiveTab('ml')} />
+        <TabButton active={activeTab === 'remote'} label="Remote" onClick={() => setActiveTab('remote')} />
+      </div>
+
+      {activeTab === 'overview' && (
+        <>
       {/* ── Stats ─────────────────────────────────────────────── */}
       <section className="mb-10">
         <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider mb-3">
@@ -631,9 +732,11 @@ export default function AdminPage() {
 
       {/* ── Contacts Face Match ───────────────────────────────────── */}
       <ContactsMatchPanel />
+        </>
+      )}
 
-      {/* ── ML Settings ──────────────────────────────────────────── */}
-      <section className="mt-10">
+      {activeTab === 'settings' && (
+      <section className="mt-2">
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
               ML Model Settings
@@ -760,9 +863,75 @@ export default function AdminPage() {
             ))}
           </div>
         </section>
+      )}
 
-      {/* ── Remote Servers ──────────────────────────────────────── */}
-      <RemoteServersPanel />
+      {activeTab === 'ml' && (
+        <section className="mt-2">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
+                ML Capability Map
+              </h2>
+              <p className="text-xs text-gray-600 mt-0.5">
+                Functions in the app, the models behind them, and module toggles where they are safe to control.
+              </p>
+            </div>
+            {isDirty && (
+              <button
+                onClick={saveSettings}
+                disabled={settingsBusy}
+                className="text-xs bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg px-3 py-1.5 font-medium transition-colors"
+              >
+                {settingsBusy ? 'Saving…' : 'Save Changes'}
+              </button>
+            )}
+          </div>
+
+          <div className="overflow-hidden rounded-xl border border-gray-800 bg-gray-900">
+            <div className="grid grid-cols-[1.3fr_1fr_120px] gap-4 px-5 py-3 text-xs font-semibold uppercase tracking-wider text-gray-500 border-b border-gray-800">
+              <div>Function</div>
+              <div>Model</div>
+              <div>Module</div>
+            </div>
+            {ML_CAPABILITIES.map((capability) => {
+              const setting = capability.settingKey ? settingsByKey.get(capability.settingKey) : undefined
+              const enabled = setting ? Boolean(val(setting)) : null
+              return (
+                <div
+                  key={capability.functionLabel}
+                  className="grid grid-cols-[1.3fr_1fr_120px] gap-4 px-5 py-4 border-b border-gray-800 last:border-b-0"
+                >
+                  <div>
+                    <p className="text-sm font-medium text-gray-200">{capability.functionLabel}</p>
+                    {capability.notes && <p className="text-xs text-gray-500 mt-0.5">{capability.notes}</p>}
+                  </div>
+                  <div className="text-sm text-gray-300">{capability.modelLabel}</div>
+                  <div className="flex items-center justify-start">
+                    {setting ? (
+                      <button
+                        onClick={() => toggleSetting(setting.key, !enabled)}
+                        className={`w-16 rounded-lg px-2 py-1.5 text-xs font-medium transition-colors ${
+                          enabled ? 'bg-emerald-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                        }`}
+                      >
+                        {enabled ? 'On' : 'Off'}
+                      </button>
+                    ) : (
+                      <span className="text-xs text-gray-600">Fixed</span>
+                    )}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+
+          <p className="text-xs text-gray-600 mt-3">
+            Module toggles affect future scans and tagging runs. Core face detection and assistant models are shown here for visibility but are not toggleable from the UI.
+          </p>
+        </section>
+      )}
+
+      {activeTab === 'remote' && <RemoteServersPanel />}
 
       {/* ── Confirmation modal ───────────────────────────────────── */}
       {confirm && confirmAction && (

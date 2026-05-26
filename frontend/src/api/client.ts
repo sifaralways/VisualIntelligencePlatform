@@ -32,12 +32,29 @@ export function buildProfileWebSocketUrl(profileId?: string): string {
   return url.toString()
 }
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
+function isUnknownProfileResponse(status: number, body: string): boolean {
+  if (status !== 404) return false
+  try {
+    const parsed = JSON.parse(body) as { detail?: unknown }
+    return typeof parsed.detail === 'string' && parsed.detail.startsWith('Unknown profile:')
+  } catch {
+    return body.includes('Unknown profile:')
+  }
+}
+
+async function request<T>(path: string, options?: RequestInit, allowProfileRecovery = true): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     headers: buildHeaders(options?.headers),
     ...options,
   })
-  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`)
+  if (!res.ok) {
+    const body = await res.text()
+    if (allowProfileRecovery && getCurrentProfileId() && isUnknownProfileResponse(res.status, body)) {
+      setCurrentProfileId(null)
+      return request<T>(path, options, false)
+    }
+    throw new Error(`${res.status} ${body}`)
+  }
   return res.json()
 }
 
@@ -90,6 +107,11 @@ export const api = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ force_retag: forceRetag }),
+      }),
+    rescanFolder: (folderId: number, pathPrefix?: string) =>
+      request<{ status: string; folder: string }>('/pipeline/rescan_folder', {
+        method: 'POST',
+        body: JSON.stringify({ folder_id: folderId, path_prefix: pathPrefix ?? null }),
       }),
     migrateModel: () =>
       request<{ status: string }>('/pipeline/migrate_model', { method: 'POST' }),
@@ -344,7 +366,7 @@ export const api = {
   // ─── Settings ────────────────────────────────────────────────────────────
   settings: {
     getAll: () => request<AppSetting[]>('/settings'),
-    update: (updates: Record<string, number | string>) =>
+    update: (updates: Record<string, number | string | boolean>) =>
       request<{ status: string; updated: string[] }>('/settings', {
         method: 'PATCH',
         body: JSON.stringify({ updates }),
@@ -759,13 +781,16 @@ export interface WritebackItem {
   fields: Record<string, string | number | string[]>
 }
 
-export type TagCategory = 'object' | 'animal' | 'geography' | 'place'
+export type TagCategory = 'object' | 'animal' | 'geography' | 'place' | 'caption' | 'ocr' | 'region'
 
 export interface TagsByCategory {
   object?: string[]
   animal?: string[]
   geography?: string[]
   place?: string[]
+  caption?: string[]
+  ocr?: string[]
+  region?: string[]
   explicit?: string[]
 }
 

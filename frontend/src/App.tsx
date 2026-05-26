@@ -134,6 +134,9 @@ export default function App() {
     folder: FolderItem
     result: RemoveResult
   } | null>(null)
+  const [folderRescanBusy, setFolderRescanBusy] = useState(false)
+  const [folderRescanMsg, setFolderRescanMsg] = useState<string | null>(null)
+  const [folderRescanError, setFolderRescanError] = useState<string | null>(null)
   // Subfolders keyed by scanned folder id — loaded lazily on expand
   const [subfolderMap, setSubfolderMap] = useState<Record<number, SubfolderItem[]>>({})
 
@@ -365,11 +368,15 @@ export default function App() {
 
   /** Navigate to a filtered photo grid (e.g. photos of Alice, photos of dogs) */
   function openFiltered(filter: MediaFilter, title: string, backTo: SidebarSection, folderId?: number, pathPrefix?: string) {
+    setFolderRescanMsg(null)
+    setFolderRescanError(null)
     setFiltered({ filter, title, backTo, folderId, pathPrefix })
   }
 
   /** Go back from filtered view to the discover/people section */
   function closeFiltered() {
+    setFolderRescanMsg(null)
+    setFolderRescanError(null)
     setFiltered(null)
   }
 
@@ -402,6 +409,22 @@ export default function App() {
         navigate('library')
       }
     } catch { /* ignore */ }
+  }
+
+  async function handleFolderRescan() {
+    if (!filtered?.folderId) return
+    setFolderRescanBusy(true)
+    setFolderRescanMsg(null)
+    setFolderRescanError(null)
+    try {
+      await api.pipeline.rescanFolder(filtered.folderId, filtered.pathPrefix)
+      setFolderRescanMsg('Rescan started — all available models will re-run for this folder scope.')
+      loadFolders()
+    } catch (e: unknown) {
+      setFolderRescanError(e instanceof Error ? e.message : 'Folder rescan failed')
+    } finally {
+      setFolderRescanBusy(false)
+    }
   }
 
   if (profileLoading && !selectedProfile) {
@@ -438,6 +461,17 @@ export default function App() {
   let mainContent: React.ReactNode
 
   if (filtered) {
+    const folderRescanSlot = filtered.folderId ? (
+      <button
+        onClick={handleFolderRescan}
+        disabled={folderRescanBusy}
+        className="text-xs px-3 py-1.5 rounded-lg font-medium bg-indigo-700 text-white hover:bg-indigo-600 disabled:opacity-40 transition-colors"
+        title="Re-run all enabled models for this folder scope"
+      >
+        {folderRescanBusy ? 'Queuing…' : '⟳ Rescan Folder'}
+      </button>
+    ) : null
+
     mainContent = (
       <div className="flex flex-col gap-4 h-full">
         <button
@@ -446,7 +480,23 @@ export default function App() {
         >
           ← Back
         </button>
-        <PhotoGrid filter={filtered.filter} title={filtered.title} selectable enableReprocess />
+        {filtered.folderId && folderRescanMsg && (
+          <div className="text-xs text-emerald-300 bg-emerald-900/20 border border-emerald-700/30 rounded-lg px-3 py-2">
+            {folderRescanMsg}
+          </div>
+        )}
+        {filtered.folderId && folderRescanError && (
+          <div className="text-xs text-red-300 bg-red-900/20 border border-red-700/30 rounded-lg px-3 py-2">
+            {folderRescanError}
+          </div>
+        )}
+        <PhotoGrid
+          filter={filtered.filter}
+          title={filtered.title}
+          selectable
+          enableReprocess
+          headerSlot={folderRescanSlot}
+        />
       </div>
     )
   } else {

@@ -35,6 +35,11 @@ class RescanRequest(BaseModel):
     force_retag: bool = False
 
 
+class FolderRescanRequest(BaseModel):
+    folder_id: int
+    path_prefix: str | None = None
+
+
 @router.post("/scan")
 async def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
     """Start the ingest pipeline on a given folder."""
@@ -103,6 +108,65 @@ async def rescan_library(req: RescanRequest, background_tasks: BackgroundTasks):
     pipeline_state.update({"status": "running", "folder": "[library reprocess]", "error": None})
     background_tasks.add_task(run_in_profile, profile_id, _run_reprocess, req.force_retag)
     return {"status": "started"}
+
+
+@router.post("/rescan_folder")
+async def rescan_folder(req: FolderRescanRequest, background_tasks: BackgroundTasks):
+    """Rescan a folder (or subfolder path prefix) and re-run all model stages."""
+    profile_id = get_current_profile_id()
+    pipeline_state = _state(profile_id)
+    if pipeline_state["status"] == "running":
+        raise HTTPException(status_code=409, detail="Pipeline already running")
+
+    async with get_db() as db:
+        folder_row = await (
+            await db.execute(
+                "SELECT folder_path FROM scan_state WHERE id=?",
+                (req.folder_id,),
+            )
+        ).fetchone()
+
+    if not folder_row:
+        raise HTTPException(status_code=404, detail="Folder not found")
+
+    folder_root = Path(folder_row["folder_path"]).resolve()
+    if req.path_prefix:
+        scan_root = Path(req.path_prefix).resolve()
+        if scan_root != folder_root and folder_root not in scan_root.parents:
+            raise HTTPException(status_code=400, detail="path_prefix must be inside the selected folder")
+    else:
+        scan_root = folder_root
+
+    if not scan_root.is_dir():
+        raise HTTPException(status_code=400, detail=f"Folder not found: {scan_root}")
+
+    prefix = str(scan_root) + "/%"
+    async with get_db() as db:
+        await db.execute(
+            """
+            UPDATE media_files
+            SET needs_reprocess = 1,
+                tags_done = 0
+            WHERE file_path LIKE ?
+              AND removed_from_app = 0
+            """,
+            (prefix,),
+        )
+        await db.execute(
+            """
+            DELETE FROM photo_analysis
+            WHERE media_file_id IN (
+                SELECT id FROM media_files
+                WHERE file_path LIKE ?
+                  AND removed_from_app = 0
+            )
+            """,
+            (prefix,),
+        )
+
+    pipeline_state.update({"status": "running", "folder": str(scan_root), "error": None})
+    background_tasks.add_task(run_in_profile, profile_id, _run_pipeline, str(scan_root))
+    return {"status": "started", "folder": str(scan_root)}
 
 
 @router.get("/status")

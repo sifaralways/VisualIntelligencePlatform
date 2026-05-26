@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass, field
@@ -1429,6 +1430,257 @@ async def tool_natural_search(ctx: ToolContext, params: dict[str, Any]) -> ToolE
     return ToolExecutionResult(payload=payload, next_state=next_state, notes="natural_search")
 
 
+async def _metadata_branch_hits(
+    query: str,
+    limit: int,
+    categories: tuple[str, ...],
+) -> tuple[list[int], dict[int, float]]:
+    tokens = [
+        token.lower()
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9'_-]*", query or "")
+        if len(token) >= 3
+    ]
+    if not tokens:
+        return [], {}
+
+    where_tokens = " OR ".join("LOWER(label) LIKE LOWER(?)" for _ in tokens)
+    category_placeholders = ",".join("?" * len(categories))
+    params_sql: list[object] = [f"%{token}%" for token in tokens]
+    params_sql.extend(categories)
+    params_sql.append(max(limit * 8, 80))
+
+    async with get_db() as db:
+        rows = await db.execute_fetchall(
+            f"""
+            SELECT media_file_id, category, label
+            FROM media_tags
+            WHERE ({where_tokens})
+              AND category IN ({category_placeholders})
+            ORDER BY media_file_id DESC
+            LIMIT ?
+            """,
+            tuple(params_sql),
+        )
+
+    scores: dict[int, float] = {}
+    for row in rows:
+        media_id = int(row["media_file_id"])
+        label = str(row["label"] or "").lower()
+        category = str(row["category"] or "")
+        matched_tokens = sum(1 for token in tokens if token in label)
+        if matched_tokens == 0:
+            continue
+        base = _metadata_category_weight(category)
+        scores[media_id] = scores.get(media_id, 0.0) + (base * matched_tokens)
+
+    ranked_ids = sorted(scores, key=scores.get, reverse=True)[:limit]
+    return ranked_ids, scores
+
+
+async def _face_branch_hits(
+    message: str,
+    state: AssistantState,
+    limit: int,
+) -> tuple[list[int], dict[int, float], list[str]]:
+    people = await _normalized_people({"message": message}, state)
+    if not people:
+        return [], {}, []
+
+    location_term = _extract_location_term_from_message(message)
+    min_other_people = _extract_min_other_people_from_message(message)
+    media_ids = await _media_ids_for_people(
+        people,
+        limit=max(limit * 3, 60),
+        offset=0,
+        min_other_people=min_other_people,
+        location_term=location_term,
+    )
+    scores = {
+        media_id: max(0.4, 2.4 - (rank * 0.04))
+        for rank, media_id in enumerate(media_ids)
+    }
+    return media_ids[:limit], scores, people
+
+
+def _accumulate_branch_scores(
+    fused_scores: dict[int, float],
+    branch_scores: dict[int, float],
+    source_hits: dict[int, list[str]],
+    branch_name: str,
+) -> None:
+    for media_id, score in branch_scores.items():
+        fused_scores[media_id] = fused_scores.get(media_id, 0.0) + score
+        source_hits.setdefault(media_id, []).append(branch_name)
+
+
+def _metadata_category_weight(category: str) -> float:
+    if category == "ocr":
+        return 1.35
+    if category in {"caption", "region"}:
+        return 1.15
+    return 0.8
+
+
+def _normalize_broker_branches(raw_branches: Any) -> list[str]:
+    candidates = (
+        raw_branches
+        if isinstance(raw_branches, list)
+        else ["natural_search", "metadata_text", "face_lookup", "ocr_lookup"]
+    )
+    branch_order = [
+        branch
+        for branch in candidates
+        if branch in {"natural_search", "metadata_text", "face_lookup", "ocr_lookup"}
+    ]
+    return branch_order or ["natural_search", "metadata_text", "face_lookup", "ocr_lookup"]
+
+
+def _natural_branch_score_map(natural: dict[str, Any]) -> tuple[dict[int, float], set[int], list[str]]:
+    natural_results = natural.get("results") or []
+    natural_ids = [int(item["media_id"]) for item in natural_results if item.get("media_id") is not None]
+    natural_scores = {
+        media_id: max(0.35, 1.8 - (rank * 0.03))
+        for rank, media_id in enumerate(natural_ids)
+    }
+    explanations = [str(natural["explanation"])] if natural.get("explanation") else []
+    return natural_scores, set(natural_ids), explanations
+
+
+def _fallback_natural_ids(natural: dict[str, Any] | None, limit: int) -> list[int]:
+    if not isinstance(natural, dict):
+        return []
+    return [
+        int(item["media_id"])
+        for item in (natural.get("results") or [])
+        if item.get("media_id") is not None
+    ][:limit]
+
+
+def _broker_reply_text(result_count: int) -> str:
+    if result_count:
+        suffix = "es" if result_count != 1 else ""
+        return f"I found {result_count} hybrid match{suffix}. Results are loaded below."
+    return "I couldn't find a strong multimodal match yet. Try adding a person, place, activity, or text clue."
+
+
+def _build_broker_tasks(
+    message: str,
+    state: AssistantState,
+    branch_order: list[str],
+    candidate_limit: int,
+) -> dict[str, Awaitable[Any]]:
+    tasks: dict[str, Awaitable[Any]] = {}
+    if "natural_search" in branch_order:
+        tasks["natural_search"] = natural_search(NaturalSearchRequest(query=message, limit=candidate_limit))
+    if "metadata_text" in branch_order:
+        tasks["metadata_text"] = _metadata_branch_hits(
+            message,
+            candidate_limit,
+            ("object", "animal", "geography", "place", "caption", "region"),
+        )
+    if "face_lookup" in branch_order:
+        tasks["face_lookup"] = _face_branch_hits(message, state, candidate_limit)
+    if "ocr_lookup" in branch_order:
+        tasks["ocr_lookup"] = _metadata_branch_hits(message, candidate_limit, ("ocr",))
+    return tasks
+
+
+def _merge_broker_results(
+    gathered: dict[str, Any],
+) -> tuple[dict[int, float], set[int], list[str], list[str]]:
+    fused_scores: dict[int, float] = {}
+    source_hits: dict[int, list[str]] = {}
+    sql_matched_ids: set[int] = set()
+    resolved_people: list[str] = []
+    explanations: list[str] = []
+
+    natural = gathered.get("natural_search")
+    if isinstance(natural, dict):
+        natural_scores, natural_ids, natural_explanations = _natural_branch_score_map(natural)
+        sql_matched_ids.update(natural_ids)
+        _accumulate_branch_scores(fused_scores, natural_scores, source_hits, "natural_search")
+        explanations.extend(natural_explanations)
+
+    metadata = gathered.get("metadata_text")
+    if isinstance(metadata, tuple):
+        _, metadata_scores = metadata
+        _accumulate_branch_scores(fused_scores, metadata_scores, source_hits, "metadata_text")
+
+    face = gathered.get("face_lookup")
+    if isinstance(face, tuple):
+        _, face_scores, resolved_people = face
+        _accumulate_branch_scores(fused_scores, face_scores, source_hits, "face_lookup")
+
+    ocr = gathered.get("ocr_lookup")
+    if isinstance(ocr, tuple):
+        _, ocr_scores = ocr
+        _accumulate_branch_scores(fused_scores, ocr_scores, source_hits, "ocr_lookup")
+
+    ranked_ids = sorted(
+        fused_scores,
+        key=lambda media_id: (fused_scores[media_id], len(source_hits.get(media_id, []))),
+        reverse=True,
+    )
+    return ranked_ids, sql_matched_ids, resolved_people, explanations
+
+
+async def tool_retrieval_broker(ctx: ToolContext, params: dict[str, Any]) -> ToolExecutionResult:
+    message = str(params.get("message") or params.get("query") or "").strip()
+    if not message:
+        return ToolExecutionResult(
+            payload={
+                "reply_text": "Ask me anything about your photos.",
+                "results": [],
+                "count": 0,
+                "action": "none",
+                "action_payload": {},
+                "intent": "HYBRID_RETRIEVAL",
+                "explanation": "Empty broker query",
+            },
+            next_state=ctx.state,
+            notes="retrieval_broker_empty",
+        )
+
+    branch_order = _normalize_broker_branches(params.get("retrieval_branches"))
+    candidate_limit = max(ctx.limit * 2, min(settings.hybrid_retrieval_candidate_limit, 200))
+    tasks = _build_broker_tasks(message, ctx.state, branch_order, candidate_limit)
+
+    branch_names = list(tasks)
+    branch_results = await asyncio.gather(*(tasks[name] for name in branch_names))
+    gathered = dict(zip(branch_names, branch_results, strict=False))
+    ranked_ids, sql_matched_ids, resolved_people, explanations = _merge_broker_results(gathered)
+    ranked_ids = ranked_ids[:ctx.limit]
+
+    if not ranked_ids:
+        ranked_ids = _fallback_natural_ids(gathered.get("natural_search"), ctx.limit)
+
+    results = await _hydrate_media_rows(ranked_ids, sql_matched_ids=sql_matched_ids) if ranked_ids else []
+    next_state = ctx.state.model_copy(deep=True)
+    next_state.last_media_ids = ranked_ids
+    if resolved_people:
+        next_state.last_people = resolved_people
+    location_term = _extract_location_term_from_message(message)
+    if location_term:
+        next_state.last_location_term = location_term
+
+    reply_text = _broker_reply_text(len(results))
+
+    explanation_parts = []
+    if explanations:
+        explanation_parts.append(explanations[0])
+    explanation_parts.append(f"Broker branches: {', '.join(branch_order)}")
+    payload = {
+        "reply_text": reply_text,
+        "results": results,
+        "count": len(results),
+        "action": "open_search",
+        "action_payload": {"query": message, "broker": True, "branches": branch_order},
+        "intent": "HYBRID_RETRIEVAL",
+        "explanation": "; ".join(explanation_parts),
+    }
+    return ToolExecutionResult(payload=payload, next_state=next_state, notes=f"retrieval_broker:{','.join(branch_order)}")
+
+
 async def tool_sql_agent(ctx: ToolContext, params: dict[str, Any]) -> ToolExecutionResult:
     message = str(params.get("message") or "").strip()
     if not message:
@@ -1641,6 +1893,30 @@ def build_default_registry() -> ToolRegistry:
                 "additionalProperties": False,
             },
             handler=tool_natural_search,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="retrieval_broker",
+            description="Run hybrid multimodal retrieval by fusing natural search, metadata text, face lookup, and OCR evidence.",
+            read_only=True,
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string"},
+                    "query": {"type": "string"},
+                    "retrieval_branches": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["natural_search", "metadata_text", "face_lookup", "ocr_lookup"],
+                        },
+                    },
+                },
+                "required": ["message"],
+                "additionalProperties": False,
+            },
+            handler=tool_retrieval_broker,
         )
     )
     registry.register(
