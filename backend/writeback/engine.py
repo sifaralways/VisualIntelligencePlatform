@@ -471,7 +471,9 @@ async def _build_fields_batch(media_ids: list[int]) -> dict[int, dict]:
         person_rows = await db.execute_fetchall(f"""
             SELECT DISTINCT f.media_file_id, p.name, f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h
             FROM faces f
-            JOIN persons p ON p.id = f.person_id
+                        JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                        JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                        JOIN persons p ON p.person_guid = cpc.person_guid
             WHERE f.media_file_id IN ({ph})
               AND p.name IS NOT NULL
               AND p.is_merged = 0
@@ -601,7 +603,9 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
         person_rows = await db.execute_fetchall("""
             SELECT DISTINCT p.name, f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h
             FROM faces f
-            JOIN persons p ON p.id = f.person_id
+                        JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                        JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                        JOIN persons p ON p.person_guid = cpc.person_guid
             WHERE f.media_file_id = ?
               AND p.name IS NOT NULL
               AND p.is_merged = 0

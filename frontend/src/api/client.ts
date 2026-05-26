@@ -97,7 +97,7 @@ export const api = {
   },
 
   pipeline: {
-    scan: (folder: string, forceReprocess = false, useExistingVipData = true) =>
+    scan: (folder: string, forceReprocess = false, useExistingVipData = false) =>
       request('/pipeline/scan', {
         method: 'POST',
         body: JSON.stringify({

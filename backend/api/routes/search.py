@@ -138,7 +138,9 @@ async def search(req: SearchRequest):
                GROUP_CONCAT(DISTINCT p.name) as persons
         FROM media_files mf
         LEFT JOIN faces f ON f.media_file_id = mf.id
-        LEFT JOIN persons p ON p.id = f.person_id AND p.is_merged = 0
+        LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+        LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+        LEFT JOIN persons p ON p.person_guid = cpc.person_guid AND p.is_merged = 0
         {where}
         GROUP BY mf.id
         ORDER BY mf.date_taken DESC
@@ -503,7 +505,9 @@ async def _hydrate_media_rows(
                 GROUP_CONCAT(DISTINCT mt.label) AS tags
             FROM media_files mf
             LEFT JOIN faces f ON f.media_file_id = mf.id
-            LEFT JOIN persons p ON p.id = f.person_id AND p.is_merged = 0
+                        LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                        LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                        LEFT JOIN persons p ON p.person_guid = cpc.person_guid AND p.is_merged = 0
             LEFT JOIN media_tags mt ON mt.media_file_id = mf.id
             WHERE mf.id IN ({placeholders})
               AND mf.removed_from_app = 0

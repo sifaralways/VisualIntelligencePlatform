@@ -10,6 +10,7 @@ from pathlib import Path
 
 from backend.config import settings
 from backend.database.db import get_db
+from backend.database.identity import append_identity_event, link_cluster_to_person, relink_face_to_cluster
 from backend.pipeline.centroid import update_person_centroid
 
 router = APIRouter()
@@ -39,6 +40,13 @@ async def _requeue_as_singleton(db, face_id: int) -> None:
         new_cluster_id = cursor.lastrowid
         await db.execute(
             "UPDATE faces SET cluster_id=? WHERE id=?", (new_cluster_id, face_id)
+        )
+        await relink_face_to_cluster(
+            db,
+            face_id=face_id,
+            cluster_id=int(new_cluster_id),
+            reason="singleton_requeue",
+            actor="api.faces",
         )
 
 
@@ -194,6 +202,13 @@ async def _apply_history_matches(
                 "UPDATE faces SET person_id=? WHERE cluster_id=? AND person_id IS NULL",
                 (person_id, cluster_id),
             )
+            await link_cluster_to_person(
+                db,
+                cluster_id=cluster_id,
+                person_id=person_id,
+                source="history_restore",
+                actor="api.restore_vip_history",
+            )
 
         await db.execute(
             "INSERT OR REPLACE INTO writeback_queue (media_file_id) VALUES (?)",
@@ -228,10 +243,16 @@ async def _restore_vip_history_names_for_media(db, media_id: int) -> None:
 
     face_rows = await db.execute_fetchall(
         """
-        SELECT f.id AS face_id, f.cluster_id,
+         SELECT f.id AS face_id,
+             COALESCE(c_current.id, f.cluster_id) AS cluster_id,
                f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h,
-               f.person_id
+             current_person.id AS person_id
         FROM faces f
+         LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+         LEFT JOIN clusters c_current ON c_current.cluster_guid = fcc.cluster_guid
+         LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+         LEFT JOIN persons current_person ON current_person.person_guid = cpc.person_guid
+             AND current_person.is_merged = 0
         WHERE f.media_file_id = ?
         """,
         (media_id,),
@@ -276,11 +297,16 @@ async def get_cluster_faces(cluster_id: int, limit: int = 20):
     """Return representative face thumbnails for a cluster."""
     async with get_db() as db:
         rows = await db.execute_fetchall("""
-            SELECT f.id, f.thumbnail_path, f.detection_conf, f.person_id,
+            SELECT f.id, f.thumbnail_path, f.detection_conf,
+                   current_person.id AS person_id,
                    mf.file_path, mf.date_taken
             FROM faces f
             JOIN media_files mf ON mf.id = f.media_file_id
-            WHERE f.cluster_id = ?
+            LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+            LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+            LEFT JOIN persons current_person ON current_person.person_guid = cpc.person_guid
+                AND current_person.is_merged = 0
+            WHERE COALESCE((SELECT c_current.id FROM clusters c_current WHERE c_current.cluster_guid = fcc.cluster_guid), f.cluster_id) = ?
             ORDER BY f.detection_conf DESC
             LIMIT ?
         """, (cluster_id, limit))
@@ -303,25 +329,36 @@ async def get_faces_for_media(
             # is_ignored=1 faces are returned with person_name=NULL (they have no real name).
             rows = await db.execute_fetchall("""
                 SELECT f.id, f.thumbnail_path, f.detection_conf,
-                       f.cluster_id, f.person_id,
-                       CASE WHEN p.is_ignored = 0 THEN p.name ELSE NULL END AS person_name,
+                       COALESCE(c_current.id, f.cluster_id) AS cluster_id,
+                       current_person.id AS person_id,
+                       CASE WHEN current_person.is_ignored = 0 THEN current_person.name ELSE NULL END AS person_name,
                        f.face_attributes,
-                       COALESCE(p.is_ignored, 0) AS is_ignored
+                       COALESCE(current_person.is_ignored, 0) AS is_ignored
                 FROM faces f
-                LEFT JOIN persons p ON p.id = f.person_id AND p.is_merged = 0
+                LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                LEFT JOIN clusters c_current ON c_current.cluster_guid = fcc.cluster_guid
+                LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                LEFT JOIN persons current_person ON current_person.person_guid = cpc.person_guid
+                    AND current_person.is_merged = 0
                 WHERE f.media_file_id = ?
                 ORDER BY f.detection_conf DESC
             """, (media_id,))
         else:
             rows = await db.execute_fetchall("""
                 SELECT f.id, f.thumbnail_path, f.detection_conf,
-                       f.cluster_id, f.person_id, p.name AS person_name,
+                       COALESCE(c_current.id, f.cluster_id) AS cluster_id,
+                       current_person.id AS person_id,
+                       current_person.name AS person_name,
                        f.face_attributes,
                        0 AS is_ignored
                 FROM faces f
-                LEFT JOIN persons p ON p.id = f.person_id AND p.is_merged = 0 AND p.is_ignored = 0
+                LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                LEFT JOIN clusters c_current ON c_current.cluster_guid = fcc.cluster_guid
+                LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                LEFT JOIN persons current_person ON current_person.person_guid = cpc.person_guid
+                    AND current_person.is_merged = 0 AND current_person.is_ignored = 0
                 WHERE f.media_file_id = ?
-                  AND (f.person_id IS NULL OR p.id IS NOT NULL)
+                  AND (cpc.person_guid IS NULL OR current_person.id IS NOT NULL)
                 ORDER BY f.detection_conf DESC
             """, (media_id,))
     result = []
@@ -351,9 +388,22 @@ async def remove_face_from_cluster(face_id: int):
     in the unnamed faces list rather than disappearing until the next pipeline.
     """
     async with get_db() as db:
+        await relink_face_to_cluster(
+            db,
+            face_id=face_id,
+            cluster_id=None,
+            reason="manual_remove_from_cluster",
+            actor="api.remove_face_from_cluster",
+        )
         await db.execute(
             "UPDATE faces SET cluster_id=NULL, person_id=NULL WHERE id=?",
             (face_id,),
+        )
+        await append_identity_event(
+            db,
+            "face_unassigned",
+            actor="api.remove_face_from_cluster",
+            payload={"face_id": face_id},
         )
         await _requeue_as_singleton(db, face_id)
     return {"status": "removed", "face_id": face_id}
@@ -378,8 +428,21 @@ async def remove_face_from_person(face_id: int):
             from fastapi import HTTPException
             raise HTTPException(status_code=404, detail="Face not found")
 
+        await relink_face_to_cluster(
+            db,
+            face_id=face_id,
+            cluster_id=None,
+            reason="manual_remove_from_person",
+            actor="api.remove_face_from_person",
+        )
         await db.execute(
             "UPDATE faces SET cluster_id=NULL, person_id=NULL WHERE id=?", (face_id,)
+        )
+        await append_identity_event(
+            db,
+            "face_person_removed",
+            actor="api.remove_face_from_person",
+            payload={"face_id": face_id, "person_id": row["person_id"]},
         )
 
         # Re-queue the media file so writeback rewrites EXIF without this person

@@ -10,7 +10,7 @@ export default function PipelinePage() {
   const [folder, setFolder] = useState('')
   const [status, setStatus] = useState<string>('idle')
   const [events, setEvents] = useState<WsEvent[]>([])
-  const [useExistingVipData, setUseExistingVipData] = useState(true)
+  const [useExistingVipData, setUseExistingVipData] = useState(false)
   const wsRef = useRef<WebSocket | null>(null)
   const logRef = useRef<HTMLDivElement>(null)
 

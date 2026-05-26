@@ -474,7 +474,15 @@ async def merge_analysis_document(media_id: int, db: aiosqlite.Connection) -> di
     if face_ids:
         ph = ",".join("?" * len(face_ids))
         face_rows = await db.execute_fetchall(
-            f"SELECT id, person_id FROM faces WHERE id IN ({ph}) AND person_id IS NOT NULL",
+                        f"""
+                        SELECT f.id, p.id AS person_id
+                        FROM faces f
+                        JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                        JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                        JOIN persons p ON p.person_guid = cpc.person_guid
+                        WHERE f.id IN ({ph})
+                            AND p.is_merged = 0
+                        """,
             face_ids,
         )
         face_person_map = {r["id"]: r["person_id"] for r in face_rows}

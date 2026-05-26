@@ -29,7 +29,7 @@ def _state(profile_id: str) -> dict:
 class ScanRequest(BaseModel):
     folder: str
     force_reprocess: bool = False
-    use_existing_vip_data: bool = True
+    use_existing_vip_data: bool = False
 
 
 class RescanRequest(BaseModel):
@@ -182,7 +182,7 @@ async def get_status():
     return _state(get_current_profile_id())
 
 
-async def _run_pipeline(folder: str, use_existing_vip_data: bool = True) -> None:
+async def _run_pipeline(folder: str, use_existing_vip_data: bool = False) -> None:
     from backend.pipeline.ingest import run_ingest
     profile_id = get_current_profile_id()
     pipeline_state = _state(profile_id)

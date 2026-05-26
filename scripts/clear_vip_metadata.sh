@@ -7,11 +7,13 @@
 #   ./scripts/clear_vip_metadata.sh "/path/to/folder"
 #   ./scripts/clear_vip_metadata.sh "/path/to/folder" --dry-run
 #   ./scripts/clear_vip_metadata.sh "/path/to/folder" --clear-gps
+#   ./scripts/clear_vip_metadata.sh "/path/to/folder" --yes
 #
 # Options:
 #   --dry-run    Print what would be changed without writing anything.
 #   --clear-gps  Also clear GPS coordinates.  Off by default because the
 #                camera itself writes GPS — clearing it removes original data.
+#   --yes        Run non-interactively (skip confirmation prompt).
 #
 # Fields cleared:
 #   XMP:PersonInImage         — named persons
@@ -34,17 +36,19 @@ set -euo pipefail
 FOLDER=""
 DRY_RUN=false
 CLEAR_GPS=false
+ASSUME_YES=false
 
 for arg in "$@"; do
     case "$arg" in
         --dry-run)   DRY_RUN=true ;;
         --clear-gps) CLEAR_GPS=true ;;
+        --yes|-y)    ASSUME_YES=true ;;
         *)           FOLDER="$arg" ;;
     esac
 done
 
 if [[ -z "$FOLDER" ]]; then
-    echo "Usage: $0 <folder> [--dry-run] [--clear-gps]"
+    echo "Usage: $0 <folder> [--dry-run] [--clear-gps] [--yes]"
     exit 1
 fi
 
@@ -101,7 +105,7 @@ if [[ "$DRY_RUN" == true ]]; then
     # List every image file exiftool can read, with its current values for VIP fields
     exiftool -r -q \
         -ext cr3 -ext arw -ext nef -ext dng -ext rw2 -ext orf -ext raf -ext cr2 \
-        -ext jpg -ext jpeg \
+        -ext jpg -ext jpeg -ext heic -ext heif -ext png -ext webp -ext tiff -ext tif -ext avif \
         -p '  $Directory/$FileName' \
         "$FOLDER" 2>/dev/null | sort || true
     echo ""
@@ -109,7 +113,7 @@ if [[ "$DRY_RUN" == true ]]; then
     echo "  [DRY RUN] VIP field values in sample file (empty = not yet written):"
     exiftool -r -q \
         -ext cr3 -ext arw -ext nef -ext dng -ext rw2 -ext orf -ext raf -ext cr2 \
-        -ext jpg -ext jpeg \
+        -ext jpg -ext jpeg -ext heic -ext heif -ext png -ext webp -ext tiff -ext tif -ext avif \
         -PersonInImage -Subject -Keywords -Location -HierarchicalSubject -Identifier \
         -fileOrder FileName \
         "$FOLDER" 2>/dev/null | head -40 || true
@@ -117,13 +121,16 @@ if [[ "$DRY_RUN" == true ]]; then
     echo "  Run without --dry-run to apply changes."
 else
     echo "  ⚠️   This will modify files in place. Originals are backed up"
-    echo "       as <filename>_original unless you pass --overwrite."
+    echo "       only if exiftool is configured to keep backups."
+    echo "       This script uses -overwrite_original (no *_original backups)."
     echo ""
-    read -r -p "  Continue? [y/N] " confirm
-    confirm_lower=$(echo "$confirm" | tr '[:upper:]' '[:lower:]')
-    if [[ "$confirm_lower" != "y" ]]; then
-        echo "  Aborted."
-        exit 0
+    if [[ "$ASSUME_YES" != true ]]; then
+        read -r -p "  Continue? [y/N] " confirm
+        confirm_lower=$(echo "$confirm" | tr '[:upper:]' '[:lower:]')
+        if [[ "$confirm_lower" != "y" ]]; then
+            echo "  Aborted."
+            exit 0
+        fi
     fi
     echo ""
 

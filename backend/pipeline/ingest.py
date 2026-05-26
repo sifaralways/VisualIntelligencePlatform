@@ -26,6 +26,7 @@ import numpy as np
 
 from backend.config import settings
 from backend.database.db import get_db
+from backend.database.identity import link_cluster_to_person
 from backend.scanner.walker import walk_folder
 from backend.scanner.hasher import compute_hash, check_idempotency
 from backend.scanner.exif_reader import ExifToolReader
@@ -123,7 +124,9 @@ async def run_reprocess(force_retag: bool = False) -> None:
             WHERE m.is_stub = 0
               AND m.id NOT IN (
                   SELECT DISTINCT f.media_file_id FROM faces f
-                  JOIN persons p ON p.id = f.person_id
+                  JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                  JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                  JOIN persons p ON p.person_guid = cpc.person_guid
                   WHERE p.name IS NOT NULL AND p.is_ignored = 0
               )
         """)).fetchone()
@@ -134,10 +137,15 @@ async def run_reprocess(force_retag: bool = False) -> None:
             DELETE FROM embeddings
             WHERE face_id IN (
                 SELECT f.id FROM faces f
-                WHERE f.person_id IS NULL
+                LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                LEFT JOIN persons pcur ON pcur.person_guid = cpc.person_guid
+                WHERE pcur.id IS NULL
                   AND f.media_file_id NOT IN (
                       SELECT DISTINCT f2.media_file_id FROM faces f2
-                      JOIN persons p ON p.id = f2.person_id
+                      JOIN v_face_cluster_current fcc2 ON fcc2.face_guid = f2.face_guid
+                      JOIN v_cluster_person_current cpc2 ON cpc2.cluster_guid = fcc2.cluster_guid
+                      JOIN persons p ON p.person_guid = cpc2.person_guid
                       WHERE p.name IS NOT NULL AND p.is_ignored = 0
                   )
             )
@@ -146,10 +154,18 @@ async def run_reprocess(force_retag: bool = False) -> None:
         # 1b. Drop the unowned face rows themselves
         await db.execute("""
             DELETE FROM faces
-            WHERE person_id IS NULL
+            WHERE id IN (
+                SELECT f.id FROM faces f
+                LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                LEFT JOIN persons pcur ON pcur.person_guid = cpc.person_guid
+                WHERE pcur.id IS NULL
+            )
               AND media_file_id NOT IN (
                   SELECT DISTINCT f2.media_file_id FROM faces f2
-                  JOIN persons p ON p.id = f2.person_id
+                  JOIN v_face_cluster_current fcc2 ON fcc2.face_guid = f2.face_guid
+                  JOIN v_cluster_person_current cpc2 ON cpc2.cluster_guid = fcc2.cluster_guid
+                  JOIN persons p ON p.person_guid = cpc2.person_guid
                   WHERE p.name IS NOT NULL AND p.is_ignored = 0
               )
         """)
@@ -160,7 +176,9 @@ async def run_reprocess(force_retag: bool = False) -> None:
             WHERE is_stub = 0
               AND id NOT IN (
                   SELECT DISTINCT f.media_file_id FROM faces f
-                  JOIN persons p ON p.id = f.person_id
+                  JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                  JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                  JOIN persons p ON p.person_guid = cpc.person_guid
                   WHERE p.name IS NOT NULL AND p.is_ignored = 0
               )
         """)
@@ -285,7 +303,9 @@ async def run_reprocess(force_retag: bool = False) -> None:
             SET photo_count = (
                 SELECT COUNT(DISTINCT f.media_file_id)
                 FROM faces f
-                WHERE f.person_id = persons.id
+                JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                WHERE cpc.person_guid = persons.person_guid
             )
             WHERE is_merged = 0
         """)
@@ -547,7 +567,9 @@ async def run_model_migration() -> None:
         named_face_rows = await db.execute_fetchall("""
             SELECT f.id AS face_id, f.thumbnail_path
             FROM faces f
-            JOIN persons p ON p.id = f.person_id
+                        JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                        JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                        JOIN persons p ON p.person_guid = cpc.person_guid
             WHERE p.name IS NOT NULL AND p.is_ignored = 0
               AND EXISTS (SELECT 1 FROM embeddings e WHERE e.face_id = f.id)
         """)
@@ -648,12 +670,27 @@ async def run_model_migration() -> None:
         await db.execute("""
             DELETE FROM embeddings
             WHERE face_id IN (
-                SELECT f.id FROM faces f WHERE f.person_id IS NULL
+                SELECT f.id FROM faces f
+                LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                LEFT JOIN persons pcur ON pcur.person_guid = cpc.person_guid
+                WHERE pcur.id IS NULL
             )
         """)
 
         # 3b. Drop the face rows themselves
-        await db.execute("DELETE FROM faces WHERE person_id IS NULL")
+        await db.execute(
+            """
+            DELETE FROM faces
+            WHERE id IN (
+                SELECT f.id FROM faces f
+                LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                LEFT JOIN persons pcur ON pcur.person_guid = cpc.person_guid
+                WHERE pcur.id IS NULL
+            )
+            """
+        )
 
         # 3c. Reset files that have no named faces → 'scanned' for re-detection
         await db.execute("""
@@ -661,7 +698,9 @@ async def run_model_migration() -> None:
             WHERE is_stub = 0
               AND id NOT IN (
                   SELECT DISTINCT f.media_file_id FROM faces f
-                  JOIN persons p ON p.id = f.person_id
+                  JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                  JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                  JOIN persons p ON p.person_guid = cpc.person_guid
                   WHERE p.name IS NOT NULL AND p.is_ignored = 0
               )
         """)
@@ -686,7 +725,9 @@ async def run_model_migration() -> None:
             SET photo_count = (
                 SELECT COUNT(DISTINCT f.media_file_id)
                 FROM faces f
-                WHERE f.person_id = persons.id
+                JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                WHERE cpc.person_guid = persons.person_guid
             )
             WHERE is_merged = 0
         """)
@@ -793,7 +834,9 @@ async def run_ingest(folder: str, use_existing_vip_data: bool = True) -> None:
             SET photo_count = (
                 SELECT COUNT(DISTINCT f.media_file_id)
                 FROM faces f
-                WHERE f.person_id = persons.id
+                JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                WHERE cpc.person_guid = persons.person_guid
             )
             WHERE is_merged = 0
         """)
@@ -1234,11 +1277,9 @@ async def _phase_cluster(media_ids: set[int] | None = None) -> None:
         async with get_db() as db:
             unnamed = await db.execute_fetchall("""
                 SELECT c.id FROM clusters c
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM faces f
-                    JOIN persons p ON p.id = f.person_id
-                    WHERE f.cluster_id = c.id AND p.name IS NOT NULL AND p.is_ignored = 0
-                )
+                LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
+                LEFT JOIN persons p ON p.person_guid = cpc.person_guid AND p.is_merged = 0 AND p.is_ignored = 0
+                WHERE p.id IS NULL
             """)
             unnamed_ids = [r["id"] for r in unnamed]
             if unnamed_ids:
@@ -1387,8 +1428,10 @@ async def _phase_recover_singletons() -> None:
                    MIN(f.id) AS face_id
             FROM clusters c
             JOIN faces f ON f.cluster_id = c.id
-            WHERE c.member_count = 1
-              AND c.person_id IS NULL
+                        LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
+                        LEFT JOIN persons p ON p.person_guid = cpc.person_guid AND p.is_merged = 0 AND p.is_ignored = 0
+                        WHERE c.member_count = 1
+                            AND p.id IS NULL
             GROUP BY c.id
         """)
 
@@ -1396,10 +1439,11 @@ async def _phase_recover_singletons() -> None:
         # (needed to find which cluster a FAISS hit belongs to)
         face_to_cluster_rows = await db.execute_fetchall("""
             SELECT f.id AS face_id, f.cluster_id, c.member_count,
-                   f.person_id,
-                   c.person_id AS cluster_person_id
+                   owner.id AS cluster_person_id
             FROM faces f
             JOIN clusters c ON c.id = f.cluster_id
+            LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
+            LEFT JOIN persons owner ON owner.person_guid = cpc.person_guid AND owner.is_merged = 0
             WHERE f.cluster_id IS NOT NULL
         """)
 
@@ -1638,7 +1682,10 @@ async def _phase_auto_merge(media_ids: set[int] | None = None) -> None:
                        MIN(f.id) AS representative_face_id
                 FROM clusters c
                 JOIN faces f ON f.cluster_id = c.id AND f.thumbnail_path IS NOT NULL
-                WHERE c.person_id IS NULL
+                LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
+                LEFT JOIN persons owner ON owner.person_guid = cpc.person_guid
+                    AND owner.is_merged = 0 AND owner.is_ignored = 0
+                WHERE owner.id IS NULL
                   AND f.media_file_id IN ({placeholders})
                 GROUP BY c.id
                 """,
@@ -1650,7 +1697,10 @@ async def _phase_auto_merge(media_ids: set[int] | None = None) -> None:
                        MIN(f.id) AS representative_face_id
                 FROM clusters c
                 JOIN faces f ON f.cluster_id = c.id AND f.thumbnail_path IS NOT NULL
-                WHERE c.person_id IS NULL
+                LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
+                LEFT JOIN persons owner ON owner.person_guid = cpc.person_guid
+                    AND owner.is_merged = 0 AND owner.is_ignored = 0
+                WHERE owner.id IS NULL
                 GROUP BY c.id
             """)
         if not clusters:
@@ -1676,7 +1726,10 @@ async def _phase_auto_merge(media_ids: set[int] | None = None) -> None:
                 emb_rows = await db.execute_fetchall("""
                     SELECT e.vector FROM embeddings e
                     JOIN faces f ON f.id = e.face_id
-                    WHERE f.person_id = ?
+                    JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                    JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                    JOIN persons p ON p.person_guid = cpc.person_guid
+                    WHERE p.id = ?
                 """, (pid,))
                 if not emb_rows:
                     continue
@@ -1693,7 +1746,10 @@ async def _phase_auto_merge(media_ids: set[int] | None = None) -> None:
             # Representative face thumbnail for the suggestion card
             rep_row = await (await db.execute("""
                 SELECT f.id FROM faces f
-                WHERE f.person_id = ? AND f.thumbnail_path IS NOT NULL
+                JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                JOIN persons p ON p.person_guid = cpc.person_guid
+                WHERE p.id = ? AND f.thumbnail_path IS NOT NULL
                 LIMIT 1
             """, (pid,))).fetchone()
             rep_face_id = rep_row["id"] if rep_row else None
@@ -1752,10 +1808,22 @@ async def _phase_auto_merge(media_ids: set[int] | None = None) -> None:
                     await db.execute(
                         "UPDATE faces SET person_id=? WHERE cluster_id=?", (pid, cid)
                     )
+                    await link_cluster_to_person(
+                        db,
+                        cluster_id=cid,
+                        person_id=pid,
+                        source="auto_merge_similarity",
+                        actor="pipeline.auto_merge",
+                    )
                     await db.execute("""
                         UPDATE persons
                         SET photo_count = (
-                            SELECT COUNT(DISTINCT media_file_id) FROM faces WHERE person_id = ?
+                            SELECT COUNT(DISTINCT f.media_file_id)
+                            FROM faces f
+                            JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                            JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                            JOIN persons p ON p.person_guid = cpc.person_guid
+                            WHERE p.id = ?
                         ) WHERE id = ?
                     """, (pid, pid))
                     await db.execute("""
@@ -1818,6 +1886,13 @@ async def _phase_auto_merge(media_ids: set[int] | None = None) -> None:
                     await db.execute(
                         "UPDATE faces SET person_id=? WHERE cluster_id=?",
                         (ip["person_id"], cid),
+                    )
+                    await link_cluster_to_person(
+                        db,
+                        cluster_id=cid,
+                        person_id=ip["person_id"],
+                        source="auto_ignore_similarity",
+                        actor="pipeline.auto_merge",
                     )
                     await update_person_centroid(db, ip["person_id"])
                 named_cluster_ids.add(cid)
@@ -2085,6 +2160,13 @@ async def _phase_restore_vip_names(media_ids: set[int] | None = None) -> None:
                         "UPDATE clusters SET person_id=? WHERE id=?",
                         (person_id, cluster_id)
                     )
+                    await link_cluster_to_person(
+                        db,
+                        cluster_id=cluster_id,
+                        person_id=person_id,
+                        source="vip_history_restore",
+                        actor="pipeline.restore_vip_names",
+                    )
                     # Assign all other faces in the same cluster too
                     await db.execute(
                         "UPDATE faces SET person_id=? WHERE cluster_id=? AND person_id IS NULL",
@@ -2242,6 +2324,13 @@ async def _phase_restore_vip_names(media_ids: set[int] | None = None) -> None:
                         person_id = int(cursor.lastrowid)
 
                     await db.execute("UPDATE clusters SET person_id=? WHERE id=?", (person_id, cid))
+                    await link_cluster_to_person(
+                        db,
+                        cluster_id=cid,
+                        person_id=person_id,
+                        source="vip_history_inference",
+                        actor="pipeline.restore_vip_names",
+                    )
                     await db.execute(
                         "UPDATE faces SET person_id=? WHERE cluster_id=? AND person_id IS NULL",
                         (person_id, cid),

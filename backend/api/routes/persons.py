@@ -12,6 +12,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
 from backend.database.db import get_db
+from backend.database.identity import append_identity_event, get_current_cluster_id_for_face, get_current_person_id_for_cluster, link_cluster_to_person, relink_face_to_cluster
 from backend.database.models import Person
 from backend.pipeline.centroid import update_person_centroid, load_centroid
 from backend.api.websocket import broadcast
@@ -82,18 +83,25 @@ async def _rescore_after_person_update(person_id: int) -> None:
         async with get_db() as db:
             rows = await db.execute_fetchall(f"""
                 SELECT f.id AS face_id,
-                       f.cluster_id,
-                       f.person_id,
+                       COALESCE(c_current.id, f.cluster_id) AS cluster_id,
+                       current_person.id AS person_id,
                        f.thumbnail_path,
                        c.member_count,
-                       c.person_id AS cluster_person_id,
+                       owner_person.id AS cluster_person_id,
                        MIN(f2.thumbnail_path) AS cluster_thumb
                 FROM faces f
-                LEFT JOIN clusters c ON c.id = f.cluster_id
-                LEFT JOIN faces f2 ON f2.cluster_id = f.cluster_id
+                LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                LEFT JOIN clusters c_current ON c_current.cluster_guid = fcc.cluster_guid
+                LEFT JOIN clusters c ON c.id = COALESCE(c_current.id, f.cluster_id)
+                LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = COALESCE(fcc.cluster_guid, c.cluster_guid)
+                LEFT JOIN persons owner_person ON owner_person.person_guid = cpc.person_guid
+                    AND owner_person.is_merged = 0
+                LEFT JOIN persons current_person ON current_person.id = f.person_id
+                    AND current_person.is_merged = 0
+                LEFT JOIN faces f2 ON f2.cluster_id = COALESCE(c_current.id, f.cluster_id)
                     AND f2.thumbnail_path IS NOT NULL
                 WHERE f.id IN ({ph})
-                  AND f.cluster_id IS NOT NULL
+                  AND COALESCE(c_current.id, f.cluster_id) IS NOT NULL
                 GROUP BY f.id
             """, hit_face_ids)
 
@@ -287,7 +295,7 @@ async def list_persons():
     """All persons — named and unnamed (clusters awaiting a name)."""
     async with get_db() as db:
         rows = await db.execute_fetchall("""
-            SELECT p.id, p.uuid, p.name, p.created_at, p.named_at,
+            SELECT p.id, p.uuid, p.person_guid, p.name, p.created_at, p.named_at,
                    p.is_merged, p.merged_into_id,
                    COUNT(DISTINCT f.media_file_id)            AS photo_count,
                    (SELECT COUNT(*) FROM persons p2
@@ -298,10 +306,14 @@ async def list_persons():
                    CASE WHEN p.name IS NOT NULL AND EXISTS (
                        SELECT 1 FROM writeback_queue wq
                        JOIN faces f2 ON f2.media_file_id = wq.media_file_id
-                       WHERE f2.person_id = p.id AND wq.status = 'written'
+                       JOIN v_face_cluster_current fcc2 ON fcc2.face_guid = f2.face_guid
+                       JOIN v_cluster_person_current cpc2 ON cpc2.cluster_guid = fcc2.cluster_guid
+                       WHERE cpc2.person_guid = p.person_guid AND wq.status = 'written'
                    ) THEN 1 ELSE 0 END                        AS name_written
             FROM persons p
-            LEFT JOIN faces f  ON f.person_id = p.id
+            LEFT JOIN v_cluster_person_current cpc ON cpc.person_guid = p.person_guid
+            LEFT JOIN clusters c ON c.cluster_guid = cpc.cluster_guid
+            LEFT JOIN faces f  ON f.cluster_id = c.id
             LEFT JOIN faces pf ON pf.id = p.portrait_face_id
             WHERE p.is_merged = 0 AND p.is_ignored = 0
             GROUP BY p.id
@@ -312,14 +324,16 @@ async def list_persons():
 
 @router.get("/unnamed")
 async def list_unnamed_clusters():
-    """Clusters not yet assigned to a named (non-ignored) person."""
+    """Clusters with no current non-merged owner person."""
     async with get_db() as db:
         rows = await db.execute_fetchall("""
-            SELECT c.id, c.member_count, c.intra_similarity, c.is_high_conf,
+            SELECT c.id, c.cluster_guid, c.member_count, c.intra_similarity, c.is_high_conf,
                    MIN(f.thumbnail_path) as representative_thumbnail
             FROM clusters c
             LEFT JOIN faces f ON f.cluster_id = c.id AND f.thumbnail_path IS NOT NULL
-            WHERE c.person_id IS NULL
+            LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
+            LEFT JOIN persons owner_person ON owner_person.person_guid = cpc.person_guid AND owner_person.is_merged = 0
+            WHERE owner_person.id IS NULL
             GROUP BY c.id
             ORDER BY c.member_count DESC
         """)
@@ -359,10 +373,13 @@ async def _load_cluster_for_ignore_actions(db, cluster_id: int) -> dict | None:
     row = await (
         await db.execute(
             """
-            SELECT c.id, c.member_count, c.centroid, c.person_id,
+                 SELECT c.id, c.member_count, c.centroid,
+                     p.id AS person_id,
                    MIN(f.thumbnail_path) AS representative_thumbnail
             FROM clusters c
             LEFT JOIN faces f ON f.cluster_id = c.id AND f.thumbnail_path IS NOT NULL
+                 LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
+                 LEFT JOIN persons p ON p.person_guid = cpc.person_guid AND p.is_merged = 0
             WHERE c.id = ?
             GROUP BY c.id
             """,
@@ -395,7 +412,9 @@ async def _score_similar_unnamed_clusters(
                MIN(f.thumbnail_path) AS representative_thumbnail
         FROM clusters c
         LEFT JOIN faces f ON f.cluster_id = c.id AND f.thumbnail_path IS NOT NULL
-        WHERE c.person_id IS NULL
+        LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
+        LEFT JOIN persons owner_person ON owner_person.person_guid = cpc.person_guid AND owner_person.is_merged = 0
+        WHERE owner_person.id IS NULL
         GROUP BY c.id
         """
     )
@@ -440,6 +459,13 @@ async def _create_ignored_person(db, source_vec: np.ndarray | None = None, centr
 async def _assign_cluster_to_ignored_person(db, person_id: int, cluster_id: int) -> None:
     await db.execute(UPDATE_CLUSTER_PERSON_SQL, (person_id, cluster_id))
     await db.execute(UPDATE_CLUSTER_FACES_PERSON_SQL, (person_id, cluster_id))
+    await link_cluster_to_person(
+        db,
+        cluster_id=cluster_id,
+        person_id=person_id,
+        source="manual_ignore_cluster",
+        actor="api.ignore_cluster",
+    )
     await _sync_photo_count(db, person_id)
     await db.execute(
         "DELETE FROM rejected_suggestions WHERE person_id=? AND cluster_id=?",
@@ -449,6 +475,25 @@ async def _assign_cluster_to_ignored_person(db, person_id: int, cluster_id: int)
 
 
 async def _delete_cluster_and_release_faces(db, cluster_id: int) -> None:
+    face_rows = await db.execute_fetchall(
+        "SELECT id FROM faces WHERE cluster_id=?",
+        (cluster_id,),
+    )
+    for row in face_rows:
+        await relink_face_to_cluster(
+            db,
+            face_id=int(row["id"]),
+            cluster_id=None,
+            reason="cluster_deleted",
+            actor="api.delete_cluster",
+        )
+    await link_cluster_to_person(
+        db,
+        cluster_id=cluster_id,
+        person_id=None,
+        source="cluster_deleted",
+        actor="api.delete_cluster",
+    )
     await db.execute("UPDATE faces SET cluster_id=NULL WHERE cluster_id=?", (cluster_id,))
     await db.execute("DELETE FROM clusters WHERE id=?", (cluster_id,))
 
@@ -465,11 +510,12 @@ async def delete_cluster(cluster_id: int):
         ).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Cluster not found")
-        if row["person_id"] is not None:
+        owner_person_id = await get_current_person_id_for_cluster(db, cluster_id)
+        if owner_person_id is not None:
             # Allow deleting attached-to-ignored-person clusters; block named-person clusters.
             p = await (
                 await db.execute(
-                    "SELECT is_ignored FROM persons WHERE id=?", (row["person_id"],)
+                    "SELECT is_ignored FROM persons WHERE id=?", (owner_person_id,)
                 )
             ).fetchone()
             if not p or not p["is_ignored"]:
@@ -484,18 +530,22 @@ async def delete_cluster(cluster_id: int):
             # Clean up the ignored person record if it has no remaining clusters
             remaining = await (
                 await db.execute(
-                    "SELECT COUNT(*) AS n FROM clusters WHERE person_id=? AND id != ?",
-                    (row["person_id"], cluster_id),
+                    """
+                    SELECT COUNT(*) AS n
+                    FROM v_cluster_person_current cpc
+                    JOIN persons p ON p.person_guid = cpc.person_guid
+                    JOIN clusters c ON c.cluster_guid = cpc.cluster_guid
+                    WHERE p.id=? AND c.id != ?
+                    """,
+                    (owner_person_id, cluster_id),
                 )
             ).fetchone()
             if remaining and remaining["n"] == 0:
                 await db.execute(
                     "DELETE FROM persons WHERE id=? AND is_ignored=1",
-                    (row["person_id"],),
+                    (owner_person_id,),
                 )
-        # Release face → cluster assignments
-        await db.execute("UPDATE faces SET cluster_id=NULL WHERE cluster_id=?", (cluster_id,))
-        await db.execute("DELETE FROM clusters WHERE id=?", (cluster_id,))
+        await _delete_cluster_and_release_faces(db, cluster_id)
     return {"status": "deleted", "cluster_id": cluster_id}
 
 
@@ -512,10 +562,10 @@ async def ignore_cluster(cluster_id: int):
     async with get_db() as db:
         row = await (
             await db.execute(
-                "SELECT id FROM clusters WHERE id=? AND person_id IS NULL", (cluster_id,)
+                "SELECT id FROM clusters WHERE id=?", (cluster_id,)
             )
         ).fetchone()
-        if not row:
+        if not row or await get_current_person_id_for_cluster(db, cluster_id) is not None:
             raise HTTPException(
                 status_code=404, detail="Cluster not found or already assigned to a person."
             )
@@ -588,8 +638,9 @@ async def list_ignored_persons():
                    COUNT(DISTINCT c.id)            AS cluster_count,
                    MIN(f.thumbnail_path)           AS representative_thumbnail
             FROM persons p
-            LEFT JOIN clusters c ON c.person_id = p.id
-            LEFT JOIN faces f ON f.person_id = p.id
+            LEFT JOIN v_cluster_person_current cpc ON cpc.person_guid = p.person_guid
+            LEFT JOIN clusters c ON c.cluster_guid = cpc.cluster_guid
+            LEFT JOIN faces f ON f.cluster_id = c.id
             WHERE p.is_ignored = 1 AND p.is_merged = 0
             GROUP BY p.id
             ORDER BY photo_count DESC
@@ -621,6 +672,24 @@ async def unignore_person(person_id: int):
             "UPDATE faces SET person_id=NULL WHERE person_id=?", (person_id,)
         )
         # Detach clusters → they return to the unnamed cluster list
+        cluster_rows = await db.execute_fetchall(
+            """
+            SELECT c.id
+            FROM v_cluster_person_current cpc
+            JOIN persons p ON p.person_guid = cpc.person_guid
+            JOIN clusters c ON c.cluster_guid = cpc.cluster_guid
+            WHERE p.id=?
+            """,
+            (person_id,),
+        )
+        for cluster_row in cluster_rows:
+            await link_cluster_to_person(
+                db,
+                cluster_id=int(cluster_row["id"]),
+                person_id=None,
+                source="manual_unignore",
+                actor="api.unignore_person",
+            )
         await db.execute(
             "UPDATE clusters SET person_id=NULL WHERE person_id=?", (person_id,)
         )
@@ -715,13 +784,36 @@ async def delete_person(person_id: int, background_tasks: BackgroundTasks):
         # 1. Queue affected media for writeback BEFORE unlinking (so we can find them)
         await db.execute("""
             INSERT OR REPLACE INTO writeback_queue (media_file_id)
-            SELECT DISTINCT media_file_id FROM faces WHERE person_id=?
+            SELECT DISTINCT f.media_file_id
+            FROM faces f
+            JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+            JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+            JOIN persons p ON p.person_guid = cpc.person_guid
+            WHERE p.id=?
         """, (person_id,))
 
         # 2. Unlink faces from person
         await db.execute("UPDATE faces SET person_id=NULL WHERE person_id=?", (person_id,))
 
         # 3. Unlink clusters from person
+        cluster_rows = await db.execute_fetchall(
+            """
+            SELECT c.id
+            FROM v_cluster_person_current cpc
+            JOIN persons p ON p.person_guid = cpc.person_guid
+            JOIN clusters c ON c.cluster_guid = cpc.cluster_guid
+            WHERE p.id=?
+            """,
+            (person_id,),
+        )
+        for cluster_row in cluster_rows:
+            await link_cluster_to_person(
+                db,
+                cluster_id=int(cluster_row["id"]),
+                person_id=None,
+                source="manual_delete_person",
+                actor="api.delete_person",
+            )
         await db.execute("UPDATE clusters SET person_id=NULL WHERE person_id=?", (person_id,))
 
         # 4. Remove co-occurrence edges
@@ -763,7 +855,10 @@ async def name_person(person_id: int, req: NamePersonRequest, background_tasks: 
             INSERT OR REPLACE INTO writeback_queue (media_file_id)
             SELECT DISTINCT f.media_file_id
             FROM faces f
-            WHERE f.person_id = ?
+            JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+            JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+            JOIN persons p ON p.person_guid = cpc.person_guid
+            WHERE p.id = ?
         """, (person_id,))
 
         # Persist centroid so this person is recognisable in future scans
@@ -779,10 +874,27 @@ async def name_person(person_id: int, req: NamePersonRequest, background_tasks: 
 async def merge_persons(req: MergeRequest, source_id: int):
     """Merge two persons (legacy endpoint — use /{a}/merge-with/{b} instead)."""
     async with get_db() as db:
-        await db.execute(
-            "UPDATE faces SET person_id=? WHERE person_id=?",
-            (req.into_person_id, source_id),
+        cluster_rows = await db.execute_fetchall(
+            """
+            SELECT c.id
+            FROM v_cluster_person_current cpc
+            JOIN persons p ON p.person_guid = cpc.person_guid
+            JOIN clusters c ON c.cluster_guid = cpc.cluster_guid
+            WHERE p.id=?
+            """,
+            (source_id,),
         )
+        for cluster_row in cluster_rows:
+            cluster_id = int(cluster_row["id"])
+            await db.execute(UPDATE_CLUSTER_PERSON_SQL, (req.into_person_id, cluster_id))
+            await db.execute(UPDATE_CLUSTER_FACES_PERSON_SQL, (req.into_person_id, cluster_id))
+            await link_cluster_to_person(
+                db,
+                cluster_id=cluster_id,
+                person_id=req.into_person_id,
+                source="legacy_merge",
+                actor="api.merge_persons",
+            )
         await db.execute("""
             UPDATE persons SET is_merged=1, merged_into_id=? WHERE id=?
         """, (req.into_person_id, source_id))
@@ -839,13 +951,27 @@ async def merge_named_persons(
         # Determine survivor = person with more associated photos; ties → person_a.
         count_a_row = await (
             await db.execute(
-                "SELECT COUNT(DISTINCT media_file_id) AS n FROM faces WHERE person_id=?",
+                """
+                SELECT COUNT(DISTINCT f.media_file_id) AS n
+                FROM faces f
+                JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                JOIN persons p ON p.person_guid = cpc.person_guid
+                WHERE p.id=?
+                """,
                 (person_a_id,),
             )
         ).fetchone()
         count_b_row = await (
             await db.execute(
-                "SELECT COUNT(DISTINCT media_file_id) AS n FROM faces WHERE person_id=?",
+                """
+                SELECT COUNT(DISTINCT f.media_file_id) AS n
+                FROM faces f
+                JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                JOIN persons p ON p.person_guid = cpc.person_guid
+                WHERE p.id=?
+                """,
                 (person_b_id,),
             )
         ).fetchone()
@@ -863,17 +989,27 @@ async def merge_named_persons(
         new_name_clean = req.new_name.strip() if req.new_name and req.new_name.strip() else None
         effective_name = new_name_clean if new_name_clean else survivor_name
 
-        # ── All DB mutations in a single implicit transaction ───────────────
-        # 1. Reassign all faces from loser → survivor.
-        await db.execute(
-            "UPDATE faces SET person_id=? WHERE person_id=?",
-            (survivor_id, loser_id),
+        loser_clusters = await db.execute_fetchall(
+            """
+            SELECT c.id
+            FROM v_cluster_person_current cpc
+            JOIN persons p ON p.person_guid = cpc.person_guid
+            JOIN clusters c ON c.cluster_guid = cpc.cluster_guid
+            WHERE p.id=?
+            """,
+            (loser_id,),
         )
-        # 2. Reassign all clusters from loser → survivor.
-        await db.execute(
-            "UPDATE clusters SET person_id=? WHERE person_id=?",
-            (survivor_id, loser_id),
-        )
+        for loser_cluster in loser_clusters:
+            cluster_id = int(loser_cluster["id"])
+            await db.execute(UPDATE_CLUSTER_PERSON_SQL, (survivor_id, cluster_id))
+            await db.execute(UPDATE_CLUSTER_FACES_PERSON_SQL, (survivor_id, cluster_id))
+            await link_cluster_to_person(
+                db,
+                cluster_id=cluster_id,
+                person_id=survivor_id,
+                source="manual_merge_person",
+                actor="api.merge_named_persons",
+            )
         # 3. Apply the effective name to the survivor (update named_at if changed).
         if effective_name != survivor_name or not survivor_name:
             await db.execute(
@@ -896,13 +1032,25 @@ async def merge_named_persons(
         #    writing the effective_name in its place.
         await db.execute("""
             INSERT OR REPLACE INTO writeback_queue (media_file_id)
-            SELECT DISTINCT media_file_id FROM faces WHERE person_id=?
+            SELECT DISTINCT f.media_file_id
+            FROM faces f
+            JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+            JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+            JOIN persons p ON p.person_guid = cpc.person_guid
+            WHERE p.id=?
         """, (survivor_id,))
 
         # Count the queued photos for the response summary.
         queued_row = await (
             await db.execute(
-                "SELECT COUNT(DISTINCT media_file_id) AS n FROM faces WHERE person_id=?",
+                """
+                SELECT COUNT(DISTINCT f.media_file_id) AS n
+                FROM faces f
+                JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                JOIN persons p ON p.person_guid = cpc.person_guid
+                WHERE p.id=?
+                """,
                 (survivor_id,),
             )
         ).fetchone()
@@ -967,8 +1115,47 @@ async def assign_lone_face_to_person(face_id: int, req: NameClusterRequest, back
             )
             person_id = cursor.lastrowid
 
+        cluster_id = face_row["cluster_id"] or await get_current_cluster_id_for_face(db, face_id)
+        if cluster_id is None:
+            emb_row = await (
+                await db.execute("SELECT vector FROM embeddings WHERE face_id=?", (face_id,))
+            ).fetchone()
+            if emb_row and emb_row["vector"]:
+                cursor = await db.execute(
+                    """
+                    INSERT INTO clusters (centroid, member_count, intra_similarity, is_high_conf)
+                    VALUES (?, 1, 1.0, 0)
+                    """,
+                    (emb_row["vector"],),
+                )
+                cluster_id = int(cursor.lastrowid)
+                await db.execute("UPDATE faces SET cluster_id=? WHERE id=?", (cluster_id, face_id))
+                await relink_face_to_cluster(
+                    db,
+                    face_id=face_id,
+                    cluster_id=cluster_id,
+                    reason="name_lone_face",
+                    actor="api.assign_face",
+                )
+
         await db.execute(
             "UPDATE faces SET person_id=? WHERE id=?", (person_id, face_id)
+        )
+        if cluster_id is not None:
+            await db.execute(UPDATE_CLUSTER_PERSON_SQL, (person_id, cluster_id))
+            await db.execute(UPDATE_CLUSTER_FACES_PERSON_SQL, (person_id, cluster_id))
+            await link_cluster_to_person(
+                db,
+                cluster_id=cluster_id,
+                person_id=person_id,
+                source="manual_assign_face",
+                actor="api.assign_face",
+            )
+        await append_identity_event(
+            db,
+            "face_person_assigned",
+            actor="api.assign_face",
+            payload={"face_id": face_id, "person_id": person_id, "name": name},
         )
 
         await _sync_photo_count(db, person_id)
@@ -1003,6 +1190,13 @@ async def create_person_from_cluster(cluster_id: int, req: NameClusterRequest, b
         await db.execute(
             UPDATE_CLUSTER_FACES_PERSON_SQL, (person_id, cluster_id)
         )
+        await link_cluster_to_person(
+            db,
+            cluster_id=cluster_id,
+            person_id=person_id,
+            source="manual_create_from_cluster",
+            actor="api.create_person_from_cluster",
+        )
         await _sync_photo_count(db, person_id)
 
         # Queue photos for writeback
@@ -1035,6 +1229,13 @@ async def add_cluster_to_person(person_id: int, cluster_id: int, background_task
         )
         await db.execute(
             UPDATE_CLUSTER_FACES_PERSON_SQL, (person_id, cluster_id)
+        )
+        await link_cluster_to_person(
+            db,
+            cluster_id=cluster_id,
+            person_id=person_id,
+            source="manual_merge_cluster",
+            actor="api.add_cluster_to_person",
         )
         await _sync_photo_count(db, person_id)
 
@@ -1073,11 +1274,11 @@ async def add_cluster_to_ignored_person(person_id: int, cluster_id: int):
 
         cluster = await (
             await db.execute(
-                "SELECT id FROM clusters WHERE id=? AND person_id IS NULL",
+                "SELECT id FROM clusters WHERE id=?",
                 (cluster_id,),
             )
         ).fetchone()
-        if not cluster:
+        if not cluster or await get_current_person_id_for_cluster(db, cluster_id) is not None:
             raise HTTPException(status_code=404, detail="Cluster not found or already assigned")
 
         await _assign_cluster_to_ignored_person(db, person_id, cluster_id)
@@ -1094,7 +1295,14 @@ async def set_portrait_face(person_id: int, face_id: int):
     async with get_db() as db:
         row = await (
             await db.execute(
-                "SELECT id FROM faces WHERE id=? AND person_id=?",
+                """
+                SELECT f.id
+                FROM faces f
+                LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                LEFT JOIN persons p ON p.person_guid = cpc.person_guid AND p.is_merged=0
+                WHERE f.id=? AND p.id=?
+                """,
                 (face_id, person_id),
             )
         ).fetchone()
@@ -1375,7 +1583,10 @@ async def get_merge_suggestions(person_id: int, limit: int = 1):
         emb_rows = await db.execute_fetchall("""
             SELECT e.vector FROM embeddings e
             JOIN faces f ON f.id = e.face_id
-            WHERE f.person_id = ?
+            JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+            JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+            JOIN persons p ON p.person_guid = cpc.person_guid
+            WHERE p.id = ?
         """, (person_id,))
         if not emb_rows:
             return []
@@ -1395,7 +1606,9 @@ async def get_merge_suggestions(person_id: int, limit: int = 1):
                    MIN(f.thumbnail_path) AS representative_thumbnail
             FROM clusters c
             JOIN faces f ON f.cluster_id = c.id
-            WHERE c.person_id IS NULL
+            LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
+            LEFT JOIN persons p ON p.person_guid = cpc.person_guid AND p.is_merged = 0 AND p.is_ignored = 0
+            WHERE p.id IS NULL
               AND c.id NOT IN (
                   SELECT cluster_id FROM rejected_suggestions WHERE person_id = ?
               )
@@ -1451,7 +1664,13 @@ async def find_similar_all(request: FindSimilarAllRequest):
     async with get_db() as db:
         named_persons = await db.execute_fetchall("""
             SELECT p.id, p.name,
-                   (SELECT MIN(f2.thumbnail_path) FROM faces f2 WHERE f2.person_id = p.id) AS thumbnail
+                   (
+                       SELECT MIN(f2.thumbnail_path)
+                       FROM faces f2
+                       JOIN v_face_cluster_current fcc2 ON fcc2.face_guid = f2.face_guid
+                       JOIN v_cluster_person_current cpc2 ON cpc2.cluster_guid = fcc2.cluster_guid
+                       WHERE cpc2.person_guid = p.person_guid
+                   ) AS thumbnail
             FROM persons p
             WHERE p.name IS NOT NULL AND p.is_merged = 0 AND p.is_ignored = 0
         """)
@@ -1463,7 +1682,9 @@ async def find_similar_all(request: FindSimilarAllRequest):
                    MIN(f.thumbnail_path) AS representative_thumbnail
             FROM clusters c
             JOIN faces f ON f.cluster_id = c.id
-            WHERE c.person_id IS NULL
+            LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
+            LEFT JOIN persons p ON p.person_guid = cpc.person_guid AND p.is_merged = 0 AND p.is_ignored = 0
+            WHERE p.id IS NULL
             GROUP BY c.id
         """)
         if not unnamed_clusters:
@@ -1500,7 +1721,10 @@ async def find_similar_all(request: FindSimilarAllRequest):
             emb_rows = await db.execute_fetchall("""
                 SELECT e.vector FROM embeddings e
                 JOIN faces f ON f.id = e.face_id
-                WHERE f.person_id = ?
+                JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                JOIN persons p ON p.person_guid = cpc.person_guid
+                WHERE p.id = ?
             """, (person_id,))
             if not emb_rows:
                 continue
@@ -1526,6 +1750,13 @@ async def find_similar_all(request: FindSimilarAllRequest):
                     # Auto-merge: assign cluster to person
                     await db.execute(UPDATE_CLUSTER_PERSON_SQL, (person_id, cid))
                     await db.execute(UPDATE_CLUSTER_FACES_PERSON_SQL, (person_id, cid))
+                    await link_cluster_to_person(
+                        db,
+                        cluster_id=cid,
+                        person_id=person_id,
+                        source="auto_merge_similarity",
+                        actor="api.find_similar_all",
+                    )
                     await db.execute("""
                         DELETE FROM rejected_suggestions WHERE person_id=? AND cluster_id=?
                     """, (person_id, cid))
@@ -1584,7 +1815,12 @@ async def _sync_photo_count(db, person_id: int) -> None:
     await db.execute("""
         UPDATE persons
         SET photo_count = (
-            SELECT COUNT(DISTINCT media_file_id) FROM faces WHERE person_id = ?
+            SELECT COUNT(DISTINCT f.media_file_id)
+            FROM faces f
+            JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+            JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+            JOIN persons p ON p.person_guid = cpc.person_guid
+            WHERE p.id = ?
         )
         WHERE id = ?
     """, (person_id, person_id))
@@ -1599,7 +1835,10 @@ async def get_person_faces(person_id: int, limit: int = 60):
                    f.media_file_id, mf.file_path, mf.date_taken
             FROM faces f
             JOIN media_files mf ON mf.id = f.media_file_id
-            WHERE f.person_id = ?
+            JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+            JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+            JOIN persons p ON p.person_guid = cpc.person_guid
+            WHERE p.id = ?
             ORDER BY f.detection_conf DESC
             LIMIT ?
         """, (person_id, limit))

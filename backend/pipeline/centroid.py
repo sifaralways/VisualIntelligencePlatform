@@ -21,7 +21,8 @@ async def update_person_centroid(db, person_id: int) -> None:
     """
     Recompute and store the normalised centroid for a named person.
 
-    Reads all current embeddings assigned to this person (via faces.person_id),
+    Reads all current embeddings assigned to this person through the active
+    cluster->person membership graph,
     averages them into a single unit vector, and writes it to persons.centroid.
 
     Call this whenever faces are added to or removed from a person:
@@ -36,7 +37,10 @@ async def update_person_centroid(db, person_id: int) -> None:
         SELECT e.vector
         FROM embeddings e
         JOIN faces f ON f.id = e.face_id
-        WHERE f.person_id = ?
+        JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+        JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+        JOIN persons p ON p.person_guid = cpc.person_guid
+        WHERE p.id = ?
     """, (person_id,))
 
     if not rows:

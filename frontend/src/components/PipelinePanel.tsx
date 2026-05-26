@@ -25,7 +25,7 @@ export default function PipelinePanel({ profileId, collapsed, onToggle, onPipeli
   const [status, setStatus]       = useState<string>('idle')
   const [events, setEvents]       = useState<WsEvent[]>([])
   const [forceRetag, setForceRetag] = useState(false)
-  const [useExistingVipData, setUseExistingVipData] = useState(true)
+  const [useExistingVipData, setUseExistingVipData] = useState(false)
   const wsRef  = useRef<WebSocket | null>(null)
   const logRef = useRef<HTMLDivElement>(null)
 

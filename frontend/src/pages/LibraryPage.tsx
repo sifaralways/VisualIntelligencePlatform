@@ -20,7 +20,7 @@ export default function LibraryPage({ onScanStarted }: Props) {
   const [scanning,     setScanning]     = useState(false)
   const [scanMsg,      setScanMsg]      = useState<string | null>(null)
   const [scanError,    setScanError]    = useState<string | null>(null)
-  const [useExistingVipData, setUseExistingVipData] = useState(true)
+  const [useExistingVipData, setUseExistingVipData] = useState(false)
 
   // Check if library has any photos on mount
   useEffect(() => {

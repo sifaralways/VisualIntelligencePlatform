@@ -480,7 +480,9 @@ async def contacts_match(req: ContactsMatchRequest):
                    MIN(f.thumbnail_path) AS rep_thumb
             FROM clusters c
             LEFT JOIN faces f ON f.cluster_id = c.id AND f.thumbnail_path IS NOT NULL
-            WHERE c.person_id IS NULL
+            LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
+            LEFT JOIN persons p ON p.person_guid = cpc.person_guid AND p.is_merged = 0 AND p.is_ignored = 0
+            WHERE p.id IS NULL
             GROUP BY c.id
             ORDER BY c.member_count DESC
         """)

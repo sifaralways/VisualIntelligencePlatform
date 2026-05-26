@@ -453,7 +453,9 @@ async def tool_count_named_faces(ctx: ToolContext, _params: dict[str, Any]) -> T
             """
             SELECT COUNT(*) AS c
             FROM faces f
-            JOIN persons p ON p.id = f.person_id
+                        JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                        JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                        JOIN persons p ON p.person_guid = cpc.person_guid
             WHERE p.name IS NOT NULL
               AND p.name != ''
               AND p.is_merged = 0
@@ -493,7 +495,7 @@ def _build_unnamed_faces_scope(ctx: ToolContext, params: dict[str, Any]) -> tupl
 
 async def _query_unnamed_faces(media_scope: list[int] | None, limit: int, offset: int) -> tuple[list[dict], int]:
     where = [
-        "f.person_id IS NULL",
+        "owner.id IS NULL",
         "mf.removed_from_app = 0",
         "mf.is_stub = 0",
     ]

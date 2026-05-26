@@ -287,7 +287,14 @@ async def bulk_delete(body: BulkDeleteRequest):
         for media_id in body.media_ids:
             # Collect person_ids before deletion so we can refresh their centroids
             person_rows = await db.execute_fetchall(
-                "SELECT DISTINCT person_id FROM faces WHERE media_file_id=? AND person_id IS NOT NULL",
+                """
+                SELECT DISTINCT p.id AS person_id
+                FROM faces f
+                JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                JOIN persons p ON p.person_guid = cpc.person_guid
+                WHERE f.media_file_id=?
+                """,
                 (media_id,),
             )
             for pr in person_rows:
