@@ -32,6 +32,7 @@ from pydantic import BaseModel
 
 from backend.database.db import get_db
 from backend.ml.analysis_builder import merge_analysis_document
+from backend.profiles import get_current_profile_id, run_in_profile
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -177,7 +178,7 @@ async def rebuild_analysis(media_id: int, background_tasks: BackgroundTasks):
         )).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Media file not found")
-    background_tasks.add_task(_rebuild_one, media_id)
+    background_tasks.add_task(run_in_profile, get_current_profile_id(), _rebuild_one, media_id)
     return {"status": "rebuilding", "media_id": media_id}
 
 
@@ -188,8 +189,8 @@ async def _rebuild_one(media_id: int) -> None:
             doc = await build_analysis_document(media_id, db)
             await save_analysis_document(media_id, doc, db)
         logger.info("Rebuilt analysis doc for media_id=%d", media_id)
-    except Exception as e:
-        logger.error("Rebuild failed for media_id=%d: %s", media_id, e)
+    except Exception:
+        logger.exception("Rebuild failed for media_id=%d", media_id)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

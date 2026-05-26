@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid as _uuid
-from typing import Optional
+from typing import Literal, Optional
 
 import numpy as np
 from fastapi import APIRouter, BackgroundTasks, HTTPException
@@ -15,12 +15,16 @@ from backend.database.db import get_db
 from backend.database.models import Person
 from backend.pipeline.centroid import update_person_centroid, load_centroid
 from backend.api.websocket import broadcast
+from backend.profiles import get_current_profile_id, run_in_profile
 
 # Minimum cosine similarity to surface a merge suggestion
 _SUGGEST_THRESHOLD = 0.50
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+UPDATE_CLUSTER_PERSON_SQL = "UPDATE clusters SET person_id=? WHERE id=?"
+UPDATE_CLUSTER_FACES_PERSON_SQL = "UPDATE faces SET person_id=? WHERE cluster_id=?"
 
 
 # ---------------------------------------------------------------------------
@@ -129,11 +133,11 @@ async def _rescore_after_person_update(person_id: int) -> None:
                 # Auto-assign this unnamed cluster to the person
                 async with get_db() as db:
                     await db.execute(
-                        "UPDATE clusters SET person_id=? WHERE id=?",
+                        UPDATE_CLUSTER_PERSON_SQL,
                         (person_id, cluster_id),
                     )
                     await db.execute(
-                        "UPDATE faces SET person_id=? WHERE cluster_id=?",
+                        UPDATE_CLUSTER_FACES_PERSON_SQL,
                         (person_id, cluster_id),
                     )
                     await db.execute("""
@@ -267,6 +271,17 @@ class FindSimilarAllRequest(BaseModel):
     auto_threshold: float = 0.85   # Clusters >= this similarity are merged automatically
 
 
+class IgnoreSuggestionRequest(BaseModel):
+    action: Literal["delete", "ignore"]
+    threshold: float = 0.85
+    limit: int = 8
+
+
+class IgnoredPersonSuggestionRequest(BaseModel):
+    threshold: float = 0.85
+    limit: int = 8
+
+
 @router.get("")
 async def list_persons():
     """All persons — named and unnamed (clusters awaiting a name)."""
@@ -321,43 +336,121 @@ async def get_similar_clusters(cluster_id: int, limit: int = 8):
     face tiles would also be affected by an ‘always ignore’ decision.
     """
     async with get_db() as db:
-        source = await (
-            await db.execute(
-                "SELECT centroid FROM clusters WHERE id=? AND person_id IS NULL",
-                (cluster_id,),
-            )
-        ).fetchone()
-        if not source or not source["centroid"]:
+        source = await _load_cluster_for_ignore_actions(db, cluster_id)
+        if source is None:
             return []
+        return await _score_similar_unnamed_clusters(
+            db,
+            source["vector"],
+            exclude_cluster_ids={cluster_id},
+            limit=limit,
+        )
 
-        source_vec = np.frombuffer(source["centroid"], dtype=np.float32).copy()
-        norm = np.linalg.norm(source_vec)
-        if norm > 0:
-            source_vec /= norm
 
-        candidates = await db.execute_fetchall("""
-            SELECT c.id AS cluster_id, c.member_count, c.intra_similarity,
-                   c.is_high_conf, c.centroid,
+def _normalise_vector(vec: np.ndarray) -> np.ndarray:
+    out = vec.copy()
+    norm = np.linalg.norm(out)
+    if norm > 0:
+        out /= norm
+    return out
+
+
+async def _load_cluster_for_ignore_actions(db, cluster_id: int) -> dict | None:
+    row = await (
+        await db.execute(
+            """
+            SELECT c.id, c.member_count, c.centroid, c.person_id,
                    MIN(f.thumbnail_path) AS representative_thumbnail
             FROM clusters c
             LEFT JOIN faces f ON f.cluster_id = c.id AND f.thumbnail_path IS NOT NULL
-            WHERE c.person_id IS NULL AND c.id != ?
+            WHERE c.id = ?
             GROUP BY c.id
-        """, (cluster_id,))
+            """,
+            (cluster_id,),
+        )
+    ).fetchone()
+    if not row or row["person_id"] is not None or not row["centroid"]:
+        return None
+    return {
+        "cluster_id": int(row["id"]),
+        "member_count": int(row["member_count"] or 0),
+        "representative_thumbnail": row["representative_thumbnail"],
+        "vector": _normalise_vector(np.frombuffer(row["centroid"], dtype=np.float32)),
+    }
 
-    scored = []
+
+async def _score_similar_unnamed_clusters(
+    db,
+    source_vec: np.ndarray,
+    *,
+    exclude_cluster_ids: set[int] | None = None,
+    rejected_for_person_id: int | None = None,
+    limit: int | None = None,
+) -> list[dict]:
+    exclude_cluster_ids = exclude_cluster_ids or set()
+    candidates = await db.execute_fetchall(
+        """
+        SELECT c.id AS cluster_id, c.member_count, c.intra_similarity,
+               c.is_high_conf, c.centroid,
+               MIN(f.thumbnail_path) AS representative_thumbnail
+        FROM clusters c
+        LEFT JOIN faces f ON f.cluster_id = c.id AND f.thumbnail_path IS NOT NULL
+        WHERE c.person_id IS NULL
+        GROUP BY c.id
+        """
+    )
+
+    rejected_cluster_ids: set[int] = set()
+    if rejected_for_person_id is not None:
+        rejected_rows = await db.execute_fetchall(
+            "SELECT cluster_id FROM rejected_suggestions WHERE person_id=?",
+            (rejected_for_person_id,),
+        )
+        rejected_cluster_ids = {int(r["cluster_id"]) for r in rejected_rows}
+
+    scored: list[dict] = []
     for cand in candidates:
-        if not cand["centroid"]:
+        cid = int(cand["cluster_id"])
+        if cid in exclude_cluster_ids or cid in rejected_cluster_ids or not cand["centroid"]:
             continue
-        vec = np.frombuffer(cand["centroid"], dtype=np.float32).copy()
-        n = np.linalg.norm(vec)
-        if n > 0:
-            vec /= n
+        vec = _normalise_vector(np.frombuffer(cand["centroid"], dtype=np.float32))
         sim = float(np.dot(source_vec, vec))
-        scored.append({**{k: cand[k] for k in cand.keys() if k != "centroid"}, "similarity": round(sim, 3)})
+        scored.append({
+            "cluster_id": cid,
+            "member_count": int(cand["member_count"] or 0),
+            "intra_similarity": cand["intra_similarity"],
+            "is_high_conf": int(cand["is_high_conf"] or 0),
+            "representative_thumbnail": cand["representative_thumbnail"],
+            "similarity": round(sim, 3),
+        })
 
     scored.sort(key=lambda x: x["similarity"], reverse=True)
-    return scored[:limit]
+    return scored[:limit] if limit is not None else scored
+
+
+async def _create_ignored_person(db, source_vec: np.ndarray | None = None, centroid_n: int = 0) -> int:
+    new_uuid = str(_uuid.uuid4())
+    cursor = await db.execute(
+        "INSERT INTO persons (uuid, is_ignored, centroid, centroid_n) VALUES (?, 1, ?, ?)",
+        (new_uuid, (source_vec.tobytes() if source_vec is not None else None), max(0, int(centroid_n))),
+    )
+    return int(cursor.lastrowid)
+
+
+async def _assign_cluster_to_ignored_person(db, person_id: int, cluster_id: int) -> None:
+    await db.execute(UPDATE_CLUSTER_PERSON_SQL, (person_id, cluster_id))
+    await db.execute(UPDATE_CLUSTER_FACES_PERSON_SQL, (person_id, cluster_id))
+    await _sync_photo_count(db, person_id)
+    await db.execute(
+        "DELETE FROM rejected_suggestions WHERE person_id=? AND cluster_id=?",
+        (person_id, cluster_id),
+    )
+    await update_person_centroid(db, person_id)
+
+
+async def _delete_cluster_and_release_faces(db, cluster_id: int) -> None:
+    await db.execute("UPDATE faces SET cluster_id=NULL WHERE cluster_id=?", (cluster_id,))
+    await db.execute("DELETE FROM clusters WHERE id=?", (cluster_id,))
 
 
 @router.delete("/clusters/{cluster_id}")
@@ -427,23 +520,57 @@ async def ignore_cluster(cluster_id: int):
                 status_code=404, detail="Cluster not found or already assigned to a person."
             )
 
-        new_uuid = str(_uuid.uuid4())
-        cursor = await db.execute(
-            "INSERT INTO persons (uuid, is_ignored) VALUES (?, 1)", (new_uuid,)
-        )
-        person_id = cursor.lastrowid
-
-        await db.execute(
-            "UPDATE clusters SET person_id=? WHERE id=?", (person_id, cluster_id)
-        )
-        await db.execute(
-            "UPDATE faces SET person_id=? WHERE cluster_id=?", (person_id, cluster_id)
-        )
-
-        # Persist centroid so Phase 3b can suppress re-detections in future scans
-        await update_person_centroid(db, person_id)
+        person_id = await _create_ignored_person(db)
+        await _assign_cluster_to_ignored_person(db, person_id, cluster_id)
 
     return {"status": "ignored", "cluster_id": cluster_id, "person_id": person_id}
+
+
+@router.post("/clusters/{cluster_id}/ignore-suggestions")
+async def ignore_cluster_with_suggestions(cluster_id: int, request: IgnoreSuggestionRequest):
+    threshold = max(_SUGGEST_THRESHOLD, min(0.99, float(request.threshold or 0.85)))
+    limit = max(1, min(int(request.limit or 8), 24))
+
+    async with get_db() as db:
+        source = await _load_cluster_for_ignore_actions(db, cluster_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="Cluster not found or already assigned to a person.")
+
+        ignored_person_id = await _create_ignored_person(
+            db,
+            source_vec=source["vector"] if request.action == "delete" else None,
+            centroid_n=source["member_count"],
+        )
+
+        if request.action == "ignore":
+            await _assign_cluster_to_ignored_person(db, ignored_person_id, cluster_id)
+        else:
+            await _delete_cluster_and_release_faces(db, cluster_id)
+
+        scored = await _score_similar_unnamed_clusters(
+            db,
+            source["vector"],
+            exclude_cluster_ids={cluster_id},
+            rejected_for_person_id=ignored_person_id,
+        )
+
+        auto_ignored: list[dict] = []
+        suggestions: list[dict] = []
+        for item in scored:
+            if item["similarity"] >= threshold:
+                await _assign_cluster_to_ignored_person(db, ignored_person_id, int(item["cluster_id"]))
+                auto_ignored.append(item)
+            elif item["similarity"] >= _SUGGEST_THRESHOLD and len(suggestions) < limit:
+                suggestions.append(item)
+
+    return {
+        "status": "ok",
+        "action": request.action,
+        "person_id": ignored_person_id,
+        "threshold": threshold,
+        "auto_ignored": auto_ignored,
+        "suggestions": suggestions,
+    }
 
 
 @router.get("/ignored")
@@ -503,6 +630,66 @@ async def unignore_person(person_id: int):
         )
 
     return {"status": "restored", "person_id": person_id}
+
+
+@router.post("/ignored/{person_id}/suggestions")
+async def ignored_person_suggestions(person_id: int, request: IgnoredPersonSuggestionRequest):
+    """
+    For an already-ignored person, find visually similar unnamed clusters.
+
+    Used by the Photo Detail "Ignore all unnamed faces" flow where the primary
+    ignore action happens first and similar-face suggestions are offered after.
+    """
+    threshold = max(_SUGGEST_THRESHOLD, min(0.99, float(request.threshold or 0.85)))
+    limit = max(1, min(int(request.limit or 8), 24))
+
+    async with get_db() as db:
+        row = await (
+            await db.execute(
+                """
+                SELECT id, is_ignored, centroid
+                FROM persons
+                WHERE id=? AND is_merged=0
+                """,
+                (person_id,),
+            )
+        ).fetchone()
+        if not row or not row["is_ignored"]:
+            raise HTTPException(status_code=404, detail="Ignored person not found")
+        if not row["centroid"]:
+            return {
+                "status": "ok",
+                "action": "ignore",
+                "person_id": person_id,
+                "threshold": threshold,
+                "auto_ignored": [],
+                "suggestions": [],
+            }
+
+        source_vec = _normalise_vector(np.frombuffer(row["centroid"], dtype=np.float32))
+        scored = await _score_similar_unnamed_clusters(
+            db,
+            source_vec,
+            rejected_for_person_id=person_id,
+        )
+
+        auto_ignored: list[dict] = []
+        suggestions: list[dict] = []
+        for item in scored:
+            if item["similarity"] >= threshold:
+                await _assign_cluster_to_ignored_person(db, person_id, int(item["cluster_id"]))
+                auto_ignored.append(item)
+            elif item["similarity"] >= _SUGGEST_THRESHOLD and len(suggestions) < limit:
+                suggestions.append(item)
+
+    return {
+        "status": "ok",
+        "action": "ignore",
+        "person_id": person_id,
+        "threshold": threshold,
+        "auto_ignored": auto_ignored,
+        "suggestions": suggestions,
+    }
 
 
 @router.delete("/{person_id}")
@@ -582,8 +769,9 @@ async def name_person(person_id: int, req: NamePersonRequest, background_tasks: 
         # Persist centroid so this person is recognisable in future scans
         await update_person_centroid(db, person_id)
 
-    background_tasks.add_task(_rescore_after_person_update, person_id)
-    background_tasks.add_task(_update_cooccurrence_for_person, person_id)
+    profile_id = get_current_profile_id()
+    background_tasks.add_task(run_in_profile, profile_id, _rescore_after_person_update, person_id)
+    background_tasks.add_task(run_in_profile, profile_id, _update_cooccurrence_for_person, person_id)
     return {"status": "ok", "name": req.name}
 
 
@@ -726,8 +914,9 @@ async def merge_named_persons(
         # 8. Recompute centroid from all merged embeddings.
         await update_person_centroid(db, survivor_id)
 
-    background_tasks.add_task(_rescore_after_person_update, survivor_id)
-    background_tasks.add_task(_update_cooccurrence_for_person, survivor_id)
+    profile_id = get_current_profile_id()
+    background_tasks.add_task(run_in_profile, profile_id, _rescore_after_person_update, survivor_id)
+    background_tasks.add_task(run_in_profile, profile_id, _update_cooccurrence_for_person, survivor_id)
     return {
         "status": "merged",
         "survivor_id": survivor_id,
@@ -792,8 +981,9 @@ async def assign_lone_face_to_person(face_id: int, req: NameClusterRequest, back
 
         await update_person_centroid(db, person_id)
 
-    background_tasks.add_task(_rescore_after_person_update, person_id)
-    background_tasks.add_task(_update_cooccurrence_for_person, person_id)
+    profile_id = get_current_profile_id()
+    background_tasks.add_task(run_in_profile, profile_id, _rescore_after_person_update, person_id)
+    background_tasks.add_task(run_in_profile, profile_id, _update_cooccurrence_for_person, person_id)
     return {"status": "assigned", "face_id": face_id, "person_id": person_id}
 
 
@@ -808,10 +998,10 @@ async def create_person_from_cluster(cluster_id: int, req: NameClusterRequest, b
         person_id = cursor.lastrowid
 
         await db.execute(
-            "UPDATE clusters SET person_id=? WHERE id=?", (person_id, cluster_id)
+            UPDATE_CLUSTER_PERSON_SQL, (person_id, cluster_id)
         )
         await db.execute(
-            "UPDATE faces SET person_id=? WHERE cluster_id=?", (person_id, cluster_id)
+            UPDATE_CLUSTER_FACES_PERSON_SQL, (person_id, cluster_id)
         )
         await _sync_photo_count(db, person_id)
 
@@ -824,8 +1014,9 @@ async def create_person_from_cluster(cluster_id: int, req: NameClusterRequest, b
         # Persist centroid — this person now has embeddings to match against
         await update_person_centroid(db, person_id)
 
-    background_tasks.add_task(_rescore_after_person_update, person_id)
-    background_tasks.add_task(_update_cooccurrence_for_person, person_id)
+    profile_id = get_current_profile_id()
+    background_tasks.add_task(run_in_profile, profile_id, _rescore_after_person_update, person_id)
+    background_tasks.add_task(run_in_profile, profile_id, _update_cooccurrence_for_person, person_id)
     return {"status": "created", "person_id": person_id, "uuid": person_uuid}
 
 
@@ -840,10 +1031,10 @@ async def add_cluster_to_person(person_id: int, cluster_id: int, background_task
             raise HTTPException(status_code=404, detail="Person not found")
 
         await db.execute(
-            "UPDATE clusters SET person_id=? WHERE id=?", (person_id, cluster_id)
+            UPDATE_CLUSTER_PERSON_SQL, (person_id, cluster_id)
         )
         await db.execute(
-            "UPDATE faces SET person_id=? WHERE cluster_id=?", (person_id, cluster_id)
+            UPDATE_CLUSTER_FACES_PERSON_SQL, (person_id, cluster_id)
         )
         await _sync_photo_count(db, person_id)
 
@@ -862,9 +1053,36 @@ async def add_cluster_to_person(person_id: int, cluster_id: int, background_task
         # Refresh centroid with the newly-added cluster's embeddings
         await update_person_centroid(db, person_id)
 
-    background_tasks.add_task(_rescore_after_person_update, person_id)
-    background_tasks.add_task(_update_cooccurrence_for_person, person_id)
+    profile_id = get_current_profile_id()
+    background_tasks.add_task(run_in_profile, profile_id, _rescore_after_person_update, person_id)
+    background_tasks.add_task(run_in_profile, profile_id, _update_cooccurrence_for_person, person_id)
     return {"status": "merged", "person_id": person_id}
+
+
+@router.post("/ignored/{person_id}/add-cluster/{cluster_id}")
+async def add_cluster_to_ignored_person(person_id: int, cluster_id: int):
+    async with get_db() as db:
+        existing = await (
+            await db.execute(
+                "SELECT id FROM persons WHERE id=? AND is_merged=0 AND is_ignored=1",
+                (person_id,),
+            )
+        ).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Ignored person not found")
+
+        cluster = await (
+            await db.execute(
+                "SELECT id FROM clusters WHERE id=? AND person_id IS NULL",
+                (cluster_id,),
+            )
+        ).fetchone()
+        if not cluster:
+            raise HTTPException(status_code=404, detail="Cluster not found or already assigned")
+
+        await _assign_cluster_to_ignored_person(db, person_id, cluster_id)
+
+    return {"status": "ignored", "person_id": person_id, "cluster_id": cluster_id}
 
 
 @router.post("/{person_id}/set-portrait/{face_id}")
@@ -918,9 +1136,16 @@ async def connections_graph(person_id: int, depth: int = 2):
             raise HTTPException(status_code=404, detail="Person not found")
 
         center_thumb = await (await db.execute(
-            "SELECT thumbnail_path FROM faces "
-            "WHERE person_id=? AND thumbnail_path IS NOT NULL LIMIT 1",
-            (person_id,),
+            """
+            SELECT COALESCE(pf.thumbnail_path,
+                           (SELECT f.thumbnail_path FROM faces f
+                            WHERE f.person_id=? AND f.thumbnail_path IS NOT NULL LIMIT 1)
+                  ) AS thumbnail_path
+            FROM persons p
+            LEFT JOIN faces pf ON pf.id = p.portrait_face_id
+            WHERE p.id=?
+            """,
+            (person_id, person_id),
         )).fetchone()
 
         center_nid = f"p_{person_id}"
@@ -944,7 +1169,7 @@ async def connections_graph(person_id: int, depth: int = 2):
                 p.name,
                 p.photo_count,
                 pc.count AS shared_photos,
-                MIN(f.thumbnail_path) AS thumbnail
+                COALESCE(pf.thumbnail_path, MIN(f.thumbnail_path)) AS thumbnail
             FROM person_cooccurrence pc
             JOIN persons p
               ON p.id = CASE
@@ -953,6 +1178,7 @@ async def connections_graph(person_id: int, depth: int = 2):
                 END
             LEFT JOIN faces f
               ON f.person_id = p.id AND f.thumbnail_path IS NOT NULL
+            LEFT JOIN faces pf ON pf.id = p.portrait_face_id
             WHERE (pc.person_a_id = ? OR pc.person_b_id = ?)
               AND p.is_merged  = 0
               AND p.is_ignored = 0
@@ -1045,10 +1271,11 @@ async def connections_graph(person_id: int, depth: int = 2):
                 new_ids_list = list(new_person_ids)
                 p2_rows = await db.execute_fetchall(f"""
                     SELECT p.id, p.name, p.photo_count,
-                           MIN(f.thumbnail_path) AS thumbnail
+                           COALESCE(pf.thumbnail_path, MIN(f.thumbnail_path)) AS thumbnail
                     FROM persons p
                     LEFT JOIN faces f
                       ON f.person_id = p.id AND f.thumbnail_path IS NOT NULL
+                    LEFT JOIN faces pf ON pf.id = p.portrait_face_id
                     WHERE p.id IN ({ph2})
                       AND p.is_merged  = 0
                       AND p.is_ignored = 0
@@ -1103,7 +1330,7 @@ async def frequently_with(person_id: int, limit: int = 10):
                 p.name,
                 pc.count          AS shared_photos,
                 pc.last_seen_at,
-                MIN(f.thumbnail_path) AS representative_thumbnail
+                COALESCE(pf.thumbnail_path, MIN(f.thumbnail_path)) AS representative_thumbnail
             FROM person_cooccurrence pc
             JOIN persons p
               ON  p.id = CASE
@@ -1111,6 +1338,7 @@ async def frequently_with(person_id: int, limit: int = 10):
                     ELSE pc.person_a_id
                   END
             LEFT JOIN faces f ON f.person_id = p.id
+            LEFT JOIN faces pf ON pf.id = p.portrait_face_id
             WHERE (pc.person_a_id = ? OR pc.person_b_id = ?)
               AND p.name IS NOT NULL
               AND p.is_merged  = 0
@@ -1296,8 +1524,8 @@ async def find_similar_all(request: FindSimilarAllRequest):
 
                 if sim >= auto_threshold:
                     # Auto-merge: assign cluster to person
-                    await db.execute("UPDATE clusters SET person_id=? WHERE id=?", (person_id, cid))
-                    await db.execute("UPDATE faces SET person_id=? WHERE cluster_id=?", (person_id, cid))
+                    await db.execute(UPDATE_CLUSTER_PERSON_SQL, (person_id, cid))
+                    await db.execute(UPDATE_CLUSTER_FACES_PERSON_SQL, (person_id, cid))
                     await db.execute("""
                         DELETE FROM rejected_suggestions WHERE person_id=? AND cluster_id=?
                     """, (person_id, cid))

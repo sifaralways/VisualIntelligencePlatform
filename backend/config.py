@@ -21,7 +21,13 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     # Paths — all runtime data lives under APP_SUPPORT_DIR, never in the repo
     # -------------------------------------------------------------------------
-    app_support_dir: Path = Path.home() / "Library" / "Application Support" / "VIP"
+    app_support_root: Path = Path.home() / "Library" / "Application Support" / "VIP"
+
+    @property
+    def app_support_dir(self) -> Path:
+        from backend.profiles import get_current_profile_data_dir
+
+        return get_current_profile_data_dir(self.app_support_root)
 
     @property
     def db_path(self) -> Path:

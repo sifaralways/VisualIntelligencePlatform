@@ -3,10 +3,38 @@
  */
 
 const BASE = '/api'
+const PROFILE_STORAGE_KEY = 'vip_profile_id'
+
+export function getCurrentProfileId(): string {
+  if (typeof window === 'undefined') return ''
+  return localStorage.getItem(PROFILE_STORAGE_KEY) ?? ''
+}
+
+export function setCurrentProfileId(profileId: string | null): void {
+  if (typeof window === 'undefined') return
+  if (profileId) localStorage.setItem(PROFILE_STORAGE_KEY, profileId)
+  else localStorage.removeItem(PROFILE_STORAGE_KEY)
+}
+
+function buildHeaders(headers?: HeadersInit): Headers {
+  const merged = new Headers(headers ?? undefined)
+  if (!merged.has('Content-Type')) merged.set('Content-Type', 'application/json')
+  const profileId = getCurrentProfileId()
+  if (profileId) merged.set('X-VIP-Profile', profileId)
+  return merged
+}
+
+export function buildProfileWebSocketUrl(profileId?: string): string {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const url = new URL(`${protocol}//${window.location.host}/ws/progress`)
+  const resolvedProfileId = profileId || getCurrentProfileId()
+  if (resolvedProfileId) url.searchParams.set('profile_id', resolvedProfileId)
+  return url.toString()
+}
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
+    headers: buildHeaders(options?.headers),
     ...options,
   })
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`)
@@ -15,6 +43,42 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 
 // ─── Pipeline ────────────────────────────────────────────────────────────────
 export const api = {
+  profiles: {
+    list: () => request<ProfileSummary[]>('/profiles'),
+    active: () => request<ProfileSummary>('/profiles/active'),
+    create: (name: string, copySettingsFromProfileId?: string, password?: string) =>
+      request<ProfileSummary>('/profiles', {
+        method: 'POST',
+        body: JSON.stringify({
+          name,
+          copy_settings_from_profile_id: copySettingsFromProfileId ?? null,
+          password: password ?? null,
+        }),
+      }),
+    select: (profileId: string, password?: string) =>
+      request<ProfileSummary>(`/profiles/${encodeURIComponent(profileId)}/select`, {
+        method: 'POST',
+        body: JSON.stringify({ password: password ?? null }),
+      }),
+    rename: (profileId: string, name: string) =>
+      request<ProfileSummary>(`/profiles/${encodeURIComponent(profileId)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ name }),
+      }),
+    delete: (profileId: string) =>
+      request<{ status: string; id: string; name: string }>(`/profiles/${encodeURIComponent(profileId)}`, {
+        method: 'DELETE',
+      }),
+    setPassword: (profileId: string, password: string | null, currentPassword?: string) =>
+      request<ProfileSummary>(`/profiles/${encodeURIComponent(profileId)}/password`, {
+        method: 'POST',
+        body: JSON.stringify({
+          password,
+          current_password: currentPassword ?? null,
+        }),
+      }),
+  },
+
   pipeline: {
     scan: (folder: string, forceReprocess = false) =>
       request('/pipeline/scan', {
@@ -96,10 +160,18 @@ export const api = {
   clusters: {
     unnamed: () => request<Cluster[]>('/persons/unnamed'),    delete: (clusterId: number) =>
       request(`/persons/clusters/${clusterId}`, { method: 'DELETE' }),
+    similar: (clusterId: number) =>
+      request<SimilarCluster[]>(`/persons/clusters/${clusterId}/similar`),
     ignore: (clusterId: number) =>
       request<{ status: string; cluster_id: number; person_id: number }>(
         `/persons/clusters/${clusterId}/ignore`, { method: 'POST' }
-      ),  },
+      ),
+    ignoreSuggestions: (clusterId: number, action: 'delete' | 'ignore', threshold: number, limit = 8) =>
+      request<IgnoreSuggestionScanResult>(`/persons/clusters/${clusterId}/ignore-suggestions`, {
+        method: 'POST',
+        body: JSON.stringify({ action, threshold, limit }),
+      }),
+  },
 
   // ─── Persons ──────────────────────────────────────────────────────────────
   persons: {
@@ -123,6 +195,8 @@ export const api = {
       }),
     addCluster: (personId: number, clusterId: number) =>
       request(`/persons/${personId}/add-cluster/${clusterId}`, { method: 'POST' }),
+    addIgnoredCluster: (personId: number, clusterId: number) =>
+      request(`/persons/ignored/${personId}/add-cluster/${clusterId}`, { method: 'POST' }),
     mergeSuggestions: (personId: number) =>
       request<MergeSuggestion[]>(`/persons/${personId}/merge-suggestions?limit=1`),
     rejectSuggestion: (personId: number, clusterId: number) =>
@@ -130,6 +204,11 @@ export const api = {
     listIgnored: () => request<IgnoredPerson[]>('/persons/ignored'),
     unignore: (personId: number) =>
       request<{ status: string; person_id: number }>(`/persons/${personId}/unignore`, { method: 'POST' }),
+    ignoredSuggestions: (personId: number, threshold: number, limit = 8) =>
+      request<IgnoreSuggestionScanResult>(`/persons/ignored/${personId}/suggestions`, {
+        method: 'POST',
+        body: JSON.stringify({ threshold, limit }),
+      }),
     findSimilarAll: (autoThreshold: number) =>
       request<FindSimilarAllResult>('/persons/find-similar-all', {
         method: 'POST',
@@ -157,7 +236,8 @@ export const api = {
   faces: {
     byCluster: (clusterId: number) => request<FaceRow[]>(`/faces/cluster/${clusterId}`),
     byPerson: (personId: number) => request<FaceRow[]>(`/persons/${personId}/faces`),
-    byMedia: (mediaId: number) => request<FaceRow[]>(`/faces/media/${mediaId}`),
+    byMedia: (mediaId: number, includeIgnored = false) =>
+      request<FaceRow[]>(`/faces/media/${mediaId}${includeIgnored ? '?include_ignored=true' : ''}`),
     removeFromCluster: (faceId: number) =>
       request(`/faces/${faceId}/from-cluster`, { method: 'DELETE' }),
     removeFromPerson: (faceId: number) =>
@@ -180,6 +260,11 @@ export const api = {
   chat: {
     message: (params: ChatRequest) =>
       request<ChatResponse>('/chat/message', {
+        method: 'POST',
+        body: JSON.stringify(params),
+      }),
+    messageV2: (params: ChatRequest) =>
+      request<ChatV2Response>('/chat/v2/message', {
         method: 'POST',
         body: JSON.stringify(params),
       }),
@@ -321,6 +406,16 @@ export interface MediaFilter {
   tag_label?: string
   folder_id?: number
   path_prefix?: string
+}
+
+export interface ProfileSummary {
+  id: string
+  name: string
+  is_password_protected: boolean
+  is_default: boolean
+  is_active: boolean
+  created_at: string
+  last_opened_at: string | null
 }
 
 export interface FolderItem {
@@ -503,6 +598,17 @@ export interface SimilarCluster {
   similarity: number
 }
 
+export interface IgnoreSuggestion extends SimilarCluster {}
+
+export interface IgnoreSuggestionScanResult {
+  status: string
+  action: 'delete' | 'ignore'
+  person_id: number
+  threshold: number
+  auto_ignored: IgnoreSuggestion[]
+  suggestions: IgnoreSuggestion[]
+}
+
 export interface FaceRow {
   id: number
   media_file_id?: number
@@ -513,6 +619,7 @@ export interface FaceRow {
   cluster_id?: number | null
   date_taken?: string | null
   sharpness?: number | null
+  is_ignored?: boolean
 }
 
 export interface SearchRequest {
@@ -563,11 +670,15 @@ export interface NaturalSearchResponse {
 export interface ChatRequest {
   message: string
   limit?: number
+  offset?: number
   conversation_id?: string
 }
 
 export interface ChatActionPayload {
   query?: string
+  offset?: number
+  next_offset?: number | null
+  has_more?: boolean
 }
 
 export interface ChatTopPerson {
@@ -599,6 +710,28 @@ export interface ChatResponse {
   top_people?: ChatTopPerson[]
 }
 
+export interface ToolCallTrace {
+  tool_name: string
+  status: 'ok' | 'error'
+  latency_ms: number
+  notes?: string
+  input?: Record<string, unknown>
+}
+
+export interface ChatV2Response {
+  version: 'v2'
+  conversation_id: string
+  reply_text: string
+  action_type: 'none' | 'open_search' | 'clarification' | 'tool_error'
+  action_payload: ChatActionPayload
+  results: NaturalSearchResult[]
+  face_results?: ChatFaceResult[]
+  count: number
+  intent?: 'SQL_ONLY' | 'CLIP_ONLY' | 'HYBRID'
+  explanation?: string
+  tool_trace?: ToolCallTrace[]
+}
+
 export interface WritebackPreview {
   count: number
   items: WritebackItem[]
@@ -614,6 +747,9 @@ export interface AdminStats {
   writeback_queue: number
   thumbnail_files: number
   media_by_state: Record<string, number>
+  geo_by_source: Record<string, number>
+  photos_with_gps: number
+  photos_geo_resolved: number
 }
 
 export interface WritebackItem {

@@ -37,7 +37,7 @@ export default function PhotoGrid({
   const [offset,   setOffset]   = useState(0)
   const [loading,  setLoading]  = useState(false)
   const [error,    setError]    = useState<string | null>(null)
-  const [selected, setSelected] = useState<MediaFile | null>(null)
+  const [selectedIndex, setSelectedIndex] = useState<number | null>(null)
   const [refreshKey, setRefreshKey] = useState(0)
 
   // Multi-select
@@ -202,7 +202,7 @@ export default function PhotoGrid({
       {/* Grid */}
       {photos.length > 0 && (
         <div className="grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-1">
-          {photos.map(photo => (
+          {photos.map((photo, index) => (
             <PhotoTile
               key={photo.id}
               photo={photo}
@@ -212,7 +212,7 @@ export default function PhotoGrid({
               onSelect={() => toggleSelect(photo.id)}
               onClick={() => {
                 if (showCheckboxes && selectable) toggleSelect(photo.id)
-                else setSelected(photo)
+                else setSelectedIndex(index)
               }}
             />
           ))}
@@ -243,11 +243,20 @@ export default function PhotoGrid({
       )}
 
       {/* Detail modal */}
-      {selected && (
+      {selectedIndex != null && photos[selectedIndex] && (
         <PhotoDetail
-          mediaId={selected.id}
-          filePath={selected.file_path}
-          onClose={() => setSelected(null)}
+          mediaId={photos[selectedIndex].id}
+          filePath={photos[selectedIndex].file_path}
+          canGoPrev={selectedIndex > 0}
+          canGoNext={selectedIndex < photos.length - 1}
+          onNavigate={(delta: number) => {
+            setSelectedIndex(prev => {
+              if (prev == null) return prev
+              const next = Math.max(0, Math.min(photos.length - 1, prev + delta))
+              return next
+            })
+          }}
+          onClose={() => setSelectedIndex(null)}
           onTagRemoved={() => setRefreshKey(k => k + 1)}
         />
       )}

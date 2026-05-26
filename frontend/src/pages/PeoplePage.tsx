@@ -6,9 +6,9 @@
  * Unnamed clusters: shown first, sorted by size.
  */
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api/client'
-import type { Cluster, Person, MergeSuggestion, FaceRow, SimilarCluster, MergePersonsResult, FindSimilarSuggestion, FindSimilarAllResult, IgnoredPerson } from '../api/client'
+import type { Cluster, Person, MergeSuggestion, FaceRow, SimilarCluster, MergePersonsResult, FindSimilarSuggestion, FindSimilarAllResult, IgnoredPerson, IgnoreSuggestion } from '../api/client'
 import ConnectionsGraph from '../components/ConnectionsGraph'
 
 interface Props {
@@ -215,6 +215,15 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   const [dismissWorking, setDismissWorking] = useState(false)
   const [similarClusters, setSimilarClusters] = useState<SimilarCluster[]>([])
   const [similarLoading, setSimilarLoading] = useState(false)
+  const [ignoreSuggestTarget, setIgnoreSuggestTarget] = useState<Cluster | null>(null)
+  const [ignoreSuggestAction, setIgnoreSuggestAction] = useState<'delete' | 'ignore' | null>(null)
+  const [ignoreSuggestThreshold, setIgnoreSuggestThreshold] = useState(0.85)
+  const [ignoreSuggestWorking, setIgnoreSuggestWorking] = useState(false)
+  const [ignoreSuggestionQueue, setIgnoreSuggestionQueue] = useState<IgnoreSuggestion[]>([])
+  const [ignoreSuggestionSource, setIgnoreSuggestionSource] = useState<Cluster | null>(null)
+  const [ignoreSuggestionPersonId, setIgnoreSuggestionPersonId] = useState<number | null>(null)
+  const [ignoreSuggestionBusy, setIgnoreSuggestionBusy] = useState(false)
+  const [ignoreSuggestionResult, setIgnoreSuggestionResult] = useState<{ autoIgnored: number; suggestionsFound: number; action: 'delete' | 'ignore' } | null>(null)
 
   // ── Connections graph modal ──────────────────────────────────────────────
   const [connectionsPersonId, setConnectionsPersonId] = useState<number | null>(null)
@@ -228,6 +237,12 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   const [bulkNameInput, setBulkNameInput] = useState('')
   const [bulkNameSuggestions, setBulkNameSuggestions] = useState(false)
   const lastSelectedIdxRef = useRef<number>(-1)
+
+  // Keep a stable, prefiltered list for autocomplete paths.
+  const namedPersonNames = useMemo(
+    () => persons.filter(p => p.name).map(p => p.name!),
+    [persons],
+  )
 
   function toggleSelect(id: number) {
     setSelected(prev => {
@@ -323,7 +338,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     try {
       const results = await api.clusters.similar(cluster.id)
       // Only show clusters above a basic similarity threshold to avoid noise
-      setSimilarClusters(results.filter(s => s.similarity >= 0.55))
+      setSimilarClusters(results.filter((s: SimilarCluster) => s.similarity >= 0.55))
     } catch {
       setSimilarClusters([])
     } finally {
@@ -338,6 +353,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
       setClusters(prev => prev.filter(c => c.id !== clusterId))
       setDismissTarget(null)
       setSimilarClusters([])
+      if (ignoredLoaded) await loadIgnored()
     } finally { setDismissWorking(false) }
   }
 
@@ -348,7 +364,101 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
       setClusters(prev => prev.filter(c => c.id !== clusterId))
       setDismissTarget(null)
       setSimilarClusters([])
+      if (ignoredLoaded) await loadIgnored()
     } finally { setDismissWorking(false) }
+  }
+
+  function openIgnoreSuggestionPrompt(action: 'delete' | 'ignore') {
+    if (!dismissTarget) return
+    // Start a new ignore-suggestion session; clear stale queue state from previous runs.
+    setIgnoreSuggestionQueue([])
+    setIgnoreSuggestionPersonId(null)
+    setIgnoreSuggestionSource(null)
+    setIgnoreSuggestTarget(dismissTarget)
+    setIgnoreSuggestAction(action)
+    setIgnoreSuggestThreshold(0.85)
+    setDismissTarget(null)
+  }
+
+  function closeIgnoreSuggestionPrompt() {
+    setIgnoreSuggestTarget(null)
+    setIgnoreSuggestAction(null)
+    setIgnoreSuggestThreshold(0.85)
+  }
+
+  async function skipIgnoreSuggestions() {
+    if (!ignoreSuggestTarget || !ignoreSuggestAction) return
+    if (ignoreSuggestAction === 'delete') {
+      await handleDeleteCluster(ignoreSuggestTarget.id)
+    } else {
+      await handleIgnoreCluster(ignoreSuggestTarget.id)
+    }
+    closeIgnoreSuggestionPrompt()
+  }
+
+  async function runIgnoreSuggestions() {
+    if (!ignoreSuggestTarget || !ignoreSuggestAction) return
+    setIgnoreSuggestWorking(true)
+    try {
+      const result = await api.clusters.ignoreSuggestions(
+        ignoreSuggestTarget.id,
+        ignoreSuggestAction,
+        ignoreSuggestThreshold,
+      )
+      await load()
+      if (ignoredLoaded) await loadIgnored()
+      setIgnoreSuggestionSource(ignoreSuggestTarget)
+      setIgnoreSuggestionPersonId(result.person_id)
+      setIgnoreSuggestionQueue(result.suggestions)
+      setIgnoreSuggestionResult({
+        autoIgnored: result.auto_ignored.length,
+        suggestionsFound: result.suggestions.length,
+        action: ignoreSuggestAction,
+      })
+    } finally {
+      setIgnoreSuggestWorking(false)
+      closeIgnoreSuggestionPrompt()
+    }
+  }
+
+  async function acceptIgnoreSuggestion() {
+    const current = ignoreSuggestionQueue[0]
+    if (!current || ignoreSuggestionPersonId == null) return
+    setIgnoreSuggestionBusy(true)
+    try {
+      await api.persons.addIgnoredCluster(ignoreSuggestionPersonId, current.cluster_id)
+      setIgnoreSuggestionQueue(q => {
+        const next = q.slice(1)
+        if (next.length === 0) {
+          setIgnoreSuggestionPersonId(null)
+          setIgnoreSuggestionSource(null)
+        }
+        return next
+      })
+      await load()
+      if (ignoredLoaded) await loadIgnored()
+    } finally {
+      setIgnoreSuggestionBusy(false)
+    }
+  }
+
+  async function rejectIgnoreSuggestion() {
+    const current = ignoreSuggestionQueue[0]
+    if (!current || ignoreSuggestionPersonId == null) return
+    setIgnoreSuggestionBusy(true)
+    try {
+      await api.persons.rejectSuggestion(ignoreSuggestionPersonId, current.cluster_id)
+      setIgnoreSuggestionQueue(q => {
+        const next = q.slice(1)
+        if (next.length === 0) {
+          setIgnoreSuggestionPersonId(null)
+          setIgnoreSuggestionSource(null)
+        }
+        return next
+      })
+    } finally {
+      setIgnoreSuggestionBusy(false)
+    }
   }
 
   async function load() {
@@ -504,7 +614,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
       setRenameInput('')
       // Optimistically update the name; name_written resets to false since
       // writeback hasn't run yet for the new name.
-      setPersons(prev => prev.map(p => p.id === personId ? { ...p, name, name_written: false } : p))
+      setPersons(prev => prev.map(p => p.id === personId ? { ...p, name, name_written: 0 } : p))
     } finally {
       setRenameSaving(false)
     }
@@ -950,14 +1060,14 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
             {/* Actions */}
             <div className="flex flex-col gap-2">
               <button
-                onClick={() => handleDeleteCluster(dismissTarget.id)}
+                onClick={() => openIgnoreSuggestionPrompt('delete')}
                 disabled={dismissWorking}
                 className="bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-white rounded-lg py-2.5 text-sm font-medium transition-colors"
               >
                 Delete — show again if re-detected
               </button>
               <button
-                onClick={() => handleIgnoreCluster(dismissTarget.id)}
+                onClick={() => openIgnoreSuggestionPrompt('ignore')}
                 disabled={dismissWorking}
                 className="bg-red-900 hover:bg-red-800 disabled:opacity-40 text-white rounded-lg py-2.5 text-sm font-medium transition-colors"
               >
@@ -1063,7 +1173,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
             {clusters.map((c, idx) => (
               <ClusterTile key={c.id} cluster={c}
                 isNaming={!selectMode && namingId === c.id} nameInput={nameInput} saving={saving}
-                personNames={persons.filter(p => p.name).map(p => p.name!)}
+                personNames={namedPersonNames}
                 selectMode={selectMode}
                 isSelected={selected.has(c.id)}
                 onToggleSelect={(shiftHeld) => rangeSelect(idx, shiftHeld)}
@@ -1098,9 +1208,8 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
                       className="w-full bg-gray-800 border border-indigo-500 rounded-lg px-3 py-1.5 text-sm text-white outline-none min-w-[180px]"
                     />
                     {bulkNameSuggestions && bulkNameInput.trim().length > 0 && (() => {
-                      const matches = persons
-                        .filter(p => p.name && p.name.toLowerCase().includes(bulkNameInput.toLowerCase()))
-                        .map(p => p.name!)
+                      const query = bulkNameInput.toLowerCase()
+                      const matches = namedPersonNames.filter(n => n.toLowerCase().includes(query))
                       return matches.length > 0 ? (
                         <ul
                           onMouseDown={e => e.preventDefault()}
@@ -1226,6 +1335,22 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
                   : <span>no manual review needed</span>}
               </p>
               <button onClick={() => setFindSimilarResult(null)} className="text-indigo-600 hover:text-indigo-400 text-sm ml-4">✕</button>
+            </div>
+          )}
+
+          {ignoreSuggestionResult && ignoreSuggestionQueue.length === 0 && (
+            <div className="mb-4 flex items-center justify-between rounded-xl bg-red-900/20 border border-red-800 px-4 py-2.5">
+              <p className="text-sm text-red-200">
+                Ignore suggestions complete for the {ignoreSuggestionResult.action === 'delete' ? 'delete' : 'always ignore'} action —{' '}
+                {ignoreSuggestionResult.autoIgnored > 0
+                  ? <span className="text-red-300 font-medium">{ignoreSuggestionResult.autoIgnored} auto-ignored</span>
+                  : <span>0 auto-ignored</span>}
+                {', '}
+                {ignoreSuggestionResult.suggestionsFound > 0
+                  ? <span className="text-yellow-300 font-medium">{ignoreSuggestionResult.suggestionsFound} reviewed manually</span>
+                  : <span>no manual review remaining</span>}
+              </p>
+              <button onClick={() => setIgnoreSuggestionResult(null)} className="text-red-500 hover:text-red-300 text-sm ml-4">✕</button>
             </div>
           )}
 
@@ -1405,6 +1530,120 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
             </div>
           )}
         </section>
+      )}
+
+      {ignoreSuggestTarget && ignoreSuggestAction && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+          <div className="bg-gray-900 border border-gray-700 rounded-2xl p-7 max-w-md w-full shadow-2xl mx-4">
+            <p className="text-white font-semibold text-lg mb-1">Ignore suggestion</p>
+            <p className="text-gray-400 text-sm mb-5">
+              VIP can auto-ignore very close matches and then show you weaker similar faces for manual review.
+            </p>
+            <div className="flex items-center gap-4 mb-5">
+              {ignoreSuggestTarget.representative_thumbnail
+                ? <img src={'/thumbnails/' + ignoreSuggestTarget.representative_thumbnail.split('/thumbnails/').pop()} alt="source face" className="w-20 h-20 rounded-xl object-cover border border-gray-600" />
+                : <div className="w-20 h-20 rounded-xl bg-gray-800 border border-gray-700 flex items-center justify-center text-gray-500 text-2xl">?</div>}
+              <div>
+                <p className="text-white text-sm font-medium">
+                  After {ignoreSuggestAction === 'delete' ? 'deleting' : 'ignoring'} this face, check for other similar faces?
+                </p>
+                <p className="text-gray-500 text-xs mt-1">
+                  Matches above the threshold are auto-ignored. Lower-confidence matches are shown one by one.
+                </p>
+              </div>
+            </div>
+            <div className="mb-6">
+              <label className="flex items-center justify-between text-sm text-gray-300 mb-2">
+                <span>Auto-ignore threshold</span>
+                <span className="font-semibold text-white">{Math.round(ignoreSuggestThreshold * 100)}%</span>
+              </label>
+              <input
+                type="range"
+                min={50}
+                max={95}
+                step={1}
+                value={Math.round(ignoreSuggestThreshold * 100)}
+                onChange={e => setIgnoreSuggestThreshold(Number(e.target.value) / 100)}
+                className="w-full accent-red-500"
+              />
+              <p className="text-xs text-gray-500 mt-2">
+                Similarity {Math.round(ignoreSuggestThreshold * 100)}% and above is ignored automatically.
+              </p>
+            </div>
+            <div className="flex gap-3">
+              <button
+                onClick={runIgnoreSuggestions}
+                disabled={ignoreSuggestWorking}
+                className="flex-1 bg-red-700 hover:bg-red-600 disabled:opacity-40 text-white rounded-xl py-2.5 text-sm font-semibold transition-colors"
+              >
+                {ignoreSuggestWorking ? 'Running…' : 'Yes'}
+              </button>
+              <button
+                onClick={skipIgnoreSuggestions}
+                disabled={ignoreSuggestWorking}
+                className="flex-1 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-gray-300 rounded-xl py-2.5 text-sm font-medium transition-colors"
+              >
+                No
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {ignoreSuggestionQueue.length > 0 && ignoreSuggestionSource && (
+        <div className="fixed inset-0 bg-black/75 flex items-center justify-center z-50">
+          <div className="bg-gray-900 border border-gray-700 rounded-2xl p-7 max-w-md w-full shadow-2xl mx-4">
+            <p className="text-white font-semibold text-lg mb-1">Ignore this similar face too?</p>
+            <p className="text-gray-400 text-xs mb-5">
+              Similarity {Math.round(ignoreSuggestionQueue[0].similarity * 100)}% — {ignoreSuggestionQueue.length} suggestion{ignoreSuggestionQueue.length !== 1 ? 's' : ''} remaining.
+            </p>
+            <div className="flex gap-6 items-center justify-center mb-6">
+              <div className="flex flex-col items-center gap-1">
+                <div className="w-24 h-24 rounded-xl overflow-hidden bg-gray-800 border border-red-700">
+                  {ignoreSuggestionSource.representative_thumbnail
+                    ? <img src={'/thumbnails/' + ignoreSuggestionSource.representative_thumbnail.split('/thumbnails/').pop()} alt="source face" className="w-full h-full object-cover" />
+                    : <span className="flex items-center justify-center h-full text-gray-500 text-2xl">?</span>}
+                </div>
+                <span className="text-xs text-red-300 font-medium">Source face</span>
+              </div>
+              <span className="text-gray-500 text-2xl">≈</span>
+              <div className="flex flex-col items-center gap-1">
+                <div className="w-24 h-24 rounded-xl overflow-hidden bg-gray-800 border border-gray-600">
+                  {ignoreSuggestionQueue[0].representative_thumbnail
+                    ? <img src={'/thumbnails/' + ignoreSuggestionQueue[0].representative_thumbnail.split('/thumbnails/').pop()} alt="suggested face" className="w-full h-full object-cover" />
+                    : <span className="flex items-center justify-center h-full text-gray-500 text-2xl">?</span>}
+                </div>
+                <span className="text-xs text-gray-500">{ignoreSuggestionQueue[0].member_count} face{ignoreSuggestionQueue[0].member_count !== 1 ? 's' : ''}</span>
+              </div>
+            </div>
+            <div className="flex gap-3">
+              <button
+                onClick={acceptIgnoreSuggestion}
+                disabled={ignoreSuggestionBusy}
+                className="flex-1 bg-red-700 hover:bg-red-600 disabled:opacity-40 text-white rounded-xl py-2.5 text-sm font-semibold transition-colors"
+              >
+                {ignoreSuggestionBusy ? 'Ignoring…' : 'Yes, ignore'}
+              </button>
+              <button
+                onClick={rejectIgnoreSuggestion}
+                disabled={ignoreSuggestionBusy}
+                className="flex-1 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-gray-300 rounded-xl py-2.5 text-sm font-medium transition-colors"
+              >
+                No, keep it
+              </button>
+            </div>
+            <button
+              onClick={() => {
+                setIgnoreSuggestionQueue([])
+                setIgnoreSuggestionPersonId(null)
+                setIgnoreSuggestionSource(null)
+              }}
+              className="mt-3 w-full text-center text-xs text-gray-600 hover:text-gray-400"
+            >
+              Stop reviewing for now
+            </button>
+          </div>
+        </div>
       )}
 
       {/* ── Connections graph modal ────────────────────────────────────────── */}
@@ -1617,7 +1856,7 @@ function ClusterTile({ cluster, isNaming, nameInput, saving, personNames, select
   const thumb = cluster.representative_thumbnail
   const thumbUrl = thumb ? '/thumbnails/' + thumb.split('/thumbnails/').pop() : null
 
-  const filteredNames = nameInput.trim().length > 0
+  const filteredNames = (isNaming && showSuggestions && nameInput.trim().length > 0)
     ? personNames.filter(n => n.toLowerCase().includes(nameInput.toLowerCase()))
     : []
 

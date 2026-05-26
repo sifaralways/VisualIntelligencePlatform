@@ -21,6 +21,7 @@ import logging
 from typing import Any
 
 from backend.database.db import get_db
+from backend.profiles import get_current_profile_id
 
 logger = logging.getLogger(__name__)
 
@@ -227,7 +228,8 @@ DEFAULTS: dict[str, dict[str, Any]] = {
 # In-process cache — populated from DB at pipeline start and on every write.
 # ML code runs synchronously in executor threads so it reads from this dict.
 # ---------------------------------------------------------------------------
-_cache: dict[str, Any] = {k: v["value"] for k, v in DEFAULTS.items()}
+_DEFAULT_CACHE: dict[str, Any] = {k: v["value"] for k, v in DEFAULTS.items()}
+_cache_by_profile: dict[str, dict[str, Any]] = {}
 
 
 def get(key: str) -> Any:
@@ -235,7 +237,8 @@ def get(key: str) -> Any:
     Synchronous read — safe to call from executor threads.
     Falls back to the default value if the key is unknown.
     """
-    return _cache.get(key, DEFAULTS.get(key, {}).get("value"))
+    cache = _cache_by_profile.get(get_current_profile_id(), _DEFAULT_CACHE)
+    return cache.get(key, DEFAULTS.get(key, {}).get("value"))
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +247,7 @@ def get(key: str) -> Any:
 
 async def load_cache() -> None:
     """Reload all settings from the DB into the in-process cache."""
-    global _cache
+    profile_id = get_current_profile_id()
     async with get_db() as db:
         rows = await db.execute_fetchall("SELECT key, value FROM app_settings")
     merged = {k: v["value"] for k, v in DEFAULTS.items()}
@@ -252,8 +255,8 @@ async def load_cache() -> None:
         key = row["key"]
         if key in DEFAULTS:
             merged[key] = _cast(key, row["value"])
-    _cache = merged
-    logger.debug("Settings cache loaded: %s", _cache)
+    _cache_by_profile[profile_id] = merged
+    logger.debug("Settings cache loaded for profile %s: %s", profile_id, merged)
 
 
 async def get_all() -> list[dict]:
@@ -262,11 +265,12 @@ async def get_all() -> list[dict]:
     Groups are returned in a stable order.
     """
     await load_cache()
+    cache = _cache_by_profile.get(get_current_profile_id(), _DEFAULT_CACHE)
     result = []
     for key, meta in DEFAULTS.items():
         result.append({
             "key": key,
-            "value": _cache.get(key, meta["value"]),
+            "value": cache.get(key, meta["value"]),
             "default": meta["value"],
             "type": meta["type"],
             "min": meta["min"],
@@ -296,7 +300,7 @@ async def update(updates: dict[str, Any]) -> None:
                 (key, str(value)),
             )
     await load_cache()
-    logger.info("Settings updated: %s", valid)
+    logger.info("Settings updated for profile %s: %s", get_current_profile_id(), valid)
 
 
 async def reset_all() -> None:
@@ -309,7 +313,7 @@ async def reset_all() -> None:
                 (key, str(meta["value"])),
             )
     await load_cache()
-    logger.info("Settings reset to defaults")
+    logger.info("Settings reset to defaults for profile %s", get_current_profile_id())
 
 
 # ---------------------------------------------------------------------------

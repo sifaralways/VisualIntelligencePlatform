@@ -8,13 +8,16 @@ import re
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from backend.assistant.executor import execute_plan
+from backend.assistant.executor import continue_pending_person_clarification, execute_plan
 from backend.assistant.memory import append_turn, get_or_create_session, save_state
 from backend.assistant.planner import AssistantPlanner
 from backend.assistant.types import AssistantPlan
+from backend.assistant_v2.orchestrator import AssistantV2Orchestrator
+from backend.assistant_v2.types import AssistantV2Request
 
 router = APIRouter()
 _planner = AssistantPlanner()
+_orchestrator_v2 = AssistantV2Orchestrator()
 
 
 def _normalize_plan_for_message(plan: AssistantPlan, message: str) -> AssistantPlan:
@@ -34,6 +37,7 @@ def _normalize_plan_for_message(plan: AssistantPlan, message: str) -> AssistantP
 class ChatRequest(BaseModel):
     message: str
     limit: int = 50
+    offset: int = 0
     conversation_id: str | None = None
 
 
@@ -41,6 +45,7 @@ class ChatRequest(BaseModel):
 async def chat_message(req: ChatRequest):
     message = (req.message or "").strip()
     limit = max(1, min(int(req.limit or 50), 200))
+    offset = max(0, int(req.offset or 0))
 
     session_id, state = await get_or_create_session(req.conversation_id)
 
@@ -61,17 +66,23 @@ async def chat_message(req: ChatRequest):
     # Keep state updated with last user query before planning.
     state.last_user_query = message
 
-    plan = await _planner.plan(message, state, limit)
-    if not isinstance(plan, AssistantPlan):
-        plan = AssistantPlan(operation="NATURAL_SEARCH", query=message, limit=limit, explanation="Planner fallback")
-    plan = _normalize_plan_for_message(plan, message)
+    clarification = await continue_pending_person_clarification(message, state, limit)
+    if clarification is not None:
+        executed, plan = clarification
+    else:
+        plan = await _planner.plan(message, state, limit)
+        if not isinstance(plan, AssistantPlan):
+            plan = AssistantPlan(operation="NATURAL_SEARCH", query=message, limit=limit, explanation="Planner fallback")
+        plan = _normalize_plan_for_message(plan, message)
+        plan.offset = offset
+        executed = await execute_plan(plan, state, limit)
 
-    executed = await execute_plan(plan, state, limit)
     next_state = executed.state
     next_state.last_user_query = message
-    next_state.last_operation = plan.operation
-    if plan.people:
-        next_state.last_people = [p for p in plan.people if p]
+    if executed.payload.get("action") != "needs_clarification":
+        next_state.last_operation = plan.operation
+        if plan.people:
+            next_state.last_people = [p for p in plan.people if p]
 
     await save_state(session_id, next_state)
 
@@ -89,3 +100,36 @@ async def chat_message(req: ChatRequest):
     )
 
     return payload
+
+
+@router.post("/v2/message")
+async def chat_message_v2(req: AssistantV2Request):
+    message = (req.message or "").strip()
+    limit = max(1, min(int(req.limit or 50), 200))
+    offset = max(0, int(req.offset or 0))
+
+    session_id, state = await get_or_create_session(req.conversation_id)
+
+    if message:
+        await append_turn(session_id, role="user", message=message)
+
+    response, next_state = await _orchestrator_v2.handle(
+        message=message,
+        session_id=session_id,
+        state=state,
+        limit=limit,
+        offset=offset,
+    )
+
+    next_state.last_user_query = message or next_state.last_user_query
+    await save_state(session_id, next_state)
+
+    response_json = response.model_dump_json()
+    await append_turn(
+        session_id,
+        role="assistant",
+        message=response.reply_text,
+        plan_json=json.dumps({"tool_trace": [t.model_dump() for t in response.tool_trace], "version": "v2"}),
+        response_json=response_json,
+    )
+    return response.model_dump()

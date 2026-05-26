@@ -15,7 +15,11 @@ export default function PipelinePage() {
 
   useEffect(() => {
     // Connect to progress WebSocket
-    const ws = new WebSocket(`ws://localhost:7474/ws/progress`)
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const profileId = localStorage.getItem('vip_profile_id') ?? ''
+    const url = new URL(`${protocol}//${window.location.host}/ws/progress`)
+    if (profileId) url.searchParams.set('profile_id', profileId)
+    const ws = new WebSocket(url.toString())
     wsRef.current = ws
     ws.onmessage = (msg) => {
       try {
