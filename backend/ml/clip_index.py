@@ -19,9 +19,21 @@ class ClipFaissIndex:
         self._index = None
         self._media_ids: list[int] = []
         self._dim: int = 0
+        self._path: str | None = None
+
+    def _ensure_profile_path(self) -> None:
+        path = str(settings.clip_faiss_path)
+        if self._path == path:
+            return
+        self._index = None
+        self._media_ids = []
+        self._dim = 0
+        self._path = path
 
     def build(self, media_ids: list[int], vectors: list[np.ndarray]) -> None:
         import faiss
+
+        self._ensure_profile_path()
 
         if not vectors:
             logger.info("ClipFaissIndex: no vectors to build")
@@ -45,6 +57,8 @@ class ClipFaissIndex:
     def save(self) -> None:
         import faiss
 
+        self._ensure_profile_path()
+
         if self._index is None:
             return
 
@@ -60,7 +74,12 @@ class ClipFaissIndex:
     def load(self) -> bool:
         import faiss
 
+        self._ensure_profile_path()
+
         if not settings.clip_faiss_path.exists():
+            self._index = None
+            self._media_ids = []
+            self._dim = 0
             return False
 
         ids_path = settings.clip_faiss_path.with_suffix(".ids.pkl")
@@ -77,8 +96,8 @@ class ClipFaissIndex:
             else:
                 self._dim = int(self._index.d)
             return True
-        except Exception as exc:
-            logger.error("ClipFaissIndex load failed: %s", exc)
+        except Exception:
+            logger.exception("ClipFaissIndex load failed")
             self._index = None
             self._media_ids = []
             self._dim = 0
@@ -90,6 +109,7 @@ class ClipFaissIndex:
         k: int = 50,
         threshold: float = 0.20,
     ) -> list[tuple[int, float]]:
+        self._ensure_profile_path()
         if self._index is None or self._index.ntotal == 0:
             return []
 
@@ -108,8 +128,10 @@ class ClipFaissIndex:
 
     @property
     def total(self) -> int:
+        self._ensure_profile_path()
         return self._index.ntotal if self._index is not None else 0
 
     @property
     def dimension(self) -> int:
+        self._ensure_profile_path()
         return self._dim

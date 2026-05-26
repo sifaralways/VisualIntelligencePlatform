@@ -15,6 +15,7 @@ from backend.database.db import get_db
 from backend.database.models import Person
 from backend.pipeline.centroid import update_person_centroid, load_centroid
 from backend.api.websocket import broadcast
+from backend.profiles import get_current_profile_id, run_in_profile
 
 # Minimum cosine similarity to surface a merge suggestion
 _SUGGEST_THRESHOLD = 0.50
@@ -768,8 +769,9 @@ async def name_person(person_id: int, req: NamePersonRequest, background_tasks: 
         # Persist centroid so this person is recognisable in future scans
         await update_person_centroid(db, person_id)
 
-    background_tasks.add_task(_rescore_after_person_update, person_id)
-    background_tasks.add_task(_update_cooccurrence_for_person, person_id)
+    profile_id = get_current_profile_id()
+    background_tasks.add_task(run_in_profile, profile_id, _rescore_after_person_update, person_id)
+    background_tasks.add_task(run_in_profile, profile_id, _update_cooccurrence_for_person, person_id)
     return {"status": "ok", "name": req.name}
 
 
@@ -912,8 +914,9 @@ async def merge_named_persons(
         # 8. Recompute centroid from all merged embeddings.
         await update_person_centroid(db, survivor_id)
 
-    background_tasks.add_task(_rescore_after_person_update, survivor_id)
-    background_tasks.add_task(_update_cooccurrence_for_person, survivor_id)
+    profile_id = get_current_profile_id()
+    background_tasks.add_task(run_in_profile, profile_id, _rescore_after_person_update, survivor_id)
+    background_tasks.add_task(run_in_profile, profile_id, _update_cooccurrence_for_person, survivor_id)
     return {
         "status": "merged",
         "survivor_id": survivor_id,
@@ -978,8 +981,9 @@ async def assign_lone_face_to_person(face_id: int, req: NameClusterRequest, back
 
         await update_person_centroid(db, person_id)
 
-    background_tasks.add_task(_rescore_after_person_update, person_id)
-    background_tasks.add_task(_update_cooccurrence_for_person, person_id)
+    profile_id = get_current_profile_id()
+    background_tasks.add_task(run_in_profile, profile_id, _rescore_after_person_update, person_id)
+    background_tasks.add_task(run_in_profile, profile_id, _update_cooccurrence_for_person, person_id)
     return {"status": "assigned", "face_id": face_id, "person_id": person_id}
 
 
@@ -1010,8 +1014,9 @@ async def create_person_from_cluster(cluster_id: int, req: NameClusterRequest, b
         # Persist centroid — this person now has embeddings to match against
         await update_person_centroid(db, person_id)
 
-    background_tasks.add_task(_rescore_after_person_update, person_id)
-    background_tasks.add_task(_update_cooccurrence_for_person, person_id)
+    profile_id = get_current_profile_id()
+    background_tasks.add_task(run_in_profile, profile_id, _rescore_after_person_update, person_id)
+    background_tasks.add_task(run_in_profile, profile_id, _update_cooccurrence_for_person, person_id)
     return {"status": "created", "person_id": person_id, "uuid": person_uuid}
 
 
@@ -1048,8 +1053,9 @@ async def add_cluster_to_person(person_id: int, cluster_id: int, background_task
         # Refresh centroid with the newly-added cluster's embeddings
         await update_person_centroid(db, person_id)
 
-    background_tasks.add_task(_rescore_after_person_update, person_id)
-    background_tasks.add_task(_update_cooccurrence_for_person, person_id)
+    profile_id = get_current_profile_id()
+    background_tasks.add_task(run_in_profile, profile_id, _rescore_after_person_update, person_id)
+    background_tasks.add_task(run_in_profile, profile_id, _update_cooccurrence_for_person, person_id)
     return {"status": "merged", "person_id": person_id}
 
 

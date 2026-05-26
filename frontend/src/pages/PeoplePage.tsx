@@ -338,7 +338,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     try {
       const results = await api.clusters.similar(cluster.id)
       // Only show clusters above a basic similarity threshold to avoid noise
-      setSimilarClusters(results.filter(s => s.similarity >= 0.55))
+      setSimilarClusters(results.filter((s: SimilarCluster) => s.similarity >= 0.55))
     } catch {
       setSimilarClusters([])
     } finally {
@@ -614,7 +614,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
       setRenameInput('')
       // Optimistically update the name; name_written resets to false since
       // writeback hasn't run yet for the new name.
-      setPersons(prev => prev.map(p => p.id === personId ? { ...p, name, name_written: false } : p))
+      setPersons(prev => prev.map(p => p.id === personId ? { ...p, name, name_written: 0 } : p))
     } finally {
       setRenameSaving(false)
     }

@@ -11,8 +11,8 @@ import QualityPage from './pages/QualityPage'
 import ExplicitPage from './pages/ExplicitPage'
 import PhotoGrid from './components/PhotoGrid'
 import PipelinePanel from './components/PipelinePanel'
-import { api } from './api/client'
-import type { MediaFilter, WsEvent, MergeSuggestionItem, FolderItem, SubfolderItem, RemoveResult } from './api/client'
+import { api, buildProfileWebSocketUrl, setCurrentProfileId } from './api/client'
+import type { MediaFilter, WsEvent, MergeSuggestionItem, FolderItem, SubfolderItem, RemoveResult, ProfileSummary } from './api/client'
 import './index.css'
 
 // ---------------------------------------------------------------------------
@@ -36,6 +36,16 @@ interface FilteredView {
 // ---------------------------------------------------------------------------
 
 export default function App() {
+  const [profiles, setProfiles] = useState<ProfileSummary[]>([])
+  const [selectedProfile, setSelectedProfile] = useState<ProfileSummary | null>(null)
+  const [profilePickerOpen, setProfilePickerOpen] = useState(true)
+  const [profileLoading, setProfileLoading] = useState(true)
+  const [profileError, setProfileError] = useState<string | null>(null)
+  const [newProfileName, setNewProfileName] = useState('')
+  const [copySettingsFromProfileId, setCopySettingsFromProfileId] = useState('')
+  const [creatingProfile, setCreatingProfile] = useState(false)
+  const [profileActionBusy, setProfileActionBusy] = useState(false)
+
   const [section, setSection]       = useState<SidebarSection>('library')
   const [filtered, setFiltered]     = useState<FilteredView | null>(null)
   const [headerSearchQuery, setHeaderSearchQuery] = useState('')
@@ -158,10 +168,110 @@ export default function App() {
   const [mergeSuggestions, setMergeSuggestions] = useState<MergeSuggestionItem[]>([])
   const [mergeWorking,     setMergeWorking]     = useState(false)
 
+  const resetProfileViewState = useCallback(() => {
+    setSection('library')
+    setFiltered(null)
+    setHeaderSearchQuery('')
+    setActiveSearchQuery('')
+    setFolders([])
+    setFolderLoadError(false)
+    setAllPhotosExpanded(false)
+    setFolderWarning(null)
+    setSubfolderMap({})
+    setQualityCount(null)
+    setMergeSuggestions([])
+    setAdminOpen(false)
+  }, [])
+
+  const refreshProfiles = useCallback(async () => {
+    setProfileLoading(true)
+    setProfileError(null)
+    try {
+      const list = await api.profiles.list()
+      setProfiles(list)
+    } catch (e: unknown) {
+      setProfileError(e instanceof Error ? e.message : 'Could not load profiles')
+    } finally {
+      setProfileLoading(false)
+    }
+  }, [])
+
+  const activateProfile = useCallback(async (profileId: string) => {
+    setProfileError(null)
+    try {
+      const active = await api.profiles.select(profileId)
+      setCurrentProfileId(active.id)
+      setSelectedProfile(active)
+      setProfiles(prev => prev.map(profile => ({
+        ...profile,
+        is_active: profile.id === active.id,
+      })))
+      resetProfileViewState()
+      setProfilePickerOpen(false)
+    } catch (e: unknown) {
+      setProfileError(e instanceof Error ? e.message : 'Could not switch profile')
+    }
+  }, [resetProfileViewState])
+
+  const createAndActivateProfile = useCallback(async () => {
+    const name = newProfileName.trim()
+    if (!name) return
+    setCreatingProfile(true)
+    setProfileError(null)
+    try {
+      const created = await api.profiles.create(name, copySettingsFromProfileId || undefined)
+      setProfiles(prev => [...prev, created])
+      setNewProfileName('')
+      setCopySettingsFromProfileId('')
+      await activateProfile(created.id)
+    } catch (e: unknown) {
+      setProfileError(e instanceof Error ? e.message : 'Could not create profile')
+    } finally {
+      setCreatingProfile(false)
+    }
+  }, [activateProfile, copySettingsFromProfileId, newProfileName])
+
+  const renameProfile = useCallback(async (profileId: string, name: string) => {
+    setProfileActionBusy(true)
+    setProfileError(null)
+    try {
+      const updated = await api.profiles.rename(profileId, name)
+      setProfiles(prev => prev.map(profile => profile.id === profileId ? { ...profile, name: updated.name } : profile))
+      setSelectedProfile(prev => prev && prev.id === profileId ? { ...prev, name: updated.name } : prev)
+    } catch (e: unknown) {
+      setProfileError(e instanceof Error ? e.message : 'Could not rename profile')
+    } finally {
+      setProfileActionBusy(false)
+    }
+  }, [])
+
+  const deleteProfile = useCallback(async (profileId: string) => {
+    setProfileActionBusy(true)
+    setProfileError(null)
+    try {
+      await api.profiles.delete(profileId)
+      const [list, active] = await Promise.all([api.profiles.list(), api.profiles.active()])
+      setProfiles(list)
+      setSelectedProfile(active)
+      setCurrentProfileId(active.id)
+      resetProfileViewState()
+    } catch (e: unknown) {
+      setProfileError(e instanceof Error ? e.message : 'Could not delete profile')
+    } finally {
+      setProfileActionBusy(false)
+    }
+  }, [resetProfileViewState])
+
   useEffect(() => {
+    refreshProfiles()
+  }, [refreshProfiles])
+
+  useEffect(() => {
+    if (!selectedProfile) return
+    const activeProfileId = selectedProfile.id
     loadFolders()
     function connect() {
-      const ws = new WebSocket('ws://localhost:7474/ws/progress')
+      const ws = new WebSocket(buildProfileWebSocketUrl(activeProfileId))
       wsRef.current = ws
       ws.onmessage = (msg) => {
         try {
@@ -189,7 +299,7 @@ export default function App() {
     }
     connect()
     return () => wsRef.current?.close()
-  }, [])
+  }, [loadFolders, selectedProfile])
 
   // Handle merge suggestion: accept (merge) or skip
   const handleMergeAction = useCallback(async (action: 'merge' | 'skip') => {
@@ -246,6 +356,29 @@ export default function App() {
         navigate('library')
       }
     } catch { /* ignore */ }
+  }
+
+  if (profileLoading && !selectedProfile) {
+    return <div className="min-h-screen bg-gray-950 text-gray-100 flex items-center justify-center">Loading profiles…</div>
+  }
+
+  if (!selectedProfile) {
+    return (
+      <ProfilePickerModal
+        profiles={profiles}
+        newProfileName={newProfileName}
+        copySettingsFromProfileId={copySettingsFromProfileId}
+        creatingProfile={creatingProfile}
+        profileActionBusy={profileActionBusy}
+        error={profileError}
+        onProfileNameChange={setNewProfileName}
+        onCopySettingsFromProfileIdChange={setCopySettingsFromProfileId}
+        onSelect={activateProfile}
+        onCreate={createAndActivateProfile}
+        onRename={renameProfile}
+        onDelete={deleteProfile}
+      />
+    )
   }
 
   // ── Main content ──────────────────────────────────────────────────────────
@@ -356,6 +489,13 @@ export default function App() {
       <header className="h-11 border-b border-gray-800 flex items-center px-4 gap-3 shrink-0">
         <span className="font-semibold text-white text-sm tracking-wide">📸 VIP</span>
         <span className="text-gray-600 text-xs">Visual Intelligence Platform</span>
+        <button
+          onClick={() => setProfilePickerOpen(true)}
+          className="ml-2 h-7 rounded-lg border border-gray-700 bg-gray-900 px-2.5 text-[11px] text-gray-200 hover:border-indigo-500 hover:text-white transition-colors"
+          title="Switch profile"
+        >
+          Profile: {selectedProfile.name}
+        </button>
 
         <div className="flex-1 max-w-2xl ml-2">
           <div className="relative">
@@ -472,6 +612,7 @@ export default function App() {
 
         {/* ── Pipeline panel (always mounted, collapsible) ── */}
         <PipelinePanel
+          profileId={selectedProfile.id}
           collapsed={pipelineCollapsed}
           onToggle={togglePipeline}
           onPipelineComplete={loadFolders}
@@ -488,7 +629,7 @@ export default function App() {
         )}
 
         {/* ── Main content ── */}
-        <main className="flex-1 overflow-y-auto p-6">
+        <main key={selectedProfile.id} className="flex-1 overflow-y-auto p-6">
           {mainContent}
         </main>
       </div>
@@ -629,6 +770,174 @@ export default function App() {
             </div>
           )
         })()}
+      </div>
+
+      {profilePickerOpen && (
+        <ProfilePickerModal
+          profiles={profiles}
+          activeProfileId={selectedProfile.id}
+          newProfileName={newProfileName}
+          copySettingsFromProfileId={copySettingsFromProfileId}
+          creatingProfile={creatingProfile}
+          profileActionBusy={profileActionBusy}
+          error={profileError}
+          onProfileNameChange={setNewProfileName}
+          onCopySettingsFromProfileIdChange={setCopySettingsFromProfileId}
+          onSelect={activateProfile}
+          onCreate={createAndActivateProfile}
+          onRename={renameProfile}
+          onDelete={deleteProfile}
+          onClose={() => setProfilePickerOpen(false)}
+        />
+      )}
+    </div>
+  )
+}
+
+function ProfilePickerModal({
+  profiles,
+  activeProfileId,
+  newProfileName,
+  copySettingsFromProfileId,
+  creatingProfile,
+  profileActionBusy,
+  error,
+  onProfileNameChange,
+  onCopySettingsFromProfileIdChange,
+  onSelect,
+  onCreate,
+  onRename,
+  onDelete,
+  onClose,
+}: {
+  profiles: ProfileSummary[]
+  activeProfileId?: string
+  newProfileName: string
+  copySettingsFromProfileId: string
+  creatingProfile: boolean
+  profileActionBusy: boolean
+  error: string | null
+  onProfileNameChange: (value: string) => void
+  onCopySettingsFromProfileIdChange: (value: string) => void
+  onSelect: (profileId: string) => void
+  onCreate: () => void
+  onRename: (profileId: string, name: string) => void
+  onDelete: (profileId: string) => void
+  onClose?: () => void
+}) {
+  function handleRename(profile: ProfileSummary, event: React.MouseEvent) {
+    event.stopPropagation()
+    const nextName = window.prompt('Rename profile', profile.name)?.trim()
+    if (!nextName || nextName === profile.name) return
+    onRename(profile.id, nextName)
+  }
+
+  function handleDelete(profile: ProfileSummary, event: React.MouseEvent) {
+    event.stopPropagation()
+    if (profile.is_default) return
+    const confirmed = window.confirm(
+      `Delete profile "${profile.name}"? This permanently removes all data in that profile.`
+    )
+    if (!confirmed) return
+    onDelete(profile.id)
+  }
+
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+      <div className="w-full max-w-2xl rounded-2xl border border-gray-800 bg-gray-950 shadow-2xl overflow-hidden">
+        <div className="flex items-center justify-between border-b border-gray-800 px-6 py-4">
+          <div>
+            <h2 className="text-lg font-semibold text-white">Choose Profile</h2>
+            <p className="text-sm text-gray-400">Each profile has its own database, thumbnails, people, and write queue.</p>
+          </div>
+          {onClose && (
+            <button
+              onClick={onClose}
+              className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-gray-800"
+            >
+              ✕
+            </button>
+          )}
+        </div>
+
+        <div className="p-6 grid gap-6 md:grid-cols-[1.2fr_0.8fr]">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-widest text-gray-500 mb-3">Existing profiles</p>
+            <div className="space-y-2 max-h-80 overflow-y-auto">
+              {profiles.map(profile => (
+                <button
+                  key={profile.id}
+                  onClick={() => onSelect(profile.id)}
+                  disabled={profileActionBusy}
+                  className={`w-full rounded-xl border px-4 py-3 text-left transition-colors ${
+                    activeProfileId === profile.id
+                      ? 'border-indigo-500 bg-indigo-500/10'
+                      : 'border-gray-800 bg-gray-900 hover:border-gray-700'
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <span className="font-medium text-white">{profile.name}</span>
+                    <div className="flex items-center gap-2 text-[10px] uppercase tracking-wider text-gray-500 shrink-0">
+                      {profile.is_default && <span>Default</span>}
+                      {activeProfileId === profile.id && <span className="text-indigo-300">Active</span>}
+                    </div>
+                  </div>
+                  <div className="mt-2 flex items-center gap-2">
+                    <button
+                      onClick={(e) => handleRename(profile, e)}
+                      disabled={profileActionBusy}
+                      className="rounded-md border border-gray-700 px-2 py-1 text-[11px] text-gray-300 hover:bg-gray-800 disabled:opacity-40"
+                    >
+                      Rename
+                    </button>
+                    {!profile.is_default && (
+                      <button
+                        onClick={(e) => handleDelete(profile, e)}
+                        disabled={profileActionBusy}
+                        className="rounded-md border border-red-800 px-2 py-1 text-[11px] text-red-300 hover:bg-red-900/30 disabled:opacity-40"
+                      >
+                        Delete
+                      </button>
+                    )}
+                  </div>
+                  <p className="mt-1 text-xs text-gray-500">Created {new Date(profile.created_at).toLocaleString()}</p>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-widest text-gray-500 mb-3">Create new profile</p>
+            <div className="rounded-xl border border-gray-800 bg-gray-900 p-4 space-y-3">
+              <input
+                value={newProfileName}
+                onChange={e => onProfileNameChange(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') onCreate() }}
+                placeholder="e.g. Family Archive"
+                className="w-full rounded-lg border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-white outline-none focus:border-indigo-500"
+              />
+              <select
+                value={copySettingsFromProfileId}
+                onChange={e => onCopySettingsFromProfileIdChange(e.target.value)}
+                className="w-full rounded-lg border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-white outline-none focus:border-indigo-500"
+              >
+                <option value="">Start with default settings</option>
+                {profiles.map(profile => (
+                  <option key={profile.id} value={profile.id}>{profile.name}</option>
+                ))}
+              </select>
+              <button
+                onClick={onCreate}
+                disabled={creatingProfile || profileActionBusy || !newProfileName.trim()}
+                className="w-full rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500 disabled:opacity-40"
+              >
+                {creatingProfile ? 'Creating…' : 'Create and open'}
+              </button>
+              <p className="text-xs text-gray-500">A new profile starts empty unless you copy admin settings from an existing profile.</p>
+              {error && <p className="text-xs text-red-400">{error}</p>}
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   )

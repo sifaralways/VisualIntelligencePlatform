@@ -7,10 +7,11 @@
  */
 
 import { useEffect, useRef, useState } from 'react'
-import { api } from '../api/client'
+import { api, buildProfileWebSocketUrl } from '../api/client'
 import type { WsEvent } from '../api/client'
 
 interface Props {
+  profileId: string
   collapsed: boolean
   onToggle: () => void
   /** Called whenever a pipeline completes so App can refresh folder list */
@@ -19,7 +20,7 @@ interface Props {
   width?: number
 }
 
-export default function PipelinePanel({ collapsed, onToggle, onPipelineComplete, width }: Props) {
+export default function PipelinePanel({ profileId, collapsed, onToggle, onPipelineComplete, width }: Props) {
   const [folder, setFolder]       = useState('')
   const [status, setStatus]       = useState<string>('idle')
   const [events, setEvents]       = useState<WsEvent[]>([])
@@ -33,7 +34,7 @@ export default function PipelinePanel({ collapsed, onToggle, onPipelineComplete,
 
     function connect() {
       if (cancelled) return
-      const ws = new WebSocket('ws://localhost:7474/ws/progress')
+      const ws = new WebSocket(buildProfileWebSocketUrl(profileId))
       wsRef.current = ws
 
       ws.onmessage = (msg) => {
@@ -59,7 +60,7 @@ export default function PipelinePanel({ collapsed, onToggle, onPipelineComplete,
       cancelled = true
       wsRef.current?.close()
     }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [profileId, onPipelineComplete])
 
   // Auto-scroll log to bottom whenever events arrive
   useEffect(() => {

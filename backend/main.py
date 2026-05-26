@@ -8,14 +8,15 @@ import warnings
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
 
 from backend.config import settings, ensure_dirs
 from backend.database.db import init_db
-from backend.api.routes import media, persons, faces, search, pipeline, writeback, admin, tags, analysis, settings as settings_route, folders, remote, chat
+from backend.api.routes import media, persons, faces, search, pipeline, writeback, admin, tags, analysis, settings as settings_route, folders, remote, chat, profiles
 from backend.api.websocket import router as ws_router
+from backend.profiles import bootstrap_profiles, get_active_profile, get_profile, reset_current_profile, set_current_profile
 
 
 def _patch_insightface_skimage() -> None:
@@ -157,13 +158,17 @@ _patch_pillow_limits()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown logic."""
-    # Ensure all directories exist
-    ensure_dirs()
-    # Initialise database (creates tables if not exist)
-    await init_db()
-    # Apply the persisted log level now that the DB / settings cache is ready
-    from backend.database.settings_store import get as _get_setting
-    apply_log_level(int(_get_setting('log_level')))
+    active_profile = bootstrap_profiles()
+    token = set_current_profile(active_profile.id)
+    try:
+        ensure_dirs()
+        await init_db()
+        from backend.database.settings_store import get as _get_setting, load_cache
+
+        await load_cache()
+        apply_log_level(int(_get_setting('log_level')))
+    finally:
+        reset_current_profile(token)
     yield
     # Cleanup on shutdown (none required currently)
 
@@ -194,6 +199,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def profile_context_middleware(request: Request, call_next):
+    requested_profile_id = request.headers.get("X-VIP-Profile")
+    profile = get_profile(requested_profile_id) if requested_profile_id else get_active_profile()
+    if requested_profile_id and profile is None:
+        return JSONResponse({"detail": f"Unknown profile: {requested_profile_id}"}, status_code=404)
+
+    token = set_current_profile(profile.id)
+    request.state.profile_id = profile.id
+    try:
+        return await call_next(request)
+    finally:
+        reset_current_profile(token)
+
 # ---------------------------------------------------------------------------
 # Routers
 # ---------------------------------------------------------------------------
@@ -204,6 +224,7 @@ app.include_router(persons.router,  prefix="/api/persons",  tags=["persons"])
 app.include_router(faces.router,    prefix="/api/faces",    tags=["faces"])
 app.include_router(search.router,   prefix="/api/search",   tags=["search"])
 app.include_router(chat.router,     prefix="/api/chat",     tags=["chat"])
+app.include_router(profiles.router, prefix="/api/profiles", tags=["profiles"])
 app.include_router(writeback.router, prefix="/api/writeback", tags=["writeback"])
 app.include_router(admin.router,    prefix="/api/admin",    tags=["admin"])
 app.include_router(tags.router,      prefix="/api/tags",      tags=["tags"])
@@ -212,16 +233,6 @@ app.include_router(settings_route.router, prefix="/api/settings", tags=["setting
 app.include_router(remote.router,         prefix="/api/remote",   tags=["remote"])
 app.include_router(folders.router,        prefix="/api/folders",  tags=["folders"])
 
-# ---------------------------------------------------------------------------
-# Static — serve face thumbnails and previews
-# ---------------------------------------------------------------------------
-app.mount(
-    "/thumbnails",
-    StaticFiles(directory=str(settings.thumbnail_dir)),
-    name="thumbnails",
-)
-
-
 @app.get("/api/health", tags=["system"])
 async def health() -> dict:
     return {
@@ -229,3 +240,12 @@ async def health() -> dict:
         "app": settings.app_name,
         "version": settings.version,
     }
+
+
+@app.get("/thumbnails/{filename:path}", tags=["system"])
+async def legacy_thumbnail(filename: str):
+    safe_name = Path(filename).name
+    path = settings.thumbnail_dir / safe_name
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Thumbnail not found")
+    return FileResponse(path, media_type="image/jpeg")

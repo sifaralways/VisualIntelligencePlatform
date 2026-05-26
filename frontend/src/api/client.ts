@@ -3,10 +3,38 @@
  */
 
 const BASE = '/api'
+const PROFILE_STORAGE_KEY = 'vip_profile_id'
+
+export function getCurrentProfileId(): string {
+  if (typeof window === 'undefined') return ''
+  return localStorage.getItem(PROFILE_STORAGE_KEY) ?? ''
+}
+
+export function setCurrentProfileId(profileId: string | null): void {
+  if (typeof window === 'undefined') return
+  if (profileId) localStorage.setItem(PROFILE_STORAGE_KEY, profileId)
+  else localStorage.removeItem(PROFILE_STORAGE_KEY)
+}
+
+function buildHeaders(headers?: HeadersInit): Headers {
+  const merged = new Headers(headers ?? undefined)
+  if (!merged.has('Content-Type')) merged.set('Content-Type', 'application/json')
+  const profileId = getCurrentProfileId()
+  if (profileId) merged.set('X-VIP-Profile', profileId)
+  return merged
+}
+
+export function buildProfileWebSocketUrl(profileId?: string): string {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const url = new URL(`${protocol}//${window.location.host}/ws/progress`)
+  const resolvedProfileId = profileId || getCurrentProfileId()
+  if (resolvedProfileId) url.searchParams.set('profile_id', resolvedProfileId)
+  return url.toString()
+}
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
+    headers: buildHeaders(options?.headers),
     ...options,
   })
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`)
@@ -15,6 +43,32 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 
 // ─── Pipeline ────────────────────────────────────────────────────────────────
 export const api = {
+  profiles: {
+    list: () => request<ProfileSummary[]>('/profiles'),
+    active: () => request<ProfileSummary>('/profiles/active'),
+    create: (name: string, copySettingsFromProfileId?: string) =>
+      request<ProfileSummary>('/profiles', {
+        method: 'POST',
+        body: JSON.stringify({
+          name,
+          copy_settings_from_profile_id: copySettingsFromProfileId ?? null,
+        }),
+      }),
+    select: (profileId: string) =>
+      request<ProfileSummary>(`/profiles/${encodeURIComponent(profileId)}/select`, {
+        method: 'POST',
+      }),
+    rename: (profileId: string, name: string) =>
+      request<ProfileSummary>(`/profiles/${encodeURIComponent(profileId)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ name }),
+      }),
+    delete: (profileId: string) =>
+      request<{ status: string; id: string; name: string }>(`/profiles/${encodeURIComponent(profileId)}`, {
+        method: 'DELETE',
+      }),
+  },
+
   pipeline: {
     scan: (folder: string, forceReprocess = false) =>
       request('/pipeline/scan', {
@@ -96,6 +150,8 @@ export const api = {
   clusters: {
     unnamed: () => request<Cluster[]>('/persons/unnamed'),    delete: (clusterId: number) =>
       request(`/persons/clusters/${clusterId}`, { method: 'DELETE' }),
+    similar: (clusterId: number) =>
+      request<SimilarCluster[]>(`/persons/clusters/${clusterId}/similar`),
     ignore: (clusterId: number) =>
       request<{ status: string; cluster_id: number; person_id: number }>(
         `/persons/clusters/${clusterId}/ignore`, { method: 'POST' }
@@ -335,6 +391,15 @@ export interface MediaFilter {
   tag_label?: string
   folder_id?: number
   path_prefix?: string
+}
+
+export interface ProfileSummary {
+  id: string
+  name: string
+  is_default: boolean
+  is_active: boolean
+  created_at: string
+  last_opened_at: string | null
 }
 
 export interface FolderItem {
@@ -644,6 +709,9 @@ export interface AdminStats {
   writeback_queue: number
   thumbnail_files: number
   media_by_state: Record<string, number>
+  geo_by_source: Record<string, number>
+  photos_with_gps: number
+  photos_geo_resolved: number
 }
 
 export interface WritebackItem {

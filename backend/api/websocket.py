@@ -14,33 +14,45 @@ from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from backend.profiles import get_active_profile, get_current_profile_id, get_profile
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # ---------------------------------------------------------------------------
 # Connection registry — multiple browser tabs can connect simultaneously
 # ---------------------------------------------------------------------------
-_connections: list[WebSocket] = []
+_connections: list[tuple[WebSocket, str]] = []
 
 
-async def broadcast(event: str, **kwargs: Any) -> None:
+async def broadcast(event: str, profile_id: str | None = None, **kwargs: Any) -> None:
     """Send a JSON event to all connected WebSocket clients."""
+    target_profile_id = profile_id or get_current_profile_id()
     payload = json.dumps({"event": event, **kwargs})
-    dead = []
-    for ws in _connections:
+    dead: list[tuple[WebSocket, str]] = []
+    for ws, ws_profile_id in _connections:
+        if ws_profile_id != target_profile_id:
+            continue
         try:
             await ws.send_text(payload)
         except Exception:
-            dead.append(ws)
-    for ws in dead:
-        _connections.remove(ws)
+            dead.append((ws, ws_profile_id))
+    for item in dead:
+        if item in _connections:
+            _connections.remove(item)
 
 
 @router.websocket("/ws/progress")
 async def progress_ws(websocket: WebSocket) -> None:
     """WebSocket endpoint — frontend connects here for live pipeline progress."""
+    requested_profile_id = websocket.query_params.get("profile_id")
+    profile = get_profile(requested_profile_id) if requested_profile_id else get_active_profile()
+    if requested_profile_id and profile is None:
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
-    _connections.append(websocket)
+    _connections.append((websocket, profile.id))
     logger.info("WebSocket client connected (%d total)", len(_connections))
 
     async def _ping_loop() -> None:
@@ -57,10 +69,11 @@ async def progress_ws(websocket: WebSocket) -> None:
         # Block here; receive() raises WebSocketDisconnect when the client leaves.
         while True:
             await websocket.receive_text()
-    except (WebSocketDisconnect, Exception):
+    except Exception:
         pass
     finally:
         ping_task.cancel()
-        if websocket in _connections:
-            _connections.remove(websocket)
+        item = (websocket, profile.id)
+        if item in _connections:
+            _connections.remove(item)
         logger.info("WebSocket client disconnected (%d remaining)", len(_connections))

@@ -30,6 +30,15 @@ class FaissIndex:
     def __init__(self) -> None:
         self._index = None
         self._face_ids: list[int] = []   # maps FAISS position → DB face_id
+        self._path: str | None = None
+
+    def _ensure_profile_path(self) -> None:
+        path = str(settings.faiss_path)
+        if self._path == path:
+            return
+        self._index = None
+        self._face_ids = []
+        self._path = path
 
     def build(self, face_ids: list[int], vectors: list[np.ndarray]) -> None:
         """
@@ -40,6 +49,8 @@ class FaissIndex:
             vectors:  512-D float32 unit vectors
         """
         import faiss
+
+        self._ensure_profile_path()
 
         n = len(vectors)
         if n == 0:
@@ -67,6 +78,8 @@ class FaissIndex:
         import faiss
         import pickle
 
+        self._ensure_profile_path()
+
         if self._index is None:
             logger.warning("No index to save")
             return
@@ -85,7 +98,11 @@ class FaissIndex:
         import faiss
         import pickle
 
+        self._ensure_profile_path()
+
         if not settings.faiss_path.exists():
+            self._index = None
+            self._face_ids = []
             logger.info("No FAISS index on disk yet")
             return False
 
@@ -96,8 +113,8 @@ class FaissIndex:
                 self._face_ids = pickle.load(f)
             logger.info("FAISS index loaded: %d vectors", self._index.ntotal)
             return True
-        except Exception as e:
-            logger.error("Failed to load FAISS index: %s", e)
+        except Exception:
+            logger.exception("Failed to load FAISS index")
             return False
 
     def search(
@@ -116,6 +133,8 @@ class FaissIndex:
         if self._index is None or self._index.ntotal == 0:
             return []
 
+        self._ensure_profile_path()
+
         query = query.astype(np.float32).reshape(1, -1)
         similarities, positions = self._index.search(query, k)
 
@@ -130,4 +149,5 @@ class FaissIndex:
 
     @property
     def total(self) -> int:
+        self._ensure_profile_path()
         return self._index.ntotal if self._index else 0
