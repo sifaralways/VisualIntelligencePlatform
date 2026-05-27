@@ -68,6 +68,17 @@ v_photo_tags_flat(media_id, file_path, date_taken, gps_lat, gps_lon, category, l
   -- One row per (photo, tag). category is one of: object, animal, geography, place, scene.
   -- USE FOR: tag/label searches. Example: SELECT DISTINCT media_id FROM v_photo_tags_flat WHERE label LIKE '%sunset%'
 
+v_photo_text_flat(media_id, file_path, date_taken, text_type, text_value, confidence, model)
+  -- One row per Florence text snippet. text_type is one of: caption, ocr, region.
+  -- USE FOR: free-text queries over descriptions, OCR text, and dense region observations.
+  -- Example: SELECT DISTINCT media_id, file_path FROM v_photo_text_flat WHERE text_type='ocr' AND text_value LIKE '%invoice%'
+  -- Example: SELECT DISTINCT media_id FROM v_photo_text_flat WHERE text_type='caption' AND text_value LIKE '%red blanket%'
+
+v_photo_text_agg(media_id, file_path, date_taken, captions, ocr_text, region_text, all_text)
+  -- Per-photo aggregated Florence text for broad phrase matching.
+  -- USE FOR: coarse "contains phrase" queries when text type is not specified.
+  -- Example: SELECT media_id FROM v_photo_text_agg WHERE all_text LIKE '%wardrobe%'
+
 v_photo_persons_agg(media_id, file_path, date_taken, camera_make, camera_model, gps_lat, gps_lon, person_count, person_names)
   -- One row per photo with aggregated person count and comma-joined names.
   -- USE FOR: "Photos with 3+ people", "Group photos", "Photos with both Alice and Bob".
@@ -114,6 +125,7 @@ person_cooccurrence(person_a_id, person_b_id, count, last_seen_at)
 === INTENT SELECTION ===
 
 Use SQL_ONLY when: query is about metadata (who, when, where, camera, tag labels, counts).
+Use SQL_ONLY when: query asks for text seen/read/described in photos (OCR/caption/region).
 Use CLIP_ONLY when: query is purely visual/aesthetic (mood, style, colour, scene content not in tags).
 Use HYBRID when: query combines metadata constraints with visual semantics.
 """.strip()

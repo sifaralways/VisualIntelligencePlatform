@@ -1322,6 +1322,48 @@ async def set_portrait_face(person_id: int, face_id: int):
 # Co-occurrence: "frequently appears with" + connection graph
 # ---------------------------------------------------------------------------
 
+@router.get("/shared-media")
+async def shared_media_for_nodes(
+    node_a_type: str,
+    node_a_id: int,
+    node_b_type: str,
+    node_b_id: int,
+    limit: int = 100,
+):
+    """
+    Return media files where both graph nodes (person or cluster) appear in
+    the same photo.  Used by the Connections graph edge-click shared-photos view.
+
+    node_type ∈ {'person', 'cluster'}
+    """
+    if node_a_type not in ("person", "cluster") or node_b_type not in ("person", "cluster"):
+        raise HTTPException(status_code=400, detail="node_type must be 'person' or 'cluster'")
+    limit = min(max(limit, 1), 500)
+
+    if node_a_type == "person":
+        join_a = "JOIN faces fa ON fa.media_file_id = mf.id AND fa.person_id = ?"
+    else:
+        join_a = "JOIN faces fa ON fa.media_file_id = mf.id AND fa.cluster_id = ? AND fa.person_id IS NULL"
+
+    if node_b_type == "person":
+        join_b = "JOIN faces fb ON fb.media_file_id = mf.id AND fb.person_id = ?"
+    else:
+        join_b = "JOIN faces fb ON fb.media_file_id = mf.id AND fb.cluster_id = ? AND fb.person_id IS NULL"
+
+    sql = f"""
+        SELECT DISTINCT mf.*
+        FROM media_files mf
+        {join_a}
+        {join_b}
+        WHERE mf.removed_from_app = 0
+        ORDER BY mf.date_taken DESC, mf.id DESC
+        LIMIT ?
+    """
+    async with get_db() as db:
+        rows = await db.execute_fetchall(sql, (node_a_id, node_b_id, limit))
+    return [dict(r) for r in rows]
+
+
 @router.get("/{person_id}/connections-graph")
 async def connections_graph(person_id: int, depth: int = 2):
     """

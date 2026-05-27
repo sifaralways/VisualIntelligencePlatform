@@ -22,15 +22,17 @@ _NAME_WORD = r"[A-Za-z]+"
 _POSSESSIVE_NAME = rf"({_NAME_WORD}(?:\s+{_NAME_WORD}){{0,10}})"
 _SQL_AND = " AND "
 _SQL_AGENT_ALLOWED_VIEWS = {
-        "v_photos_active",
-        "v_person_photos",
-        "v_photo_tags_flat",
-        "v_photo_persons_agg",
-        "v_person_cooccurrence_named",
-        "v_photos_with_location",
-        "v_person_photo_count",
-        "v_photos_by_year_month",
-        "v_photo_full_context",
+    "v_photos_active",
+    "v_person_photos",
+    "v_photo_tags_flat",
+    "v_photo_text_flat",
+    "v_photo_text_agg",
+    "v_photo_persons_agg",
+    "v_person_cooccurrence_named",
+    "v_photos_with_location",
+    "v_person_photo_count",
+    "v_photos_by_year_month",
+    "v_photo_full_context",
 }
 _SQL_AGENT_FORBIDDEN = (
         "insert ",
@@ -62,6 +64,8 @@ Hard rules:
     v_photos_active,
     v_person_photos,
     v_photo_tags_flat,
+    v_photo_text_flat,
+    v_photo_text_agg,
     v_photo_persons_agg,
     v_person_cooccurrence_named,
     v_photos_with_location,
@@ -74,17 +78,26 @@ Hard rules:
 - Include media_id when asking for photos.
 - Include ORDER BY for deterministic output.
 - Do not include trailing semicolons.
+- For Florence free-text search (caption/OCR/region), prefer v_photo_text_flat.
+- Filter Florence text by text_type when the user intent is specific (ocr/caption/region).
+- Join text views to person/location views using media_id for combined constraints.
 
 View columns:
 - v_photos_active(media_id, file_path, date_taken, camera_make, camera_model, gps_lat, gps_lon, width, height, file_format, vip_id)
 - v_person_photos(person_id, person_name, media_id, file_path, date_taken, camera_make, camera_model, gps_lat, gps_lon)
 - v_photo_tags_flat(media_id, file_path, date_taken, gps_lat, gps_lon, category, label, confidence, model)
+- v_photo_text_flat(media_id, file_path, date_taken, text_type, text_value, confidence, model)
+- v_photo_text_agg(media_id, file_path, date_taken, captions, ocr_text, region_text, all_text)
 - v_photo_persons_agg(media_id, file_path, date_taken, camera_make, camera_model, gps_lat, gps_lon, person_count, person_names)
 - v_person_cooccurrence_named(person_a, person_b, shared_photo_count, last_seen_at)
 - v_photos_with_location(media_id, file_path, date_taken, gps_lat, gps_lon, place_label, place_category)
 - v_person_photo_count(person_id, name, photo_count)
 - v_photos_by_year_month(media_id, file_path, date_taken, year, month, camera_make, camera_model, gps_lat, gps_lon)
-- v_photo_full_context(media_id, file_path, date_taken, camera_model, persons, objects, places, animals, scenes)
+- v_photo_full_context(media_id, file_path, date_taken, camera_make, camera_model, persons, objects, places, animals, scenes)
+
+Examples:
+- Photos where OCR mentions invoice: SELECT DISTINCT media_id, file_path FROM v_photo_text_flat WHERE text_type = 'ocr' AND LOWER(text_value) LIKE LOWER('%invoice%') ORDER BY date_taken DESC
+- Photos with person + caption phrase: SELECT DISTINCT t.media_id FROM v_photo_text_flat t JOIN v_person_photos p ON p.media_id = t.media_id WHERE LOWER(p.person_name) LIKE LOWER('%alice%') AND t.text_type = 'caption' AND LOWER(t.text_value) LIKE LOWER('%red blanket%') ORDER BY t.media_id DESC
 """.strip()
 _SQL_AGENT_REPAIR_PROMPT = """
 You repair SQLite SELECT queries for VIP analytics.
@@ -1523,6 +1536,61 @@ def _metadata_category_weight(category: str) -> float:
     return 0.8
 
 
+def _scale_branch_scores(scores: dict[int, float], multiplier: float) -> dict[int, float]:
+    if multiplier == 1.0:
+        return scores
+    return {media_id: (score * multiplier) for media_id, score in scores.items()}
+
+
+def _is_text_heavy_query(message: str) -> bool:
+    text = (message or "").lower()
+    if not text:
+        return False
+    text_cues = (
+        "ocr",
+        "text",
+        "caption",
+        "description",
+        "described",
+        "says",
+        "written",
+        "read",
+        "reads",
+        "contains",
+        "phrase",
+        "word",
+        "sentence",
+        "invoice",
+        "receipt",
+        "sign",
+        "board",
+        "poster",
+        "document",
+        "license",
+        "plate",
+    )
+    return any(cue in text for cue in text_cues)
+
+
+def _broker_branch_multipliers(message: str) -> dict[str, float]:
+    # Default balance works well for mixed multimodal queries.
+    multipliers = {
+        "natural_search": 1.0,
+        "metadata_text": 1.0,
+        "face_lookup": 1.0,
+        "ocr_lookup": 1.0,
+    }
+
+    # Text-heavy intent: prioritize Florence-derived text channels.
+    if _is_text_heavy_query(message):
+        multipliers["natural_search"] = 0.8
+        multipliers["face_lookup"] = 0.9
+        multipliers["metadata_text"] = 1.35
+        multipliers["ocr_lookup"] = 1.65
+
+    return multipliers
+
+
 def _normalize_broker_branches(raw_branches: Any) -> list[str]:
     candidates = (
         raw_branches
@@ -1589,7 +1657,9 @@ def _build_broker_tasks(
 
 def _merge_broker_results(
     gathered: dict[str, Any],
+    branch_multipliers: dict[str, float] | None = None,
 ) -> tuple[dict[int, float], set[int], list[str], list[str]]:
+    branch_multipliers = branch_multipliers or {}
     fused_scores: dict[int, float] = {}
     source_hits: dict[int, list[str]] = {}
     sql_matched_ids: set[int] = set()
@@ -1599,6 +1669,10 @@ def _merge_broker_results(
     natural = gathered.get("natural_search")
     if isinstance(natural, dict):
         natural_scores, natural_ids, natural_explanations = _natural_branch_score_map(natural)
+        natural_scores = _scale_branch_scores(
+            natural_scores,
+            float(branch_multipliers.get("natural_search", 1.0)),
+        )
         sql_matched_ids.update(natural_ids)
         _accumulate_branch_scores(fused_scores, natural_scores, source_hits, "natural_search")
         explanations.extend(natural_explanations)
@@ -1606,16 +1680,28 @@ def _merge_broker_results(
     metadata = gathered.get("metadata_text")
     if isinstance(metadata, tuple):
         _, metadata_scores = metadata
+        metadata_scores = _scale_branch_scores(
+            metadata_scores,
+            float(branch_multipliers.get("metadata_text", 1.0)),
+        )
         _accumulate_branch_scores(fused_scores, metadata_scores, source_hits, "metadata_text")
 
     face = gathered.get("face_lookup")
     if isinstance(face, tuple):
         _, face_scores, resolved_people = face
+        face_scores = _scale_branch_scores(
+            face_scores,
+            float(branch_multipliers.get("face_lookup", 1.0)),
+        )
         _accumulate_branch_scores(fused_scores, face_scores, source_hits, "face_lookup")
 
     ocr = gathered.get("ocr_lookup")
     if isinstance(ocr, tuple):
         _, ocr_scores = ocr
+        ocr_scores = _scale_branch_scores(
+            ocr_scores,
+            float(branch_multipliers.get("ocr_lookup", 1.0)),
+        )
         _accumulate_branch_scores(fused_scores, ocr_scores, source_hits, "ocr_lookup")
 
     ranked_ids = sorted(
@@ -1650,7 +1736,11 @@ async def tool_retrieval_broker(ctx: ToolContext, params: dict[str, Any]) -> Too
     branch_names = list(tasks)
     branch_results = await asyncio.gather(*(tasks[name] for name in branch_names))
     gathered = dict(zip(branch_names, branch_results, strict=False))
-    ranked_ids, sql_matched_ids, resolved_people, explanations = _merge_broker_results(gathered)
+    branch_multipliers = _broker_branch_multipliers(message)
+    ranked_ids, sql_matched_ids, resolved_people, explanations = _merge_broker_results(
+        gathered,
+        branch_multipliers=branch_multipliers,
+    )
     ranked_ids = ranked_ids[:ctx.limit]
 
     if not ranked_ids:
@@ -1671,6 +1761,10 @@ async def tool_retrieval_broker(ctx: ToolContext, params: dict[str, Any]) -> Too
     if explanations:
         explanation_parts.append(explanations[0])
     explanation_parts.append(f"Broker branches: {', '.join(branch_order)}")
+    if _is_text_heavy_query(message):
+        explanation_parts.append(
+            "Adaptive weighting: boosted metadata_text/ocr_lookup for text-centric query"
+        )
     payload = {
         "reply_text": reply_text,
         "results": results,

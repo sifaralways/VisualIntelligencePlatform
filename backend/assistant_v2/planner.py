@@ -64,8 +64,10 @@ Rules:
 - If required params are missing from user query, still pick the best tool and leave missing fields empty.
 - Prefer deterministic tools over legacy fallback when a deterministic tool clearly matches.
 - Prefer retrieval_broker for open-ended multimodal retrieval where captions, OCR, face matches, metadata text, and CLIP similarity may all help.
+- Prefer retrieval_broker for open-ended multimodal retrieval where captions, OCR, dense region text, face matches, metadata text, and CLIP similarity may all help.
 - Use natural_search for open-ended visual queries only when retrieval_broker is unnecessary.
 - Use sql_agent for open-ended analytical/database questions (top/most/least/breakdown/compare/trend/count by group) that are not explicit direct photo-opening commands.
+- For text-centric analytical prompts (for example OCR phrase frequency, caption keyword counts, region-text filters by person/place), prefer sql_agent.
 - For prompts like "top people by photo count" or "top locations where X appears", prefer sql_agent unless a dedicated deterministic tool exactly fits.
 - For prompts like "who was with <person/pronoun> in <location> [in <year>]", prefer list_people_with_person_in_location.
 - For prompts like "where is <person> typically found" or "where has <person> been", prefer list_locations.

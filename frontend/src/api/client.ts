@@ -244,6 +244,10 @@ export const api = {
       request<FrequentlyWithEntry[]>(`/persons/${personId}/frequently-with?limit=${limit}`),
     connectionsGraph: (personId: number, depth = 2) =>
       request<ConnectionGraph>(`/persons/${personId}/connections-graph?depth=${depth}`),
+    sharedMedia: (nodeAType: 'person' | 'cluster', nodeAId: number, nodeBType: 'person' | 'cluster', nodeBId: number, limit = 200) => {
+      const q = new URLSearchParams({ node_a_type: nodeAType, node_a_id: String(nodeAId), node_b_type: nodeBType, node_b_id: String(nodeBId), limit: String(limit) })
+      return request<MediaFile[]>(`/persons/shared-media?${q}`)
+    },
     setPortrait: (personId: number, faceId: number) =>
       request<{ status: string; person_id: number; portrait_face_id: number }>(
         `/persons/${personId}/set-portrait/${faceId}`, { method: 'POST' }
