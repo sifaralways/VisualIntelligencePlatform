@@ -7,6 +7,7 @@ import importlib.metadata
 import logging
 import logging.handlers
 import os
+import re
 import subprocess
 import sys
 import time
@@ -14,8 +15,12 @@ import warnings
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from packaging.requirements import Requirement
-from packaging.version import Version
+try:
+    from packaging.requirements import Requirement
+    from packaging.version import Version
+except ModuleNotFoundError:  # pragma: no cover
+    Requirement = None  # type: ignore[assignment]
+    Version = None  # type: ignore[assignment]
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _REQUIREMENTS_PATH = _REPO_ROOT / "requirements.txt"
@@ -25,6 +30,23 @@ _BOOTSTRAP_LOCK_PATH = _REPO_ROOT / ".vip-deps-bootstrap.lock"
 def _read_unsatisfied_requirements() -> list[str]:
     if not _REQUIREMENTS_PATH.exists():
         return []
+
+    # Fallback path for environments that don't yet have the "packaging" module.
+    # We still detect missing top-level packages so bootstrap can recover.
+    if Requirement is None or Version is None:
+        unsatisfied: list[str] = []
+        for raw_line in _REQUIREMENTS_PATH.read_text(encoding="utf-8").splitlines():
+            requirement = raw_line.split("#", 1)[0].strip()
+            if not requirement:
+                continue
+            name = re.split(r"[<>=!~;\[]", requirement, maxsplit=1)[0].strip()
+            if not name:
+                continue
+            try:
+                importlib.metadata.version(name)
+            except importlib.metadata.PackageNotFoundError:
+                unsatisfied.append(name)
+        return unsatisfied
 
     unsatisfied: list[str] = []
     for raw_line in _REQUIREMENTS_PATH.read_text(encoding="utf-8").splitlines():

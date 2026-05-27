@@ -19,6 +19,8 @@ interface Props {
 }
 
 export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
+  const REVIEW_PAGE_SIZE = 60
+
   const [clusters, setClusters] = useState<Cluster[]>([])
   const [persons, setPersons] = useState<Person[]>([])
   const [loading, setLoading] = useState(true)
@@ -41,6 +43,10 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   const [reviewPerson, setReviewPerson] = useState<Person | null>(null)
   const [reviewFaces, setReviewFaces] = useState<FaceRow[]>([])
   const [reviewLoading, setReviewLoading] = useState(false)
+  const [reviewPage, setReviewPage] = useState(0)
+  const [reviewHasMore, setReviewHasMore] = useState(false)
+  const [reviewSortBy, setReviewSortBy] = useState<'detection_conf' | 'date_taken' | 'id'>('detection_conf')
+  const [reviewSortDir, setReviewSortDir] = useState<'asc' | 'desc'>('desc')
   const [reviewPortraitFaceId, setReviewPortraitFaceId] = useState<number | null>(null)
   const [settingPortrait, setSettingPortrait] = useState<number | null>(null)
   const [confirmUnname, setConfirmUnname] = useState(false)
@@ -505,17 +511,34 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     }
   }, [activeTab])
 
+  async function loadReviewPage(personId: number, page: number) {
+    setReviewLoading(true)
+    try {
+      const offset = page * REVIEW_PAGE_SIZE
+      const faces = await api.faces.byPerson(personId, REVIEW_PAGE_SIZE, offset, reviewSortBy, reviewSortDir)
+      setReviewFaces(faces)
+      setReviewPage(page)
+      setReviewHasMore(faces.length === REVIEW_PAGE_SIZE)
+    } finally {
+      setReviewLoading(false)
+    }
+  }
+
   async function openReview(person: Person) {
     setReviewPerson(person)
     setReviewFaces([])
+    setReviewPage(0)
+    setReviewHasMore(false)
+    setReviewSortBy('detection_conf')
+    setReviewSortDir('desc')
     setReviewPortraitFaceId(null)
     setConfirmUnname(false)
     setReviewLoading(true)
     try {
-      const faces = await api.faces.byPerson(person.id)
+      const faces = await api.faces.byPerson(person.id, REVIEW_PAGE_SIZE, 0, 'detection_conf', 'desc')
       setReviewFaces(faces)
-      // Determine current portrait face id from representative thumbnail path
-      // No dedicated field returned yet — we'll track it locally via setPortrait calls
+      setReviewPage(0)
+      setReviewHasMore(faces.length === REVIEW_PAGE_SIZE)
     } finally {
       setReviewLoading(false)
     }
@@ -904,7 +927,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
       {/* Face review panel */}
       {reviewPerson && (
         <div className="fixed inset-0 bg-black/70 flex items-start justify-center z-50 overflow-y-auto py-10">
-          <div className="bg-gray-900 rounded-xl p-6 w-full max-w-2xl shadow-xl mx-4">
+          <div className="bg-gray-900 rounded-xl p-6 w-full max-w-2xl shadow-xl mx-4 max-h-[88vh] flex flex-col">
             <div className="flex items-center justify-between mb-4">
               <div>
                 <h2 className="text-white font-semibold text-lg">{reviewPerson.name}</h2>
@@ -944,60 +967,126 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
                   className="text-gray-400 hover:text-white text-xl leading-none px-2">✕</button>
               </div>
             </div>
-            {reviewLoading
-              ? <p className="text-gray-400 text-sm">Loading…</p>
-              : reviewFaces.length === 0
-                ? <p className="text-gray-500 text-sm">No faces assigned.</p>
-                : (
-                  <div className="grid grid-cols-4 sm:grid-cols-6 gap-3">
-                    {reviewFaces.map(f => {
-                      const url = f.thumbnail_path
-                        ? '/thumbnails/' + f.thumbnail_path.split('/thumbnails/').pop()
-                        : null
-                      const isPortrait = reviewPortraitFaceId === f.id
-                      const isSetting = settingPortrait === f.id
-                      return (
-                        <div key={f.id} className="relative group">
-                          <div className={`w-16 h-16 rounded-lg overflow-hidden bg-gray-800 ${
-                            isPortrait ? 'ring-2 ring-yellow-400' : ''
-                          }`}>
-                            {url
-                              ? <img src={url} alt="face" className="w-full h-full object-cover" />
-                              : <span className="flex items-center justify-center h-full text-gray-600 text-xl">?</span>}
-                          </div>
-                          {/* Remove button */}
-                          <button
-                            onClick={() => ejectFace(f.id)}
-                            title="Remove — not this person"
-                            className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-red-600 hover:bg-red-500 text-white rounded-full text-xs leading-none flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
-                            ✕
-                          </button>
-                          {/* Portrait / primary button */}
-                          {!isPortrait && (
+            <div className="flex items-center justify-between mb-3 text-xs">
+              <span className="text-gray-500">
+                Page {reviewPage + 1} · {reviewFaces.length} face{reviewFaces.length !== 1 ? 's' : ''}
+              </span>
+              <div className="flex items-center gap-2">
+                <select
+                  value={reviewSortBy}
+                  onChange={async (e) => {
+                    if (!reviewPerson) return
+                    const nextSort = e.target.value as 'detection_conf' | 'date_taken' | 'id'
+                    setReviewSortBy(nextSort)
+                    setReviewPage(0)
+                    setReviewLoading(true)
+                    try {
+                      const faces = await api.faces.byPerson(reviewPerson.id, REVIEW_PAGE_SIZE, 0, nextSort, reviewSortDir)
+                      setReviewFaces(faces)
+                      setReviewHasMore(faces.length === REVIEW_PAGE_SIZE)
+                    } finally {
+                      setReviewLoading(false)
+                    }
+                  }}
+                  className="bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-gray-200"
+                >
+                  <option value="detection_conf">Confidence</option>
+                  <option value="date_taken">Date</option>
+                  <option value="id">Added</option>
+                </select>
+                <button
+                  onClick={async () => {
+                    if (!reviewPerson) return
+                    const nextDir: 'asc' | 'desc' = reviewSortDir === 'desc' ? 'asc' : 'desc'
+                    setReviewSortDir(nextDir)
+                    setReviewPage(0)
+                    setReviewLoading(true)
+                    try {
+                      const faces = await api.faces.byPerson(reviewPerson.id, REVIEW_PAGE_SIZE, 0, reviewSortBy, nextDir)
+                      setReviewFaces(faces)
+                      setReviewHasMore(faces.length === REVIEW_PAGE_SIZE)
+                    } finally {
+                      setReviewLoading(false)
+                    }
+                  }}
+                  title={reviewSortDir === 'desc' ? 'Descending' : 'Ascending'}
+                  disabled={reviewLoading}
+                  className="px-2.5 py-1 rounded-md border border-gray-700 text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed hover:border-gray-500 transition-colors"
+                >
+                  {reviewSortDir === 'desc' ? '↓' : '↑'}
+                </button>
+                <button
+                  onClick={() => reviewPerson && loadReviewPage(reviewPerson.id, Math.max(0, reviewPage - 1))}
+                  disabled={reviewLoading || reviewPage === 0}
+                  className="px-2.5 py-1 rounded-md border border-gray-700 text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed hover:border-gray-500 transition-colors"
+                >
+                  Prev
+                </button>
+                <button
+                  onClick={() => reviewPerson && loadReviewPage(reviewPerson.id, reviewPage + 1)}
+                  disabled={reviewLoading || !reviewHasMore}
+                  className="px-2.5 py-1 rounded-md border border-gray-700 text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed hover:border-gray-500 transition-colors"
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+            <div className="overflow-y-auto pr-1">
+              {reviewLoading
+                ? <p className="text-gray-400 text-sm">Loading…</p>
+                : reviewFaces.length === 0
+                  ? <p className="text-gray-500 text-sm">No faces assigned.</p>
+                  : (
+                    <div className="grid grid-cols-4 sm:grid-cols-6 gap-3">
+                      {reviewFaces.map(f => {
+                        const url = f.thumbnail_path
+                          ? '/thumbnails/' + f.thumbnail_path.split('/thumbnails/').pop()
+                          : null
+                        const isPortrait = reviewPortraitFaceId === f.id
+                        const isSetting = settingPortrait === f.id
+                        return (
+                          <div key={f.id} className="relative group">
+                            <div className={`w-16 h-16 rounded-lg overflow-hidden bg-gray-800 ${
+                              isPortrait ? 'ring-2 ring-yellow-400' : ''
+                            }`}>
+                              {url
+                                ? <img src={url} alt="face" className="w-full h-full object-cover" />
+                                : <span className="flex items-center justify-center h-full text-gray-600 text-xl">?</span>}
+                            </div>
+                            {/* Remove button */}
                             <button
-                              onClick={() => setPortraitFace(f.id)}
-                              disabled={!!settingPortrait}
-                              title="Set as primary thumbnail"
-                              className="absolute -top-1.5 -left-1.5 w-5 h-5 bg-gray-700 hover:bg-yellow-500 disabled:opacity-40 text-yellow-300 hover:text-white rounded-full text-xs leading-none flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
-                              {isSetting ? '…' : '★'}
+                              onClick={() => ejectFace(f.id)}
+                              title="Remove — not this person"
+                              className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-red-600 hover:bg-red-500 text-white rounded-full text-xs leading-none flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                              ✕
                             </button>
-                          )}
-                          {isPortrait && (
-                            <span
-                              title="Current primary thumbnail"
-                              className="absolute -top-1.5 -left-1.5 w-5 h-5 bg-yellow-500 text-white rounded-full text-xs leading-none flex items-center justify-center">
-                              ★
-                            </span>
-                          )}
-                          <p className="text-gray-500 text-[10px] mt-0.5 text-center truncate">
-                            {(f.detection_conf * 100).toFixed(0)}%
-                          </p>
-                        </div>
-                      )
-                    })}
-                  </div>
-                )
-            }
+                            {/* Portrait / primary button */}
+                            {!isPortrait && (
+                              <button
+                                onClick={() => setPortraitFace(f.id)}
+                                disabled={!!settingPortrait}
+                                title="Set as primary thumbnail"
+                                className="absolute -top-1.5 -left-1.5 w-5 h-5 bg-gray-700 hover:bg-yellow-500 disabled:opacity-40 text-yellow-300 hover:text-white rounded-full text-xs leading-none flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                                {isSetting ? '…' : '★'}
+                              </button>
+                            )}
+                            {isPortrait && (
+                              <span
+                                title="Current primary thumbnail"
+                                className="absolute -top-1.5 -left-1.5 w-5 h-5 bg-yellow-500 text-white rounded-full text-xs leading-none flex items-center justify-center">
+                                ★
+                              </span>
+                            )}
+                            <p className="text-gray-500 text-[10px] mt-0.5 text-center truncate">
+                              {(f.detection_conf * 100).toFixed(0)}%
+                            </p>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )
+              }
+            </div>
           </div>
         </div>
       )}

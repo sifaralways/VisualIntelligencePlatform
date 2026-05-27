@@ -1869,19 +1869,48 @@ async def _sync_photo_count(db, person_id: int) -> None:
 
 
 @router.get("/{person_id}/faces")
-async def get_person_faces(person_id: int, limit: int = 60):
+async def get_person_faces(
+    person_id: int,
+    limit: int | None = None,
+    offset: int = 0,
+    sort_by: str = "detection_conf",
+    sort_dir: str = "desc",
+):
     """All face thumbnails assigned to a person, for review / false-positive removal."""
+    offset = max(0, int(offset or 0))
+    sort_col = {
+        "detection_conf": "f.detection_conf",
+        "date_taken": "mf.date_taken",
+        "id": "f.id",
+    }.get((sort_by or "").lower(), "f.detection_conf")
+    sort_direction = "ASC" if (sort_dir or "").lower() == "asc" else "DESC"
+
+    order_sql = f"ORDER BY {sort_col} {sort_direction}, f.id DESC"
+
     async with get_db() as db:
-        rows = await db.execute_fetchall("""
-            SELECT f.id, f.thumbnail_path, f.detection_conf,
-                   f.media_file_id, mf.file_path, mf.date_taken
-            FROM faces f
-            JOIN media_files mf ON mf.id = f.media_file_id
-            JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
-            JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
-            JOIN persons p ON p.person_guid = cpc.person_guid
-            WHERE p.id = ?
-            ORDER BY f.detection_conf DESC
-            LIMIT ?
-        """, (person_id, limit))
+        if limit is not None and limit > 0:
+            rows = await db.execute_fetchall(f"""
+                SELECT f.id, f.thumbnail_path, f.detection_conf,
+                       f.media_file_id, mf.file_path, mf.date_taken
+                FROM faces f
+                JOIN media_files mf ON mf.id = f.media_file_id
+                JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                JOIN persons p ON p.person_guid = cpc.person_guid
+                WHERE p.id = ?
+                {order_sql}
+                LIMIT ? OFFSET ?
+            """, (person_id, limit, offset))
+        else:
+            rows = await db.execute_fetchall(f"""
+                SELECT f.id, f.thumbnail_path, f.detection_conf,
+                       f.media_file_id, mf.file_path, mf.date_taken
+                FROM faces f
+                JOIN media_files mf ON mf.id = f.media_file_id
+                JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                JOIN persons p ON p.person_guid = cpc.person_guid
+                WHERE p.id = ?
+                {order_sql}
+            """, (person_id,))
     return [dict(r) for r in rows]

@@ -265,7 +265,21 @@ export const api = {
   // ─── Faces ────────────────────────────────────────────────────────────────
   faces: {
     byCluster: (clusterId: number) => request<FaceRow[]>(`/faces/cluster/${clusterId}`),
-    byPerson: (personId: number) => request<FaceRow[]>(`/persons/${personId}/faces`),
+    byPerson: (
+      personId: number,
+      limit?: number,
+      offset?: number,
+      sortBy: 'detection_conf' | 'date_taken' | 'id' = 'detection_conf',
+      sortDir: 'asc' | 'desc' = 'desc',
+    ) => {
+      const q = new URLSearchParams()
+      if (limit != null) q.set('limit', String(limit))
+      if (offset != null) q.set('offset', String(offset))
+      q.set('sort_by', sortBy)
+      q.set('sort_dir', sortDir)
+      const qs = q.toString()
+      return request<FaceRow[]>(`/persons/${personId}/faces${qs ? `?${qs}` : ''}`)
+    },
     byMedia: (mediaId: number, includeIgnored = false) =>
       request<FaceRow[]>(`/faces/media/${mediaId}${includeIgnored ? '?include_ignored=true' : ''}`),
     removeFromCluster: (faceId: number) =>
