@@ -428,7 +428,7 @@ export default function App() {
   }
 
   if (profileLoading && !selectedProfile) {
-    return <div className="min-h-screen bg-gray-950 text-gray-100 flex items-center justify-center">Loading profiles…</div>
+    return <div className="h-screen overflow-hidden bg-gray-950 text-gray-100 flex items-center justify-center">Loading profiles…</div>
   }
 
   if (!selectedProfile) {
@@ -599,7 +599,7 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-950 text-gray-100 flex flex-col">
+    <div className="h-screen overflow-hidden bg-gray-950 text-gray-100 flex flex-col">
       {/* ── Top bar ── */}
       <header className="h-11 border-b border-gray-800 flex items-center px-4 gap-3 shrink-0">
         <span className="font-semibold text-white text-sm tracking-wide">📸 VIP</span>
@@ -641,11 +641,11 @@ export default function App() {
         </button>
       </header>
 
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex flex-1 min-h-0 overflow-hidden">
         {/* ── Nav sidebar ── */}
         <aside
           style={{ width: sidebarWidth }}
-          className="shrink-0 border-r border-gray-800 py-3 flex flex-col gap-1 overflow-y-auto bg-gray-950"
+          className="shrink-0 min-h-0 border-r border-gray-800 py-3 flex flex-col gap-1 overflow-y-auto bg-gray-950"
         >
           <NavGroup label="Browse">
             <NavItem id="assistant" icon="💬" label="Assistant"    active={section === 'assistant' && !filtered} onClick={() => navigate('assistant')} />
@@ -745,7 +745,7 @@ export default function App() {
         )}
 
         {/* ── Main content ── */}
-        <main key={selectedProfile.id} className="flex-1 overflow-y-auto p-6">
+        <main key={selectedProfile.id} className="flex-1 min-h-0 overflow-y-auto p-6">
           {mainContent}
         </main>
       </div>

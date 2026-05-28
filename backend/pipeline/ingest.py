@@ -40,6 +40,9 @@ from backend.ml.florence_analyzer import FlorenceAnalyzer
 from backend.ml.tagger import Tagger
 from backend.api.websocket import broadcast
 from backend.database import settings_store
+from backend.pipeline.control import wait_if_paused
+from backend.pipeline.runtime_state import set_phase
+from backend.profiles import get_current_profile_id
 
 try:
     from PIL import Image as _PILImage
@@ -57,6 +60,11 @@ _clip_index = ClipFaissIndex()
 _tagger = Tagger()
 _florence = FlorenceAnalyzer()
 _models_loaded = False
+
+
+async def _pause_point() -> None:
+    """Cooperative pause checkpoint for long-running pipeline phases."""
+    await wait_if_paused(get_current_profile_id())
 
 
 def _ensure_models() -> None:
@@ -769,14 +777,20 @@ async def run_ingest(folder: str, use_existing_vip_data: bool = True) -> None:
     # Refresh the in-process settings cache from DB so any tweaks made in
     # the Admin UI take effect on the next pipeline run without a restart.
     await settings_store.load_cache()
+    await _pause_point()
 
     _ensure_models()
+    await _pause_point()
 
     # -- Phase 1: Scan, hash, EXIF -----------------------------------------
+    await set_phase("scan")
     await _phase_scan(folder_path, use_existing_vip_data=use_existing_vip_data)
+    await _pause_point()
 
     # -- Phase 2: Extract previews + detect + embed -------------------------
+    await set_phase("embed")
     await _phase_embed()
+    await _pause_point()
 
     # Notify the frontend if quality issues were found during embed
     async with get_db() as db:
@@ -789,19 +803,29 @@ async def run_ingest(folder: str, use_existing_vip_data: bool = True) -> None:
         await broadcast("quality_issues_found", count=_quality_count)
 
     # -- Phase 3: Cluster ---------------------------------------------------
+    await set_phase("cluster")
     await _phase_cluster()
+    await _pause_point()
 
     # -- Phase 3a-i: Refresh co-occurrence so singleton recovery can use it --
+    await set_phase("cooccurrence")
     await _phase_build_cooccurrence()
+    await _pause_point()
 
     # -- Phase 3a-ii: Singleton recovery — FAISS nearest-neighbour pass ------
+    await set_phase("singleton_recovery")
     await _phase_recover_singletons()
+    await _pause_point()
 
     # -- Phase 3b: Auto-merge high-conf + surface borderline suggestions ----
+    await set_phase("auto_merge")
     await _phase_auto_merge()
+    await _pause_point()
 
     # -- Phase 3b-ii: Rebuild co-occurrence to capture this run's assignments -
+    await set_phase("cooccurrence")
     await _phase_build_cooccurrence()
+    await _pause_point()
 
     # -- Phase 3c: Restore person names from VIP History -------------------
     # When ExifTool has previously written named face regions to a photo,
@@ -811,21 +835,31 @@ async def run_ingest(folder: str, use_existing_vip_data: bool = True) -> None:
     # the stored MWG face regions back to the freshly-detected face clusters
     # by bounding-box centre proximity, then re-assigns person names.
     if use_existing_vip_data:
+        await set_phase("restore_vip_names")
         await _phase_restore_vip_names()
+        await _pause_point()
     else:
         logger.info("Phase 3c skipped: treating imports as new photos (VIP history disabled)")
 
     # -- Phase 4: Core tagging (objects/animals/geography/places/explicit) --
+    await set_phase("tag")
     tagged_ids = await _phase_tag()
+    await _pause_point()
 
     # -- Phase 5: Florence enrichment (caption/OCR/region) ------------------
+    await set_phase("florence")
     await _phase_florence(tagged_ids)
+    await _pause_point()
 
     # -- Phase 4b: Build per-photo CLIP vector index -------------------------
+    await set_phase("clip_index")
     await _phase_clip_index()
+    await _pause_point()
 
     # -- Phase 6: Build analysis documents (Rekognition-format JSON) --------
+    await set_phase("analyse")
     await _phase_analyse()
+    await _pause_point()
 
     # Sync denormalised photo_count on all active persons
     async with get_db() as db:
@@ -844,6 +878,49 @@ async def run_ingest(folder: str, use_existing_vip_data: bool = True) -> None:
 
     await broadcast("pipeline_complete", folder=str(folder_path))
     logger.info("=== Pipeline complete: %s ===", folder_path)
+
+
+async def run_resume_pending() -> None:
+    """Resume pending post-cluster work (tag/florence/clip/analyse) after interruption."""
+    logger.info("=== Resume pending pipeline start ===")
+    await broadcast("pipeline_start", folder="[resume pending]")
+    await settings_store.load_cache()
+    _ensure_models()
+
+    await set_phase("tag")
+    await _pause_point()
+    tagged_now = await _phase_tag()
+
+    async with get_db() as db:
+        pending_rows = await db.execute_fetchall(
+            """
+            SELECT id
+            FROM media_files
+            WHERE is_stub = 0
+              AND removed_from_app = 0
+              AND ingest_state = 'tagged'
+              AND tags_done = 1
+              AND florence_done = 0
+            """
+        )
+    florence_ids = {int(r["id"]) for r in pending_rows}
+    if tagged_now:
+        florence_ids.update(tagged_now)
+
+    await set_phase("florence")
+    await _pause_point()
+    await _phase_florence(florence_ids)
+
+    await set_phase("clip_index")
+    await _pause_point()
+    await _phase_clip_index()
+
+    await set_phase("analyse")
+    await _pause_point()
+    await _phase_analyse()
+
+    await broadcast("pipeline_complete", folder="[resume pending]")
+    logger.info("=== Resume pending pipeline complete ===")
 
 
 # ---------------------------------------------------------------------------
@@ -887,6 +964,7 @@ async def _phase_scan(folder: Path, use_existing_vip_data: bool = True) -> None:
     exif_reader = ExifToolReader()
 
     for batch_start in range(0, total_files, scan_batch_size):
+        await _pause_point()
         batch = all_paths[batch_start : batch_start + scan_batch_size]
 
         # ── 1a + 1b: ExifTool (one subprocess for the whole batch) and ────────
@@ -1066,6 +1144,7 @@ async def _phase_embed(force_ids: set[int] | None = None, media_ids: set[int] | 
     _counter = [0]  # [processed]
 
     async def _process_one(row: aiosqlite.Row) -> None:
+        await _pause_point()
         async with sem:
             media_id = row["id"]
             file_path = row["file_path"]
@@ -2417,7 +2496,9 @@ async def _phase_tag(media_ids: set[int] | None = None) -> set[int]:
     _processed_ids: set[int] = set()
 
     async def _process_batch(batch: list) -> None:
+        await _pause_point()
         async with sem:
+            await _pause_point()
             # Ensure previews exist for every image in the batch.
             preview_paths: list[Path] = []
             for row in batch:
@@ -2490,7 +2571,7 @@ async def _phase_tag(media_ids: set[int] | None = None) -> set[int]:
                 # tags_done = 1 causes this file to be skipped on future
                 # pipeline runs (unless force_retag resets it).
                 await db.executemany(
-                    "UPDATE media_files SET ingest_state='tagged', tags_done=1 WHERE id=?",
+                    "UPDATE media_files SET ingest_state='tagged', tags_done=1, florence_done=0 WHERE id=?",
                     [(mid,) for mid in media_ids],
                 )
 
@@ -2588,8 +2669,10 @@ async def _phase_florence(media_ids: set[int] | None = None) -> set[int]:
     _processed_ids: set[int] = set()
 
     async def _process_batch(batch: list) -> None:
+        await _pause_point()
         wait_started = time.perf_counter()
         async with sem:
+            await _pause_point()
             _wait_seconds[0] += time.perf_counter() - wait_started
 
             preview_paths: list[Path] = []
@@ -2644,6 +2727,11 @@ async def _phase_florence(media_ids: set[int] | None = None) -> set[int]:
                         "INSERT OR REPLACE INTO writeback_queue (media_file_id) VALUES (?)",
                         [(mid,) for mid in changed_ids],
                     )
+
+                await db.executemany(
+                    "UPDATE media_files SET florence_done=1 WHERE id=?",
+                    [(mid,) for mid in batch_media_ids],
+                )
 
             for pp in preview_paths:
                 if pp.exists():

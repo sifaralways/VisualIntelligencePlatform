@@ -121,6 +121,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   const [findSimilarThreshold, setFindSimilarThreshold] = useState(0.85)
   const [findSimilarWorking, setFindSimilarWorking] = useState(false)
   const [findSimilarResult, setFindSimilarResult] = useState<{ autoMerged: number; suggestionsFound: number } | null>(null)
+  const [findSimilarError, setFindSimilarError] = useState<string | null>(null)
   const [bulkSuggestionQueue, setBulkSuggestionQueue] = useState<FindSimilarSuggestion[]>([])
   const [bulkSuggestionWorking, setBulkSuggestionWorking] = useState(false)
 
@@ -128,6 +129,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     setFindSimilarOpen(false)
     setFindSimilarWorking(true)
     setFindSimilarResult(null)
+    setFindSimilarError(null)
     try {
       const result: FindSimilarAllResult = await api.persons.findSimilarAll(findSimilarThreshold)
 
@@ -144,6 +146,9 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
 
       setBulkSuggestionQueue(needsReview)
       setFindSimilarResult({ autoMerged: totalAutoMerged, suggestionsFound: needsReview.length })
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'Find Similar failed'
+      setFindSimilarError(msg)
     } finally {
       setFindSimilarWorking(false)
     }
@@ -1535,6 +1540,13 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
                   : <span>no manual review needed</span>}
               </p>
               <button onClick={() => setFindSimilarResult(null)} className="text-indigo-600 hover:text-indigo-400 text-sm ml-4">✕</button>
+            </div>
+          )}
+
+          {findSimilarError && (
+            <div className="mb-4 flex items-center justify-between rounded-xl bg-red-900/25 border border-red-800 px-4 py-2.5">
+              <p className="text-sm text-red-200">Find Similar failed: {findSimilarError}</p>
+              <button onClick={() => setFindSimilarError(null)} className="text-red-500 hover:text-red-300 text-sm ml-4">✕</button>
             </div>
           )}
 

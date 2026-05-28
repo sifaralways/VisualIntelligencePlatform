@@ -112,6 +112,22 @@ export const api = {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ force_retag: forceRetag }),
       }),
+    pause: () =>
+      request<{ status: string }>('/pipeline/pause', {
+        method: 'POST',
+      }),
+    resume: () =>
+      request<{ status: string }>('/pipeline/resume', {
+        method: 'POST',
+      }),
+    stop: () =>
+      request<{ status: string }>('/pipeline/stop', {
+        method: 'POST',
+      }),
+    resumePending: () =>
+      request<{ status: string }>('/pipeline/resume_pending', {
+        method: 'POST',
+      }),
     rescanFolder: (folderId: number, pathPrefix?: string) =>
       request<{ status: string; folder: string }>('/pipeline/rescan_folder', {
         method: 'POST',
@@ -126,7 +142,16 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ media_ids: mediaIds }),
       }),
-    status: () => request<{ status: string; folder: string | null; error: string | null }>('/pipeline/status'),
+    status: () =>
+      request<{
+        status: string
+        folder: string | null
+        error: string | null
+        resumable?: boolean
+        pending_florence?: number
+        last_phase?: string | null
+        run_kind?: string | null
+      }>('/pipeline/status'),
   },
 
   // ─── Media ────────────────────────────────────────────────────────────────

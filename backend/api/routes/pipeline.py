@@ -11,6 +11,26 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
 from backend.database.db import get_db
+from backend.pipeline.control import (
+    PipelineStopRequested,
+    is_paused,
+    mark_pipeline_finished,
+    mark_pipeline_started,
+    request_pause,
+    request_resume,
+    request_stop,
+)
+from backend.pipeline.runtime_state import (
+    begin_run,
+    get_runtime_state,
+    mark_error,
+    mark_interrupted_resumable,
+    mark_paused,
+    mark_running,
+    mark_stopped_resumable,
+    mark_stopping,
+    mark_succeeded_idle,
+)
 from backend.profiles import get_current_profile_id, run_in_profile
 
 logger = logging.getLogger(__name__)
@@ -71,6 +91,8 @@ async def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
         """, (str(folder),))
 
     pipeline_state.update({"status": "running", "folder": str(folder), "error": None})
+    await begin_run("scan", str(folder), req.use_existing_vip_data)
+    mark_pipeline_started(profile_id)
     background_tasks.add_task(
         run_in_profile,
         profile_id,
@@ -113,6 +135,8 @@ async def rescan_library(req: RescanRequest, background_tasks: BackgroundTasks):
         """)
 
     pipeline_state.update({"status": "running", "folder": "[library reprocess]", "error": None})
+    await begin_run("rescan", "[library reprocess]", None)
+    mark_pipeline_started(profile_id)
     background_tasks.add_task(run_in_profile, profile_id, _run_reprocess, req.force_retag)
     return {"status": "started"}
 
@@ -172,6 +196,8 @@ async def rescan_folder(req: FolderRescanRequest, background_tasks: BackgroundTa
         )
 
     pipeline_state.update({"status": "running", "folder": str(scan_root), "error": None})
+    await begin_run("scan", str(scan_root), None)
+    mark_pipeline_started(profile_id)
     background_tasks.add_task(run_in_profile, profile_id, _run_pipeline, str(scan_root))
     return {"status": "started", "folder": str(scan_root)}
 
@@ -179,7 +205,133 @@ async def rescan_folder(req: FolderRescanRequest, background_tasks: BackgroundTa
 @router.get("/status")
 async def get_status():
     """Current pipeline status."""
-    return _state(get_current_profile_id())
+    profile_id = get_current_profile_id()
+    state = dict(_state(profile_id))
+    runtime = await get_runtime_state()
+
+    # Process restart recovery: DB says running but this process is not.
+    if runtime.get("status") == "running" and state.get("status") != "running":
+        await mark_interrupted_resumable()
+        runtime = await get_runtime_state()
+
+    if state.get("status") == "running":
+        effective_status = "paused" if is_paused(profile_id) else "running"
+    else:
+        effective_status = runtime.get("status") or state.get("status") or "idle"
+
+    pending_florence = 0
+    async with get_db() as db:
+        row = await (await db.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM media_files
+            WHERE is_stub = 0
+              AND removed_from_app = 0
+              AND ingest_state = 'tagged'
+              AND tags_done = 1
+              AND florence_done = 0
+            """
+        )).fetchone()
+    if row:
+        pending_florence = int(row["cnt"])
+
+    resumable = bool(runtime.get("resumable")) or pending_florence > 0
+
+    return {
+        "status": effective_status,
+        "folder": state.get("folder") or runtime.get("folder"),
+        "error": state.get("error") or runtime.get("error"),
+        "resumable": resumable,
+        "pending_florence": pending_florence,
+        "last_phase": runtime.get("last_phase"),
+        "run_kind": runtime.get("run_kind"),
+    }
+
+
+@router.post("/pause")
+async def pause_pipeline():
+    """Request cooperative pipeline pause for the active profile."""
+    profile_id = get_current_profile_id()
+    pipeline_state = _state(profile_id)
+    if pipeline_state["status"] != "running":
+        raise HTTPException(status_code=409, detail="No running pipeline to pause")
+    changed = request_pause(profile_id)
+    if not changed:
+        raise HTTPException(status_code=409, detail="Pipeline already paused")
+    await mark_paused()
+    return {"status": "paused"}
+
+
+@router.post("/resume")
+async def resume_pipeline():
+    """Resume a paused pipeline for the active profile."""
+    profile_id = get_current_profile_id()
+    pipeline_state = _state(profile_id)
+    if pipeline_state["status"] != "running":
+        raise HTTPException(status_code=409, detail="No running pipeline to resume")
+    changed = request_resume(profile_id)
+    if not changed:
+        raise HTTPException(status_code=409, detail="Pipeline is not paused")
+    await mark_running()
+    return {"status": "running"}
+
+
+@router.post("/stop")
+async def stop_pipeline():
+    """Request cooperative pipeline stop that preserves resumable state."""
+    profile_id = get_current_profile_id()
+    pipeline_state = _state(profile_id)
+    if pipeline_state["status"] != "running":
+        raise HTTPException(status_code=409, detail="No running pipeline to stop")
+    changed = request_stop(profile_id)
+    if not changed:
+        raise HTTPException(status_code=409, detail="Pipeline stop already requested")
+    await mark_stopping()
+    return {"status": "stopping"}
+
+
+@router.post("/resume_pending")
+async def resume_pending_pipeline(background_tasks: BackgroundTasks):
+    """Resume pending pipeline work after a stop/restart interruption."""
+    profile_id = get_current_profile_id()
+    pipeline_state = _state(profile_id)
+    if pipeline_state["status"] == "running":
+        raise HTTPException(status_code=409, detail="Pipeline already running")
+
+    runtime = await get_runtime_state()
+
+    pending_florence = 0
+    async with get_db() as db:
+        row = await (await db.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM media_files
+            WHERE is_stub = 0
+              AND removed_from_app = 0
+              AND ingest_state = 'tagged'
+              AND tags_done = 1
+              AND florence_done = 0
+            """
+        )).fetchone()
+    if row:
+        pending_florence = int(row["cnt"])
+
+    if not runtime.get("resumable") and pending_florence <= 0:
+        raise HTTPException(status_code=409, detail="No resumable pipeline work found")
+
+    pipeline_state.update({
+        "status": "running",
+        "folder": runtime.get("folder") or "[resume pending]",
+        "error": None,
+    })
+    await begin_run(
+        runtime.get("run_kind") or "resume_pending",
+        runtime.get("folder"),
+        runtime.get("use_existing_vip_data"),
+    )
+    mark_pipeline_started(profile_id)
+    background_tasks.add_task(run_in_profile, profile_id, _run_resume_pending, runtime)
+    return {"status": "started"}
 
 
 async def _run_pipeline(folder: str, use_existing_vip_data: bool = False) -> None:
@@ -202,6 +354,12 @@ async def _run_pipeline(folder: str, use_existing_vip_data: bool = False) -> Non
                 WHERE folder_path = ?
             """, (folder, folder))
         pipeline_state["status"] = "idle"
+        await mark_succeeded_idle()
+    except PipelineStopRequested:
+        logger.info("Pipeline stop requested (folder=%s)", folder)
+        pipeline_state["status"] = "stopped"
+        pipeline_state["error"] = None
+        await mark_stopped_resumable()
     except Exception as e:
         logger.exception("Pipeline error")
         async with get_db() as db:
@@ -211,18 +369,30 @@ async def _run_pipeline(folder: str, use_existing_vip_data: bool = False) -> Non
             )
         pipeline_state["status"] = "error"
         pipeline_state["error"] = str(e)
+        await mark_error(str(e))
+    finally:
+        mark_pipeline_finished(profile_id)
 
 
 async def _run_reprocess(force_retag: bool = False) -> None:
     from backend.pipeline.ingest import run_reprocess
-    pipeline_state = _state(get_current_profile_id())
+    profile_id = get_current_profile_id()
+    pipeline_state = _state(profile_id)
     try:
         await run_reprocess(force_retag=force_retag)
         pipeline_state["status"] = "idle"
+        await mark_succeeded_idle()
+    except PipelineStopRequested:
+        pipeline_state["status"] = "stopped"
+        pipeline_state["error"] = None
+        await mark_stopped_resumable()
     except Exception as e:
         logger.exception("Reprocess error")
         pipeline_state["status"] = "error"
         pipeline_state["error"] = str(e)
+        await mark_error(str(e))
+    finally:
+        mark_pipeline_finished(profile_id)
 
 
 @router.post("/reprocess/{media_id}")
@@ -245,20 +415,31 @@ async def reprocess_photo(media_id: int, background_tasks: BackgroundTasks):
         "folder": f"[reprocess photo {media_id}]",
         "error": None,
     })
+    await begin_run("reprocess_photo", f"[reprocess photo {media_id}]", None)
+    mark_pipeline_started(profile_id)
     background_tasks.add_task(run_in_profile, profile_id, _run_single_reprocess, media_id)
     return {"status": "started", "media_id": media_id}
 
 
 async def _run_single_reprocess(media_id: int) -> None:
     from backend.pipeline.ingest import run_single_reprocess
-    pipeline_state = _state(get_current_profile_id())
+    profile_id = get_current_profile_id()
+    pipeline_state = _state(profile_id)
     try:
         await run_single_reprocess(media_id)
         pipeline_state["status"] = "idle"
+        await mark_succeeded_idle()
+    except PipelineStopRequested:
+        pipeline_state["status"] = "stopped"
+        pipeline_state["error"] = None
+        await mark_stopped_resumable()
     except Exception as e:
         logger.exception("Single-photo reprocess error for media_id=%d", media_id)
         pipeline_state["status"] = "error"
         pipeline_state["error"] = str(e)
+        await mark_error(str(e))
+    finally:
+        mark_pipeline_finished(profile_id)
 
 
 class BatchReprocessRequest(BaseModel):
@@ -284,20 +465,31 @@ async def reprocess_batch(req: BatchReprocessRequest, background_tasks: Backgrou
 
     label = f"[reprocess {len(req.media_ids)} photo{'s' if len(req.media_ids) != 1 else ''}]"
     pipeline_state.update({"status": "running", "folder": label, "error": None})
+    await begin_run("reprocess_batch", label, None)
+    mark_pipeline_started(profile_id)
     background_tasks.add_task(run_in_profile, profile_id, _run_batch_reprocess, list(req.media_ids))
     return {"status": "started", "count": len(req.media_ids)}
 
 
 async def _run_batch_reprocess(media_ids: list[int]) -> None:
     from backend.pipeline.ingest import run_batch_reprocess
-    pipeline_state = _state(get_current_profile_id())
+    profile_id = get_current_profile_id()
+    pipeline_state = _state(profile_id)
     try:
         await run_batch_reprocess(media_ids)
         pipeline_state["status"] = "idle"
+        await mark_succeeded_idle()
+    except PipelineStopRequested:
+        pipeline_state["status"] = "stopped"
+        pipeline_state["error"] = None
+        await mark_stopped_resumable()
     except Exception as e:
         logger.exception("Batch reprocess error")
         pipeline_state["status"] = "error"
         pipeline_state["error"] = str(e)
+        await mark_error(str(e))
+    finally:
+        mark_pipeline_finished(profile_id)
 
 
 @router.post("/migrate_model")
@@ -315,6 +507,8 @@ async def migrate_model(background_tasks: BackgroundTasks):
         raise HTTPException(status_code=409, detail="Pipeline already running")
 
     pipeline_state.update({"status": "running", "folder": "[model migration]", "error": None})
+    await begin_run("migrate_model", "[model migration]", None)
+    mark_pipeline_started(profile_id)
     background_tasks.add_task(run_in_profile, profile_id, _run_model_migration)
     return {"status": "started"}
 
@@ -328,29 +522,91 @@ async def rebuild_clip_index(background_tasks: BackgroundTasks):
         raise HTTPException(status_code=409, detail="Pipeline already running")
 
     pipeline_state.update({"status": "running", "folder": "[clip index rebuild]", "error": None})
+    await begin_run("rebuild_clip_index", "[clip index rebuild]", None)
+    mark_pipeline_started(profile_id)
     background_tasks.add_task(run_in_profile, profile_id, _run_clip_index_rebuild)
     return {"status": "started"}
 
 
 async def _run_model_migration() -> None:
     from backend.pipeline.ingest import run_model_migration
-    pipeline_state = _state(get_current_profile_id())
+    profile_id = get_current_profile_id()
+    pipeline_state = _state(profile_id)
     try:
         await run_model_migration()
         pipeline_state["status"] = "idle"
+        await mark_succeeded_idle()
+    except PipelineStopRequested:
+        pipeline_state["status"] = "stopped"
+        pipeline_state["error"] = None
+        await mark_stopped_resumable()
     except Exception as e:
         logger.exception("Model migration error")
         pipeline_state["status"] = "error"
         pipeline_state["error"] = str(e)
+        await mark_error(str(e))
+    finally:
+        mark_pipeline_finished(profile_id)
 
 
 async def _run_clip_index_rebuild() -> None:
     from backend.pipeline.ingest import run_clip_index_rebuild
-    pipeline_state = _state(get_current_profile_id())
+    profile_id = get_current_profile_id()
+    pipeline_state = _state(profile_id)
     try:
         await run_clip_index_rebuild()
         pipeline_state["status"] = "idle"
+        await mark_succeeded_idle()
+    except PipelineStopRequested:
+        pipeline_state["status"] = "stopped"
+        pipeline_state["error"] = None
+        await mark_stopped_resumable()
     except Exception as e:
         logger.exception("CLIP index rebuild error")
         pipeline_state["status"] = "error"
         pipeline_state["error"] = str(e)
+        await mark_error(str(e))
+    finally:
+        mark_pipeline_finished(profile_id)
+
+
+async def _run_resume_pending(runtime: dict) -> None:
+    from backend.pipeline.ingest import run_ingest, run_resume_pending
+
+    profile_id = get_current_profile_id()
+    pipeline_state = _state(profile_id)
+    try:
+        run_kind = runtime.get("run_kind")
+        last_phase = runtime.get("last_phase")
+        folder = runtime.get("folder")
+        use_existing = runtime.get("use_existing_vip_data")
+
+        # For earlier phases, rerun full ingest for the known folder.
+        if run_kind == "scan" and folder and last_phase in {
+            None,
+            "init",
+            "scan",
+            "embed",
+            "cluster",
+            "cooccurrence",
+            "singleton_recovery",
+            "auto_merge",
+            "restore_vip_names",
+        }:
+            await run_ingest(folder, use_existing_vip_data=bool(use_existing) if use_existing is not None else True)
+        else:
+            await run_resume_pending()
+
+        pipeline_state["status"] = "idle"
+        await mark_succeeded_idle()
+    except PipelineStopRequested:
+        pipeline_state["status"] = "stopped"
+        pipeline_state["error"] = None
+        await mark_stopped_resumable()
+    except Exception as e:
+        logger.exception("Resume pending error")
+        pipeline_state["status"] = "error"
+        pipeline_state["error"] = str(e)
+        await mark_error(str(e))
+    finally:
+        mark_pipeline_finished(profile_id)

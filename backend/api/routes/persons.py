@@ -565,6 +565,7 @@ class MergeNamedPersonsRequest(BaseModel):
 
 class FindSimilarAllRequest(BaseModel):
     auto_threshold: float = 0.85   # Clusters >= this similarity are merged automatically
+    max_suggestions: int = 500
 
 
 class IgnoreSuggestionRequest(BaseModel):
@@ -2080,13 +2081,15 @@ async def find_similar_all(request: FindSimilarAllRequest):
     A cluster is only auto-merged once (first matching person wins).
     """
     auto_threshold = max(_SUGGEST_THRESHOLD, min(1.0, request.auto_threshold))
+    max_suggestions = max(50, min(5000, int(request.max_suggestions or 500)))
+    max_per_person = max(5, min(100, max_suggestions // 10))
 
     auto_merged: list[dict] = []
     suggestions: list[dict] = []
 
     async with get_db() as db:
         named_persons = await db.execute_fetchall("""
-            SELECT p.id, p.name,
+            SELECT p.id, p.name, p.centroid,
                    (
                        SELECT MIN(f2.thumbnail_path)
                        FROM faces f2
@@ -2101,7 +2104,7 @@ async def find_similar_all(request: FindSimilarAllRequest):
             return {"auto_merged": [], "suggestions": []}
 
         unnamed_clusters = await db.execute_fetchall("""
-            SELECT c.id AS cluster_id, c.member_count, c.intra_similarity, c.is_high_conf,
+            SELECT c.id AS cluster_id, c.member_count, c.intra_similarity, c.is_high_conf, c.centroid,
                    MIN(f.thumbnail_path) AS representative_thumbnail
             FROM clusters c
             JOIN faces f ON f.cluster_id = c.id
@@ -2113,17 +2116,20 @@ async def find_similar_all(request: FindSimilarAllRequest):
         if not unnamed_clusters:
             return {"auto_merged": [], "suggestions": []}
 
-        # Pre-load unnamed cluster embeddings once (avoids N×M round-trips)
+        # Pre-load unnamed cluster centroids once (avoid per-cluster embedding queries)
         cluster_centroids: dict[int, np.ndarray] = {}
         for cluster in unnamed_clusters:
-            cid = cluster["cluster_id"]
-            cand_embs = await db.execute_fetchall("""
-                SELECT e.vector, f.detection_conf, f.bbox_w, f.bbox_h
-                FROM embeddings e
-                JOIN faces f ON f.id = e.face_id
-                WHERE f.cluster_id = ?
-            """, (cid,))
-            c_vec = _weighted_centroid_from_rows(cand_embs)
+            cid = int(cluster["cluster_id"])
+            c_blob = cluster["centroid"]
+            c_vec = _normalise_vector(load_centroid(c_blob)) if c_blob else None
+            if c_vec is None:
+                cand_embs = await db.execute_fetchall("""
+                    SELECT e.vector, f.detection_conf, f.bbox_w, f.bbox_h
+                    FROM embeddings e
+                    JOIN faces f ON f.id = e.face_id
+                    WHERE f.cluster_id = ?
+                """, (cid,))
+                c_vec = _weighted_centroid_from_rows(cand_embs)
             if c_vec is None:
                 continue
             cluster_centroids[cid] = c_vec
@@ -2145,16 +2151,18 @@ async def find_similar_all(request: FindSimilarAllRequest):
             person_name = person["name"]
             person_thumbnail = person["thumbnail"]
 
-            emb_rows = await db.execute_fetchall("""
-                SELECT e.vector, f.detection_conf, f.bbox_w, f.bbox_h
-                FROM embeddings e
-                JOIN faces f ON f.id = e.face_id
-                JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
-                JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
-                JOIN persons p ON p.person_guid = cpc.person_guid
-                WHERE p.id = ?
-            """, (person_id,))
-            p_centroid = _weighted_centroid_from_rows(emb_rows)
+            p_centroid = _normalise_vector(load_centroid(person["centroid"])) if person["centroid"] else None
+            if p_centroid is None:
+                emb_rows = await db.execute_fetchall("""
+                    SELECT e.vector, f.detection_conf, f.bbox_w, f.bbox_h
+                    FROM embeddings e
+                    JOIN faces f ON f.id = e.face_id
+                    JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                    JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                    JOIN persons p ON p.person_guid = cpc.person_guid
+                    WHERE p.id = ?
+                """, (person_id,))
+                p_centroid = _weighted_centroid_from_rows(emb_rows)
             if p_centroid is None:
                 continue
 
@@ -2181,6 +2189,7 @@ async def find_similar_all(request: FindSimilarAllRequest):
                 "SELECT cluster_id FROM rejected_suggestions WHERE person_id = ?", (person_id,)
             )
             rejected_ids = {r["cluster_id"] for r in rejected}
+            person_suggestions: list[dict] = []
 
             for cid, c_vec in cluster_centroids.items():
                 if cid in rejected_ids or cid in already_merged_cluster_ids:
@@ -2192,6 +2201,7 @@ async def find_similar_all(request: FindSimilarAllRequest):
                 competing_id, competing_sim = _best_competing_person(c_vec, competitor_centroids)
                 if competing_id is not None and competing_id in blocked_ids and competing_sim is not None and competing_sim >= _SUGGEST_THRESHOLD:
                     continue
+                margin = float("inf") if competing_sim is None else (sim - competing_sim)
 
                 if sim >= auto_threshold:
                     co_clusters = await _load_cooccurring_unnamed_clusters_for_cluster(db, int(cid))
@@ -2226,8 +2236,8 @@ async def find_similar_all(request: FindSimilarAllRequest):
                         "member_count": cluster["member_count"],
                     })
 
-                elif sim >= _SUGGEST_THRESHOLD:
-                    suggestions.append({
+                elif sim >= _SUGGEST_THRESHOLD and margin >= _SUGGEST_MIN_MARGIN:
+                    person_suggestions.append({
                         "person_id": person_id,
                         "person_name": person_name,
                         "person_thumbnail": person_thumbnail,
@@ -2239,10 +2249,17 @@ async def find_similar_all(request: FindSimilarAllRequest):
                         "similarity": round(sim, 3),
                         "competing_person_id": competing_id,
                         "competing_similarity": round(competing_sim, 3) if competing_sim is not None else None,
+                        "margin": round(margin, 3) if np.isfinite(margin) else None,
                     })
 
+            if person_suggestions:
+                person_suggestions.sort(key=lambda x: x["similarity"], reverse=True)
+                suggestions.extend(person_suggestions[:max_per_person])
+                if len(suggestions) >= max_suggestions:
+                    break
+
     suggestions.sort(key=lambda x: x["similarity"], reverse=True)
-    return {"auto_merged": auto_merged, "suggestions": suggestions}
+    return {"auto_merged": auto_merged, "suggestions": suggestions[:max_suggestions]}
 
 
 @router.post("/{person_id}/reject-suggestion/{cluster_id}")

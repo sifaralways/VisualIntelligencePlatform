@@ -23,11 +23,24 @@ interface Props {
 export default function PipelinePanel({ profileId, collapsed, onToggle, onPipelineComplete, width }: Props) {
   const [folder, setFolder]       = useState('')
   const [status, setStatus]       = useState<string>('idle')
+  const [statusError, setStatusError] = useState<string | null>(null)
+  const [resumable, setResumable] = useState(false)
+  const [pendingFlorence, setPendingFlorence] = useState(0)
+  const [lastPhase, setLastPhase] = useState<string | null>(null)
   const [events, setEvents]       = useState<WsEvent[]>([])
   const [forceRetag, setForceRetag] = useState(false)
   const [useExistingVipData, setUseExistingVipData] = useState(false)
+  const [pauseBusy, setPauseBusy] = useState(false)
+  const [resumeBusy, setResumeBusy] = useState(false)
+  const [stopBusy, setStopBusy] = useState(false)
+  const [resumePendingBusy, setResumePendingBusy] = useState(false)
   const wsRef  = useRef<WebSocket | null>(null)
   const logRef = useRef<HTMLDivElement>(null)
+
+  const isRunning = status === 'running'
+  const isPaused = status === 'paused'
+  const isStopping = status === 'stopping'
+  const isBusy = isRunning || isPaused || isStopping
 
   // ── WebSocket — persistent, auto-reconnecting ─────────────────────────────
   useEffect(() => {
@@ -62,6 +75,33 @@ export default function PipelinePanel({ profileId, collapsed, onToggle, onPipeli
       wsRef.current?.close()
     }
   }, [profileId, onPipelineComplete])
+
+  useEffect(() => {
+    let alive = true
+    let timer: number | undefined
+
+    async function tick() {
+      try {
+        const s = await api.pipeline.status()
+        if (!alive) return
+        setStatus(s.status)
+        setResumable(Boolean(s.resumable))
+        setPendingFlorence(Number(s.pending_florence ?? 0))
+        setLastPhase(s.last_phase ?? null)
+        setStatusError(null)
+      } catch {
+        if (!alive) return
+        setStatusError('status-unavailable')
+      }
+      timer = window.setTimeout(tick, 1500)
+    }
+
+    tick()
+    return () => {
+      alive = false
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [profileId])
 
   // Auto-scroll log to bottom whenever events arrive
   useEffect(() => {
@@ -109,12 +149,64 @@ export default function PipelinePanel({ profileId, collapsed, onToggle, onPipeli
     }
   }
 
-  const isRunning = status === 'running'
+  async function pausePipeline() {
+    setPauseBusy(true)
+    try {
+      await api.pipeline.pause()
+      setStatus('paused')
+    } catch {
+      // status poll will reconcile
+    } finally {
+      setPauseBusy(false)
+    }
+  }
+
+  async function stopPipeline() {
+    setStopBusy(true)
+    try {
+      await api.pipeline.stop()
+      setStatus('stopping')
+    } catch {
+      // status poll will reconcile
+    } finally {
+      setStopBusy(false)
+    }
+  }
+
+  async function resumePendingPipeline() {
+    setResumePendingBusy(true)
+    try {
+      await api.pipeline.resumePending()
+      setEvents([])
+      setStatus('running')
+      setResumable(false)
+    } catch {
+      // status poll will reconcile
+    } finally {
+      setResumePendingBusy(false)
+    }
+  }
+
+  async function resumePipeline() {
+    if (!isPaused) {
+      await resumePendingPipeline()
+      return
+    }
+    setResumeBusy(true)
+    try {
+      await api.pipeline.resume()
+      setStatus('running')
+    } catch {
+      // status poll will reconcile
+    } finally {
+      setResumeBusy(false)
+    }
+  }
 
   // ── Collapsed strip ───────────────────────────────────────────────────────
   if (collapsed) {
     return (
-      <div className="w-8 shrink-0 border-r border-gray-800 bg-gray-950 flex flex-col items-center py-3 gap-3">
+      <div className="w-8 shrink-0 min-h-0 border-r border-gray-800 bg-gray-950 flex flex-col items-center py-3 gap-3">
         <button
           onClick={onToggle}
           title="Expand pipeline panel"
@@ -122,7 +214,7 @@ export default function PipelinePanel({ profileId, collapsed, onToggle, onPipeli
         >
           ▶
         </button>
-        {isRunning && (
+        {isBusy && (
           <span className="w-2 h-2 rounded-full bg-yellow-400 animate-pulse" title="Pipeline running" />
         )}
       </div>
@@ -133,7 +225,7 @@ export default function PipelinePanel({ profileId, collapsed, onToggle, onPipeli
   return (
     <div
       style={{ width: width ?? 288 }}
-      className="shrink-0 border-r border-gray-800 bg-gray-950 flex flex-col overflow-hidden"
+      className="shrink-0 min-h-0 border-r border-gray-800 bg-gray-950 flex flex-col overflow-hidden"
     >
       {/* Header row */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-gray-800 shrink-0">
@@ -141,6 +233,8 @@ export default function PipelinePanel({ profileId, collapsed, onToggle, onPipeli
           <span className="text-xs font-semibold text-gray-300 uppercase tracking-wider">⚙️ Pipeline</span>
           <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
             isRunning        ? 'bg-yellow-600 text-white' :
+            isPaused         ? 'bg-amber-600 text-white' :
+            isStopping       ? 'bg-orange-700 text-white' :
             status === 'error' ? 'bg-red-700 text-white' :
                                  'bg-gray-800 text-gray-500'
           }`}>
@@ -177,14 +271,14 @@ export default function PipelinePanel({ profileId, collapsed, onToggle, onPipeli
         <div className="flex gap-1.5">
           <button
             onClick={startScan}
-            disabled={isRunning || !folder.trim()}
+            disabled={isBusy || !folder.trim()}
             className="flex-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white text-xs font-medium rounded-lg px-2 py-1.5 transition-colors"
           >
-            {isRunning ? 'Running…' : 'Scan'}
+            {isBusy ? 'Running…' : 'Scan'}
           </button>
           <button
             onClick={rescanAll}
-            disabled={isRunning}
+            disabled={isBusy}
             className="flex-1 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-white text-xs font-medium rounded-lg px-2 py-1.5 transition-colors"
             title="Re-run all pipeline phases on every photo already in the library"
           >
@@ -192,9 +286,37 @@ export default function PipelinePanel({ profileId, collapsed, onToggle, onPipeli
           </button>
         </div>
 
+        <div className="flex gap-1.5">
+          <button
+            onClick={pausePipeline}
+            disabled={!isRunning || pauseBusy || resumeBusy || stopBusy || statusError != null}
+            className="flex-1 bg-amber-700 hover:bg-amber-600 disabled:opacity-40 text-white text-xs font-medium rounded-lg px-2 py-1.5 transition-colors"
+            title="Pause the current pipeline at the next safe checkpoint"
+          >
+            {pauseBusy ? 'Pausing…' : 'Pause'}
+          </button>
+          <button
+            onClick={resumePipeline}
+            disabled={(!isPaused && !resumable) || pauseBusy || resumeBusy || stopBusy || resumePendingBusy || statusError != null}
+            className="flex-1 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-40 text-white text-xs font-medium rounded-lg px-2 py-1.5 transition-colors"
+            title={isPaused ? 'Resume a paused pipeline' : 'Resume pending pipeline work after interruption'}
+          >
+            {(resumeBusy || resumePendingBusy) ? 'Resuming…' : (isPaused ? 'Resume' : 'Resume Pending')}
+          </button>
+        </div>
+
+        <button
+          onClick={stopPipeline}
+          disabled={!isRunning || pauseBusy || resumeBusy || stopBusy || statusError != null}
+          className="w-full bg-red-700 hover:bg-red-600 disabled:opacity-40 text-white text-xs font-medium rounded-lg px-2 py-1.5 transition-colors"
+          title="Safely stop the current run at the next checkpoint"
+        >
+          {stopBusy || isStopping ? 'Stopping…' : 'Stop Safely'}
+        </button>
+
         <button
           onClick={migrateModel}
-          disabled={isRunning}
+          disabled={isBusy}
           className="w-full bg-orange-800 hover:bg-orange-700 disabled:opacity-40 text-white text-xs font-medium rounded-lg px-2 py-1.5 transition-colors"
           title="Re-embed all named faces with the current model and re-cluster unnamed faces"
         >
@@ -216,6 +338,16 @@ export default function PipelinePanel({ profileId, collapsed, onToggle, onPipeli
         {forceRetag && (
           <p className="text-[10px] text-amber-400 leading-snug">
             ⚠ Re-runs object, animal and place detection on every photo — this will take significantly longer.
+          </p>
+        )}
+        {statusError && (
+          <p className="text-[10px] text-red-400 leading-snug">
+            Could not fetch pipeline status; pause/resume controls temporarily disabled.
+          </p>
+        )}
+        {!statusError && resumable && !isBusy && (
+          <p className="text-[10px] text-cyan-300 leading-snug">
+            Resumable work detected{pendingFlorence > 0 ? ` (${pendingFlorence.toLocaleString()} Florence items pending)` : ''}{lastPhase ? ` (last phase: ${lastPhase})` : ''}.
           </p>
         )}
       </div>
