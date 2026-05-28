@@ -4,7 +4,7 @@ import json
 import math
 import uuid
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from fastapi.responses import Response
 from pathlib import Path
 
@@ -410,12 +410,14 @@ async def remove_face_from_cluster(face_id: int):
 
 
 @router.delete("/{face_id}/from-person")
-async def remove_face_from_person(face_id: int):
+async def remove_face_from_person(face_id: int, background_tasks: BackgroundTasks):
     """
     Remove a face from its person assignment (false positive correction).
     The face is detached from person + cluster so it re-enters the unassigned pool.
     The media file is re-queued for writeback so the person is removed from EXIF.
     """
+    person_id_for_refresh = None
+
     async with get_db() as db:
         # Find what person this face belongs to (for writeback re-queue)
         row = await (
@@ -456,10 +458,20 @@ async def remove_face_from_person(face_id: int):
         # Without this the stored centroid stays stale and future similarity
         # comparisons remain biased toward the ejected face.
         if row["person_id"]:
+            person_id_for_refresh = int(row["person_id"])
             await update_person_centroid(db, row["person_id"])
 
         # Place the face in a new 1-member cluster so it immediately reappears
         # in the unnamed-faces list rather than being lost until re-clustering.
         await _requeue_as_singleton(db, face_id)
+
+    if person_id_for_refresh is not None:
+        # Re-score/sync in background so correction effects are visible quickly.
+        from backend.api.routes.persons import _rescore_after_person_update, _update_cooccurrence_for_person
+        from backend.profiles import get_current_profile_id, run_in_profile
+
+        profile_id = get_current_profile_id()
+        background_tasks.add_task(run_in_profile, profile_id, _rescore_after_person_update, person_id_for_refresh)
+        background_tasks.add_task(run_in_profile, profile_id, _update_cooccurrence_for_person, person_id_for_refresh)
 
     return {"status": "removed", "face_id": face_id}

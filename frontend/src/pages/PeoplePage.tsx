@@ -8,8 +8,9 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api/client'
-import type { Cluster, Person, MergeSuggestion, FaceRow, SimilarCluster, MergePersonsResult, FindSimilarSuggestion, FindSimilarAllResult, IgnoredPerson, IgnoreSuggestion } from '../api/client'
+import type { Cluster, Person, MergeSuggestion, FaceRow, SimilarCluster, MergePersonsResult, FindSimilarSuggestion, FindSimilarAllResult, IgnoredPerson, IgnoreSuggestion, MediaFile } from '../api/client'
 import ConnectionsGraph from '../components/ConnectionsGraph'
+import PhotoDetail from '../components/PhotoDetail'
 
 interface Props {
   /** Called when user clicks a named person tile to view their photos. */
@@ -49,6 +50,11 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   const [reviewSortDir, setReviewSortDir] = useState<'asc' | 'desc'>('desc')
   const [reviewPortraitFaceId, setReviewPortraitFaceId] = useState<number | null>(null)
   const [settingPortrait, setSettingPortrait] = useState<number | null>(null)
+  const [reviewFocusFaceId, setReviewFocusFaceId] = useState<number | null>(null)
+  const [reviewFocusFaceClusterId, setReviewFocusFaceClusterId] = useState<number | null>(null)
+  const [reviewFocusPhotos, setReviewFocusPhotos] = useState<MediaFile[]>([])
+  const [reviewFocusPhotosLoading, setReviewFocusPhotosLoading] = useState(false)
+  const [reviewFocusPhotoIndex, setReviewFocusPhotoIndex] = useState<number | null>(null)
   const [confirmUnname, setConfirmUnname] = useState(false)
   const [unnaming, setUnnaming] = useState(false)
 
@@ -148,9 +154,14 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     if (!current) return
     setBulkSuggestionWorking(true)
     try {
+      const merged = clusters.find(c => c.id === current.cluster_id)
       await api.persons.addCluster(current.person_id, current.cluster_id)
+      applyAcceptedSuggestionLocally(current.person_id, {
+        id: current.cluster_id,
+        member_count: merged?.member_count ?? current.member_count,
+        representative_thumbnail: merged?.representative_thumbnail ?? current.representative_thumbnail,
+      })
       setBulkSuggestionQueue(q => q.slice(1))
-      await load()
     } finally { setBulkSuggestionWorking(false) }
   }
 
@@ -164,6 +175,21 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     } finally { setBulkSuggestionWorking(false) }
   }
 
+  function applyAcceptedSuggestionLocally(personId: number, mergedCluster: { id: number; member_count: number; representative_thumbnail: string | null } | null) {
+    if (!mergedCluster) return
+
+    setClusters(prev => prev.filter(c => c.id !== mergedCluster.id))
+
+    setPersons(prev => prev.map(p => {
+      if (p.id !== personId) return p
+      return {
+        ...p,
+        photo_count: p.photo_count + Math.max(0, mergedCluster.member_count || 0),
+        representative_thumbnail: p.representative_thumbnail || mergedCluster.representative_thumbnail,
+      }
+    }))
+  }
+
   async function fetchNextSuggestion(personId: number) {
     try {
       // eslint-disable-next-line no-constant-condition
@@ -174,7 +200,12 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
         if (s.is_high_conf === 1) {
           // auto-merge silently — don't ask the user
           await api.persons.addCluster(personId, s.cluster_id)
-          await load()
+          const merged = clusters.find(c => c.id === s.cluster_id)
+          applyAcceptedSuggestionLocally(personId, {
+            id: s.cluster_id,
+            member_count: merged?.member_count ?? s.member_count,
+            representative_thumbnail: merged?.representative_thumbnail ?? s.representative_thumbnail,
+          })
           // loop: fetch next suggestion (the merged cluster is now excluded)
         } else {
           setSuggestion(s)
@@ -196,8 +227,13 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     if (!suggestionPersonId || !suggestion) return
     setSuggestionBusy(true)
     try {
+      const merged = clusters.find(c => c.id === suggestion.cluster_id)
       await api.persons.addCluster(suggestionPersonId, suggestion.cluster_id)
-      await load()
+      applyAcceptedSuggestionLocally(suggestionPersonId, {
+        id: suggestion.cluster_id,
+        member_count: merged?.member_count ?? suggestion.member_count,
+        representative_thumbnail: merged?.representative_thumbnail ?? suggestion.representative_thumbnail,
+      })
       await fetchNextSuggestion(suggestionPersonId)
     } finally { setSuggestionBusy(false) }
   }
@@ -532,6 +568,10 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     setReviewSortBy('detection_conf')
     setReviewSortDir('desc')
     setReviewPortraitFaceId(null)
+    setReviewFocusFaceId(null)
+    setReviewFocusFaceClusterId(null)
+    setReviewFocusPhotos([])
+    setReviewFocusPhotoIndex(null)
     setConfirmUnname(false)
     setReviewLoading(true)
     try {
@@ -560,7 +600,34 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   async function ejectFace(faceId: number) {
     await api.faces.removeFromPerson(faceId)
     setReviewFaces(f => f.filter(x => x.id !== faceId))
+    if (reviewFocusFaceId === faceId) {
+      setReviewFocusFaceId(null)
+      setReviewFocusFaceClusterId(null)
+      setReviewFocusPhotos([])
+      setReviewFocusPhotoIndex(null)
+    }
     load() // refresh counts
+  }
+
+  async function previewFacePhotos(face: FaceRow) {
+    setReviewFocusFaceId(face.id)
+    setReviewFocusFaceClusterId(face.cluster_id ?? null)
+    setReviewFocusPhotos([])
+    setReviewFocusPhotoIndex(null)
+    setReviewFocusPhotosLoading(true)
+    try {
+      if (face.cluster_id != null) {
+        const photos = await api.media.list({ cluster_id: face.cluster_id, limit: 80, offset: 0 })
+        setReviewFocusPhotos(photos)
+      } else if (face.media_file_id != null) {
+        const one = await api.media.get(face.media_file_id)
+        setReviewFocusPhotos(one ? [one] : [])
+      } else {
+        setReviewFocusPhotos([])
+      }
+    } finally {
+      setReviewFocusPhotosLoading(false)
+    }
   }
 
   async function handleUnnamePerson() {
@@ -1037,8 +1104,49 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
                 : reviewFaces.length === 0
                   ? <p className="text-gray-500 text-sm">No faces assigned.</p>
                   : (
-                    <div className="grid grid-cols-4 sm:grid-cols-6 gap-3">
-                      {reviewFaces.map(f => {
+                    <>
+                      {(reviewFocusFaceId != null || reviewFocusPhotosLoading) && (
+                        <div className="mb-4 rounded-xl border border-gray-800 bg-gray-950/50 p-3">
+                          <div className="flex items-center justify-between mb-2">
+                            <p className="text-xs text-gray-400">
+                              Photos for selected face
+                              {reviewFocusFaceClusterId != null ? ` · cluster ${reviewFocusFaceClusterId}` : ''}
+                            </p>
+                            <button
+                              onClick={() => {
+                                setReviewFocusFaceId(null)
+                                setReviewFocusFaceClusterId(null)
+                                setReviewFocusPhotos([])
+                                setReviewFocusPhotoIndex(null)
+                              }}
+                              className="text-[11px] text-gray-500 hover:text-gray-300"
+                            >
+                              Clear
+                            </button>
+                          </div>
+                          {reviewFocusPhotosLoading ? (
+                            <p className="text-gray-500 text-xs">Loading photos…</p>
+                          ) : reviewFocusPhotos.length === 0 ? (
+                            <p className="text-gray-500 text-xs">No photos found for this face.</p>
+                          ) : (
+                            <div className="grid grid-cols-3 sm:grid-cols-5 gap-2">
+                              {reviewFocusPhotos.map((m, idx) => (
+                                <button
+                                  key={m.id}
+                                  onClick={() => setReviewFocusPhotoIndex(idx)}
+                                  className="aspect-square rounded-md overflow-hidden bg-gray-800 border border-gray-700 hover:border-indigo-500 transition-colors"
+                                  title="Open photo details"
+                                >
+                                  <img src={api.media.thumbnailUrl(m.id)} alt="photo" className="w-full h-full object-cover" />
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      <div className="grid grid-cols-4 sm:grid-cols-6 gap-3">
+                        {reviewFaces.map(f => {
                         const url = f.thumbnail_path
                           ? '/thumbnails/' + f.thumbnail_path.split('/thumbnails/').pop()
                           : null
@@ -1048,9 +1156,11 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
                           <div key={f.id} className="relative group">
                             <div className={`w-16 h-16 rounded-lg overflow-hidden bg-gray-800 ${
                               isPortrait ? 'ring-2 ring-yellow-400' : ''
+                            } ${
+                              reviewFocusFaceId === f.id ? 'ring-2 ring-indigo-400' : ''
                             }`}>
                               {url
-                                ? <img src={url} alt="face" className="w-full h-full object-cover" />
+                                ? <img src={url} alt="face" className="w-full h-full object-cover cursor-pointer" onClick={() => previewFacePhotos(f)} />
                                 : <span className="flex items-center justify-center h-full text-gray-600 text-xl">?</span>}
                             </div>
                             {/* Remove button */}
@@ -1082,8 +1192,9 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
                             </p>
                           </div>
                         )
-                      })}
-                    </div>
+                        })}
+                      </div>
+                    </>
                   )
               }
             </div>
@@ -1927,6 +2038,23 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
             </div>
           )}
         </section>
+      )}
+
+      {reviewFocusPhotoIndex != null && reviewFocusPhotos[reviewFocusPhotoIndex] && (
+        <PhotoDetail
+          mediaId={reviewFocusPhotos[reviewFocusPhotoIndex].id}
+          filePath={reviewFocusPhotos[reviewFocusPhotoIndex].file_path}
+          canGoPrev={reviewFocusPhotoIndex > 0}
+          canGoNext={reviewFocusPhotoIndex < reviewFocusPhotos.length - 1}
+          onNavigate={(delta: number) => {
+            setReviewFocusPhotoIndex(prev => {
+              if (prev == null) return prev
+              const next = Math.max(0, Math.min(reviewFocusPhotos.length - 1, prev + delta))
+              return next
+            })
+          }}
+          onClose={() => setReviewFocusPhotoIndex(null)}
+        />
       )}
     </div>
   )
