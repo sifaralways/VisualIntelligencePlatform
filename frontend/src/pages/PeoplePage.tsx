@@ -115,6 +115,11 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   const [suggestionPersonId, setSuggestionPersonId] = useState<number | null>(null)
   const [suggestionPersonName, setSuggestionPersonName] = useState<string | null>(null)
   const [suggestionBusy, setSuggestionBusy] = useState(false)
+  // Ref holds the auto-merge threshold active for the current per-person scan.
+  // Using a ref avoids stale-closure issues across async awaits.
+  const activeSuggestionThresholdRef = useRef(Infinity)
+  const [personSimilarDialogOpen, setPersonSimilarDialogOpen] = useState(false)
+  const [personSimilarDialogPerson, setPersonSimilarDialogPerson] = useState<{ id: number; name: string } | null>(null)
 
   // ── Find Similar (bulk scan across all named persons) ─────────────────────
   const [findSimilarOpen, setFindSimilarOpen] = useState(false)
@@ -137,15 +142,30 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
       const highConf  = result.suggestions.filter(s => s.is_high_conf === 1)
       const needsReview = result.suggestions.filter(s => s.is_high_conf !== 1)
 
+      // Deduplicate clusters across persons — a cluster can only go to the
+      // highest-scoring person. Track which cluster_ids are already claimed.
+      const claimedClusterIds = new Set<number>(
+        result.auto_merged.map(m => m.cluster_id)
+      )
+      let autoMergedCount = result.auto_merged.length
       for (const s of highConf) {
-        await api.persons.addCluster(s.person_id, s.cluster_id)
+        if (claimedClusterIds.has(s.cluster_id)) continue
+        try {
+          await api.persons.addCluster(s.person_id, s.cluster_id)
+          claimedClusterIds.add(s.cluster_id)
+          autoMergedCount++
+        } catch {
+          // Cluster was assigned by a concurrent operation — skip silently
+        }
       }
 
-      const totalAutoMerged = result.auto_merged.length + highConf.length
-      if (totalAutoMerged > 0) await load()
+      // Filter manual queue: drop clusters already claimed this run
+      const dedupedReview = needsReview.filter(s => !claimedClusterIds.has(s.cluster_id))
 
-      setBulkSuggestionQueue(needsReview)
-      setFindSimilarResult({ autoMerged: totalAutoMerged, suggestionsFound: needsReview.length })
+      if (autoMergedCount > 0) await load()
+
+      setBulkSuggestionQueue(dedupedReview)
+      setFindSimilarResult({ autoMerged: autoMergedCount, suggestionsFound: dedupedReview.length })
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : 'Find Similar failed'
       setFindSimilarError(msg)
@@ -166,7 +186,17 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
         member_count: merged?.member_count ?? current.member_count,
         representative_thumbnail: merged?.representative_thumbnail ?? current.representative_thumbnail,
       })
-      setBulkSuggestionQueue(q => q.slice(1))
+      // Remove this cluster from the rest of the queue in case it appears again
+      // for a different person (backend returns cross-person suggestions).
+      setBulkSuggestionQueue(q => q.slice(1).filter(s => s.cluster_id !== current.cluster_id))
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : ''
+      if (msg.includes('409')) {
+        // Cluster was already claimed — skip it and continue
+        setBulkSuggestionQueue(q => q.slice(1).filter(s => s.cluster_id !== current.cluster_id))
+      } else {
+        throw e
+      }
     } finally { setBulkSuggestionWorking(false) }
   }
 
@@ -196,21 +226,25 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   }
 
   async function fetchNextSuggestion(personId: number) {
+    const autoThreshold = activeSuggestionThresholdRef.current
     try {
       // eslint-disable-next-line no-constant-condition
       while (true) {
         const list = await api.persons.mergeSuggestions(personId)
         if (list.length === 0) { setSuggestion(null); break }
         const s = list[0]
-        if (s.is_high_conf === 1) {
-          // auto-merge silently — don't ask the user
-          await api.persons.addCluster(personId, s.cluster_id)
-          const merged = clusters.find(c => c.id === s.cluster_id)
-          applyAcceptedSuggestionLocally(personId, {
-            id: s.cluster_id,
-            member_count: merged?.member_count ?? s.member_count,
-            representative_thumbnail: merged?.representative_thumbnail ?? s.representative_thumbnail,
-          })
+        const shouldAutoMerge = s.is_high_conf === 1 || s.similarity >= autoThreshold
+        if (shouldAutoMerge) {
+          // auto-merge silently — high-conf or above user threshold
+          try {
+            await api.persons.addCluster(personId, s.cluster_id)
+            const merged = clusters.find(c => c.id === s.cluster_id)
+            applyAcceptedSuggestionLocally(personId, {
+              id: s.cluster_id,
+              member_count: merged?.member_count ?? s.member_count,
+              representative_thumbnail: merged?.representative_thumbnail ?? s.representative_thumbnail,
+            })
+          } catch { /* already claimed by another person — skip */ }
           // loop: fetch next suggestion (the merged cluster is now excluded)
         } else {
           setSuggestion(s)
@@ -252,10 +286,20 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     } finally { setSuggestionBusy(false) }
   }
 
+  async function handlePersonSimilarConfirm() {
+    if (!personSimilarDialogPerson) return
+    setPersonSimilarDialogOpen(false)
+    activeSuggestionThresholdRef.current = findSimilarThreshold
+    setSuggestionPersonId(personSimilarDialogPerson.id)
+    setSuggestionPersonName(personSimilarDialogPerson.name)
+    await fetchNextSuggestion(personSimilarDialogPerson.id)
+  }
+
   function dismissSuggestions() {
     setSuggestion(null)
     setSuggestionPersonId(null)
     setSuggestionPersonName(null)
+    activeSuggestionThresholdRef.current = Infinity
   }
   // ── Cluster dismiss (delete / always ignore) ──────────────────────────────
   const [dismissTarget, setDismissTarget] = useState<Cluster | null>(null)
@@ -1689,7 +1733,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
                   )}
                   {!namedSelectMode && (
                     <button
-                      onClick={() => startSuggestions(p.id, p.name!)}
+                      onClick={() => { setPersonSimilarDialogPerson({ id: p.id, name: p.name! }); setPersonSimilarDialogOpen(true) }}
                       title="Find similar faces"
                       className="text-xs text-gray-600 hover:text-indigo-400 transition-colors"
                     >
@@ -1854,6 +1898,52 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
             >
               Stop reviewing for now
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Per-person Find Similar threshold dialog ─────────────────────────── */}
+      {personSimilarDialogOpen && personSimilarDialogPerson && (
+        <div className="fixed inset-0 bg-black/75 flex items-center justify-center z-50">
+          <div className="bg-gray-900 border border-gray-700 rounded-2xl p-7 max-w-sm w-full shadow-2xl mx-4">
+            <p className="text-white font-semibold text-lg mb-1">Find Similar — {personSimilarDialogPerson.name}</p>
+            <p className="text-gray-400 text-sm mb-5">
+              Scans all {clusters.length} unnamed cluster{clusters.length !== 1 ? 's' : ''} for faces that may belong to this person.
+            </p>
+
+            <label className="block text-xs text-gray-400 mb-2">
+              Auto-merge threshold
+              <span className="ml-1 text-gray-600">(above this → merged without asking)</span>
+            </label>
+            <div className="flex items-center gap-3 mb-2">
+              <input
+                type="range" min={50} max={99} step={1}
+                value={Math.round(findSimilarThreshold * 100)}
+                onChange={e => setFindSimilarThreshold(Number(e.target.value) / 100)}
+                className="flex-1 accent-indigo-500"
+              />
+              <span className="text-sm text-white font-mono w-10 text-right">
+                {Math.round(findSimilarThreshold * 100)}%
+              </span>
+            </div>
+            <p className="text-xs text-gray-600 mb-6">
+              Matches between 50% and {Math.round(findSimilarThreshold * 100)}% will be shown for manual review.
+            </p>
+
+            <div className="flex gap-3">
+              <button
+                onClick={handlePersonSimilarConfirm}
+                className="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl py-2.5 text-sm font-semibold transition-colors"
+              >
+                Scan now
+              </button>
+              <button
+                onClick={() => setPersonSimilarDialogOpen(false)}
+                className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-xl py-2.5 text-sm font-medium transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
           </div>
         </div>
       )}

@@ -2258,8 +2258,19 @@ async def find_similar_all(request: FindSimilarAllRequest):
                 if len(suggestions) >= max_suggestions:
                     break
 
+    # Deduplicate suggestions: each cluster should appear for at most one person
+    # (the highest-scoring one). Without this the frontend gets 409 when it
+    # tries to assign an already-claimed cluster on a second person's behalf.
     suggestions.sort(key=lambda x: x["similarity"], reverse=True)
-    return {"auto_merged": auto_merged, "suggestions": suggestions[:max_suggestions]}
+    seen_cluster_ids: set[int] = {m["cluster_id"] for m in auto_merged}
+    deduped: list[dict] = []
+    for s in suggestions:
+        if s["cluster_id"] not in seen_cluster_ids:
+            seen_cluster_ids.add(s["cluster_id"])
+            deduped.append(s)
+        if len(deduped) >= max_suggestions:
+            break
+    return {"auto_merged": auto_merged, "suggestions": deduped}
 
 
 @router.post("/{person_id}/reject-suggestion/{cluster_id}")
