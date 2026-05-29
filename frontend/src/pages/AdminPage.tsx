@@ -7,7 +7,14 @@
 
 import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api/client'
-import type { AppSetting, ContactsMatchSuggestion, ContactsMatchStats } from '../api/client'
+import type {
+  AppSetting,
+  ContactsMatchSuggestion,
+  ContactsMatchStats,
+  ManualPilotModel,
+  ManualPilotScope,
+  ManualPilotSummary,
+} from '../api/client'
 import RemoteServersPanel from '../components/RemoteServersPanel'
 
 // ─── Types ─────────────────────────────────────────────────────────────────
@@ -80,7 +87,30 @@ const ACTIONS = [
 ] as const
 
 type Scope = (typeof ACTIONS)[number]['scope']
-type AdminTab = 'overview' | 'settings' | 'ml' | 'remote'
+type AdminTab = 'overview' | 'settings' | 'pilot' | 'ml' | 'remote'
+
+const MANUAL_PILOT_MODELS: Array<{ key: ManualPilotModel; label: string; description: string }> = [
+  {
+    key: 'tag',
+    label: 'Core Tagging',
+    description: 'Objects, animals, geography/place, explicit tags (Phase 4).',
+  },
+  {
+    key: 'florence',
+    label: 'Florence Enrichment',
+    description: 'Caption, OCR, and region tags.',
+  },
+  {
+    key: 'clip_index',
+    label: 'CLIP Photo Index',
+    description: 'Photo embeddings for visual search.',
+  },
+  {
+    key: 'analyse',
+    label: 'Analysis Documents',
+    description: 'Build/rebuild analysis JSON records.',
+  },
+]
 
 type MlCapability = {
   functionLabel: string
@@ -503,6 +533,12 @@ export default function AdminPage() {
   const [settingsMsg, setSettingsMsg] = useState<string | null>(null)
   const [settingsLoading, setSettingsLoading] = useState(true)
   const [settingsError, setSettingsError] = useState<string | null>(null)
+  const [pilotScope, setPilotScope] = useState<ManualPilotScope>('unindexed')
+  const [pilotModels, setPilotModels] = useState<Set<ManualPilotModel>>(new Set(['florence']))
+  const [pilotSummary, setPilotSummary] = useState<ManualPilotSummary | null>(null)
+  const [pilotLoading, setPilotLoading] = useState(false)
+  const [pilotBusy, setPilotBusy] = useState(false)
+  const [pilotMsg, setPilotMsg] = useState<string | null>(null)
 
   async function loadSettings() {
     setSettingsLoading(true)
@@ -589,6 +625,55 @@ export default function AdminPage() {
 
   useEffect(() => { loadStats() }, [])
 
+  async function loadPilotSummary() {
+    setPilotLoading(true)
+    try {
+      const summary = await api.pipeline.manualPilotSummary()
+      setPilotSummary(summary)
+    } catch (e: unknown) {
+      const err = e as { message?: string }
+      setPilotMsg('Error: ' + (err?.message ?? 'Failed to load pilot summary'))
+    } finally {
+      setPilotLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    if (activeTab === 'pilot') void loadPilotSummary()
+  }, [activeTab])
+
+  function togglePilotModel(model: ManualPilotModel) {
+    setPilotModels(prev => {
+      const next = new Set(prev)
+      if (next.has(model)) {
+        next.delete(model)
+      } else {
+        next.add(model)
+      }
+      return next
+    })
+  }
+
+  async function runPilot() {
+    if (pilotModels.size === 0) {
+      setPilotMsg('Select at least one model.')
+      return
+    }
+    setPilotBusy(true)
+    setPilotMsg(null)
+    try {
+      const selected = Array.from(pilotModels)
+      await api.pipeline.manualPilotRun(selected, pilotScope)
+      setPilotMsg(`Started manual pilot: ${selected.join(', ')} on ${pilotScope} data. Monitor progress in Pipeline panel.`)
+      await loadPilotSummary()
+    } catch (e: unknown) {
+      const err = e as { message?: string }
+      setPilotMsg('Error: ' + (err?.message ?? 'Failed to start manual pilot'))
+    } finally {
+      setPilotBusy(false)
+    }
+  }
+
   async function doReset(scope: Scope) {
     setBusy(true)
     setResult(null)
@@ -624,6 +709,7 @@ export default function AdminPage() {
       <div className="flex flex-wrap gap-2 mb-6">
         <TabButton active={activeTab === 'overview'} label="Overview" onClick={() => setActiveTab('overview')} />
         <TabButton active={activeTab === 'settings'} label="Settings" onClick={() => setActiveTab('settings')} />
+        <TabButton active={activeTab === 'pilot'} label="Manual Pilot" onClick={() => setActiveTab('pilot')} />
         <TabButton active={activeTab === 'ml'} label="ML" onClick={() => setActiveTab('ml')} />
         <TabButton active={activeTab === 'remote'} label="Remote" onClick={() => setActiveTab('remote')} />
       </div>
@@ -862,6 +948,93 @@ export default function AdminPage() {
               </div>
             ))}
           </div>
+        </section>
+      )}
+
+      {activeTab === 'pilot' && (
+        <section className="mt-2">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
+                Manual Model Pilot
+              </h2>
+              <p className="text-xs text-gray-600 mt-0.5">
+                Select one or more model stages and run them on all eligible files or only unindexed files.
+              </p>
+            </div>
+            <button
+              onClick={loadPilotSummary}
+              disabled={pilotLoading || pilotBusy}
+              className="text-xs text-indigo-400 hover:text-indigo-300 disabled:opacity-40"
+            >
+              ↻ Refresh counts
+            </button>
+          </div>
+
+          <div className="bg-gray-900 border border-gray-800 rounded-xl px-5 py-4 mb-4">
+            <p className="text-xs text-gray-500 uppercase tracking-wider mb-2">Scope</p>
+            <div className="inline-flex items-center gap-1 bg-gray-800 rounded-lg p-1">
+              <button
+                onClick={() => setPilotScope('unindexed')}
+                className={`px-3 py-1 rounded-md text-xs font-medium transition-colors ${pilotScope === 'unindexed' ? 'bg-indigo-600 text-white' : 'text-gray-400 hover:text-gray-200'}`}
+              >
+                Unindexed only
+              </button>
+              <button
+                onClick={() => setPilotScope('whole')}
+                className={`px-3 py-1 rounded-md text-xs font-medium transition-colors ${pilotScope === 'whole' ? 'bg-indigo-600 text-white' : 'text-gray-400 hover:text-gray-200'}`}
+              >
+                Whole dataset
+              </button>
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-3">
+            {MANUAL_PILOT_MODELS.map(model => {
+              const selected = pilotModels.has(model.key)
+              const count = pilotSummary?.[model.key]?.[pilotScope] ?? 0
+              return (
+                <label
+                  key={model.key}
+                  className={`flex items-start justify-between gap-4 bg-gray-900 border rounded-xl px-5 py-4 cursor-pointer transition-colors ${selected ? 'border-indigo-600/70' : 'border-gray-800 hover:border-gray-700'}`}
+                >
+                  <div className="flex items-start gap-3">
+                    <input
+                      type="checkbox"
+                      checked={selected}
+                      onChange={() => togglePilotModel(model.key)}
+                      className="mt-0.5 accent-indigo-500"
+                    />
+                    <div>
+                      <p className="text-sm font-medium text-gray-200">{model.label}</p>
+                      <p className="text-xs text-gray-500 mt-0.5">{model.description}</p>
+                    </div>
+                  </div>
+                  <div className="text-right shrink-0">
+                    <p className="text-xs text-gray-500 uppercase tracking-wider">Eligible</p>
+                    <p className="text-lg font-semibold text-white tabular-nums">{pilotLoading ? '…' : count.toLocaleString()}</p>
+                  </div>
+                </label>
+              )
+            })}
+          </div>
+
+          <div className="mt-4 flex items-center gap-3">
+            <button
+              onClick={runPilot}
+              disabled={pilotBusy || pilotModels.size === 0}
+              className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg px-4 py-2 text-sm font-medium transition-colors"
+            >
+              {pilotBusy ? 'Starting…' : 'Start Manual Pilot'}
+            </button>
+            <p className="text-xs text-gray-600">Runs in background and streams progress in Pipeline panel.</p>
+          </div>
+
+          {pilotMsg && (
+            <div className="mt-4 bg-gray-900 border border-gray-700 rounded-xl px-4 py-3 text-sm text-gray-300">
+              {pilotMsg}
+            </div>
+          )}
         </section>
       )}
 

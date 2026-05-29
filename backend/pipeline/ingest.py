@@ -923,6 +923,197 @@ async def run_resume_pending() -> None:
     logger.info("=== Resume pending pipeline complete ===")
 
 
+async def run_resume_florence_pending() -> int:
+    """Resume only pending Florence enrichment work after interruption."""
+    logger.info("=== Resume Florence pending start ===")
+    await broadcast("pipeline_start", folder="[resume florence pending]")
+    await settings_store.load_cache()
+    _ensure_models()
+
+    async with get_db() as db:
+        pending_rows = await db.execute_fetchall(
+            """
+            SELECT id
+            FROM media_files
+            WHERE is_stub = 0
+              AND removed_from_app = 0
+              AND ingest_state = 'tagged'
+              AND tags_done = 1
+              AND florence_done = 0
+            """
+        )
+    florence_ids = {int(r["id"]) for r in pending_rows}
+    if not florence_ids:
+        await broadcast("pipeline_complete", folder="[resume florence pending]")
+        logger.info("=== Resume Florence pending complete: 0 files ===")
+        return 0
+
+    await set_phase("florence")
+    await _pause_point()
+    await _phase_florence(florence_ids)
+
+    await broadcast("pipeline_complete", folder="[resume florence pending]")
+    logger.info("=== Resume Florence pending complete: %d files ===", len(florence_ids))
+    return len(florence_ids)
+
+
+async def run_manual_pilot(models: list[str], scope: str = "unindexed") -> dict[str, int]:
+    """Run selected model phases manually across whole or unindexed scope."""
+    selected = {m.strip().lower() for m in models if m and m.strip()}
+    ordered = [m for m in ("tag", "florence", "clip_index", "analyse") if m in selected]
+    if not ordered:
+        return {}
+
+    logger.info("=== Manual pilot start (scope=%s, models=%s) ===", scope, ",".join(ordered))
+    await broadcast("pipeline_start", folder=f"[manual pilot:{scope}]")
+    await settings_store.load_cache()
+    _ensure_models()
+
+    counts: dict[str, int] = {}
+    is_whole = scope == "whole"
+
+    if "tag" in ordered:
+        await set_phase("tag")
+        await _pause_point()
+        if is_whole:
+            async with get_db() as db:
+                await db.execute(
+                    """
+                    UPDATE media_files
+                    SET tags_done = 0
+                    WHERE is_stub = 0
+                      AND removed_from_app = 0
+                      AND ingest_state IN ('embedded', 'clustered', 'tagged')
+                    """
+                )
+            tagged_ids = await _phase_tag()
+        else:
+            async with get_db() as db:
+                rows = await db.execute_fetchall(
+                    """
+                    SELECT id
+                    FROM media_files
+                    WHERE tags_done = 0
+                      AND is_stub = 0
+                      AND removed_from_app = 0
+                      AND ingest_state IN ('embedded', 'clustered', 'tagged')
+                    """
+                )
+            tagged_ids = await _phase_tag({int(r["id"]) for r in rows})
+        counts["tag"] = len(tagged_ids)
+
+    if "florence" in ordered:
+        await set_phase("florence")
+        await _pause_point()
+        async with get_db() as db:
+            if is_whole:
+                rows = await db.execute_fetchall(
+                    """
+                    SELECT id
+                    FROM media_files
+                    WHERE is_stub = 0
+                      AND removed_from_app = 0
+                      AND ingest_state = 'tagged'
+                      AND tags_done = 1
+                    """
+                )
+            else:
+                rows = await db.execute_fetchall(
+                    """
+                    SELECT id
+                    FROM media_files
+                    WHERE is_stub = 0
+                      AND removed_from_app = 0
+                      AND ingest_state = 'tagged'
+                      AND tags_done = 1
+                      AND florence_done = 0
+                    """
+                )
+        florence_ids = {int(r["id"]) for r in rows}
+        processed_florence = await _phase_florence(florence_ids)
+        counts["florence"] = len(processed_florence)
+
+    if "clip_index" in ordered:
+        await set_phase("clip_index")
+        await _pause_point()
+        pending_before = 0
+        async with get_db() as db:
+            if is_whole:
+                row = await (await db.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM media_files
+                    WHERE is_stub = 0
+                      AND removed_from_app = 0
+                    """
+                )).fetchone()
+            else:
+                row = await (await db.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM media_files mf
+                    LEFT JOIN clip_embeddings ce ON ce.media_file_id = mf.id
+                    WHERE mf.is_stub = 0
+                      AND mf.removed_from_app = 0
+                      AND mf.tags_done = 1
+                      AND ce.media_file_id IS NULL
+                    """
+                )).fetchone()
+        pending_before = int(row["cnt"]) if row else 0
+        await _phase_clip_index(rebuild_all=is_whole)
+        counts["clip_index"] = pending_before
+
+    if "analyse" in ordered:
+        from backend.ml.analysis_builder import MODEL_VERSION
+
+        await set_phase("analyse")
+        await _pause_point()
+        async with get_db() as db:
+            if is_whole:
+                await db.execute(
+                    """
+                    DELETE FROM photo_analysis
+                    WHERE media_file_id IN (
+                        SELECT id FROM media_files
+                        WHERE ingest_state = 'tagged'
+                          AND is_stub = 0
+                          AND removed_from_app = 0
+                    )
+                    """
+                )
+                row = await (await db.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM media_files
+                    WHERE ingest_state = 'tagged'
+                      AND is_stub = 0
+                      AND removed_from_app = 0
+                    """
+                )).fetchone()
+                analyse_ids: set[int] | None = None
+            else:
+                rows = await db.execute_fetchall(
+                    """
+                    SELECT mf.id
+                    FROM media_files mf
+                    LEFT JOIN photo_analysis pa ON pa.media_file_id = mf.id
+                    WHERE mf.ingest_state = 'tagged'
+                      AND mf.is_stub = 0
+                      AND mf.removed_from_app = 0
+                      AND (pa.id IS NULL OR pa.model_version != ?)
+                    """,
+                    (MODEL_VERSION,),
+                )
+                row = {"cnt": len(rows)}
+                analyse_ids = {int(r["id"]) for r in rows}
+        counts["analyse"] = int(row["cnt"]) if row else 0
+        await _phase_analyse(analyse_ids)
+
+    await broadcast("pipeline_complete", folder=f"[manual pilot:{scope}]")
+    logger.info("=== Manual pilot complete: %s ===", counts)
+    return counts
+
+
 # ---------------------------------------------------------------------------
 # Phase 1: Scan
 # ---------------------------------------------------------------------------

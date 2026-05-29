@@ -21,8 +21,12 @@ interface Props {
 
 export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   const REVIEW_PAGE_SIZE = 60
+  const UNNAMED_PAGE_SIZE = 100
 
   const [clusters, setClusters] = useState<Cluster[]>([])
+  const [unnamedTotal, setUnnamedTotal] = useState(0)
+  const [unnamedPage, setUnnamedPage] = useState(0)
+  const [unnamedSortBy, setUnnamedSortBy] = useState<'member_count' | 'created_at'>('member_count')
   const [persons, setPersons] = useState<Person[]>([])
   const [loading, setLoading] = useState(true)
   const [activeTab, setActiveTab] = useState<'named' | 'unnamed' | 'ignored'>('named')
@@ -555,8 +559,17 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   async function load() {
     setLoading(true)
     try {
-      const [c, p] = await Promise.all([api.clusters.unnamed(), api.persons.list()])
-      setClusters(c)
+      const [c, p] = await Promise.all([
+        api.clusters.unnamed({
+          limit: UNNAMED_PAGE_SIZE,
+          offset: unnamedPage * UNNAMED_PAGE_SIZE,
+          sortBy: unnamedSortBy,
+          sortDir: 'desc',
+        }),
+        api.persons.list(),
+      ])
+      setClusters(c.items)
+      setUnnamedTotal(c.total)
       setPersons(p)
     } finally {
       setLoading(false)
@@ -580,14 +593,20 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
       await api.persons.unignore(personId)
       setIgnoredPersons(prev => prev.filter(p => p.id !== personId))
       // Reload unnamed clusters so the restored faces appear immediately
-      const fresh = await api.clusters.unnamed()
-      setClusters(fresh)
+      const fresh = await api.clusters.unnamed({
+        limit: UNNAMED_PAGE_SIZE,
+        offset: unnamedPage * UNNAMED_PAGE_SIZE,
+        sortBy: unnamedSortBy,
+        sortDir: 'desc',
+      })
+      setClusters(fresh.items)
+      setUnnamedTotal(fresh.total)
     } finally {
       setUnignoringId(null)
     }
   }
 
-  useEffect(() => { load() }, [])
+  useEffect(() => { load() }, [unnamedPage, unnamedSortBy])
 
   // Lazy-load ignored faces when tab is first activated
   useEffect(() => {
@@ -1368,26 +1387,52 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
         </div>
       )}
 
-      {activeTab === 'unnamed' && clusters.length === 0 && persons.length > 0 && (
+      {activeTab === 'unnamed' && unnamedTotal === 0 && persons.length > 0 && (
         <div className="text-gray-500 text-sm mt-12 text-center">
           No unnamed clusters — all faces have been assigned.
         </div>
       )}
 
-      {activeTab === 'named' && persons.length === 0 && clusters.length > 0 && (
+      {activeTab === 'named' && persons.length === 0 && unnamedTotal > 0 && (
         <div className="text-gray-500 text-sm mt-12 text-center">
           No named persons yet. Switch to <button onClick={() => setActiveTab('unnamed')} className="text-indigo-400 hover:text-indigo-300 underline">Unnamed Faces</button> to name some.
         </div>
       )}
 
       {/* ── Unnamed clusters tab ─────────────────────────────────────────── */}
-      {activeTab === 'unnamed' && clusters.length > 0 && (
+      {activeTab === 'unnamed' && unnamedTotal > 0 && (
         <section className="mb-8">
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
-              Unnamed clusters ({clusters.length})
+              Unnamed clusters ({unnamedTotal})
             </h2>
             <div className="flex items-center gap-2">
+              <label className="text-xs text-gray-500">Sort</label>
+              <select
+                value={unnamedSortBy}
+                onChange={e => { setUnnamedPage(0); setUnnamedSortBy(e.target.value as 'member_count' | 'created_at') }}
+                className="text-xs px-2.5 py-1 rounded-lg border border-gray-600 bg-gray-800 text-gray-300"
+              >
+                <option value="member_count">Most photos</option>
+                <option value="created_at">Newest added</option>
+              </select>
+              <span className="text-xs text-gray-500">
+                {unnamedPage * UNNAMED_PAGE_SIZE + 1}-{Math.min((unnamedPage + 1) * UNNAMED_PAGE_SIZE, unnamedTotal)}
+              </span>
+              <button
+                onClick={() => setUnnamedPage(p => Math.max(0, p - 1))}
+                disabled={unnamedPage === 0}
+                className="text-xs px-2.5 py-1 rounded-lg border border-gray-600 bg-gray-800 text-gray-400 disabled:opacity-40 hover:text-white hover:border-gray-400 transition-colors"
+              >
+                Prev
+              </button>
+              <button
+                onClick={() => setUnnamedPage(p => ((p + 1) * UNNAMED_PAGE_SIZE < unnamedTotal ? p + 1 : p))}
+                disabled={(unnamedPage + 1) * UNNAMED_PAGE_SIZE >= unnamedTotal}
+                className="text-xs px-2.5 py-1 rounded-lg border border-gray-600 bg-gray-800 text-gray-400 disabled:opacity-40 hover:text-white hover:border-gray-400 transition-colors"
+              >
+                Next
+              </button>
               {selectMode && (
                 <>
                   <button

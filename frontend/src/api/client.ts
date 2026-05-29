@@ -128,6 +128,17 @@ export const api = {
       request<{ status: string }>('/pipeline/resume_pending', {
         method: 'POST',
       }),
+    resumeFlorencePending: () =>
+      request<{ status: string; pending_florence: number }>('/pipeline/resume_florence_pending', {
+        method: 'POST',
+      }),
+    manualPilotSummary: () =>
+      request<ManualPilotSummary>('/pipeline/manual_pilot_summary'),
+    manualPilotRun: (models: ManualPilotModel[], scope: ManualPilotScope) =>
+      request<{ status: string; scope: ManualPilotScope; models: ManualPilotModel[] }>('/pipeline/manual_pilot', {
+        method: 'POST',
+        body: JSON.stringify({ models, scope }),
+      }),
     rescanFolder: (folderId: number, pathPrefix?: string) =>
       request<{ status: string; folder: string }>('/pipeline/rescan_folder', {
         method: 'POST',
@@ -209,7 +220,15 @@ export const api = {
 
   // ─── Clusters ─────────────────────────────────────────────────────────────
   clusters: {
-    unnamed: () => request<Cluster[]>('/persons/unnamed'),    delete: (clusterId: number) =>
+    unnamed: (params: { limit?: number; offset?: number; sortBy?: 'member_count' | 'created_at'; sortDir?: 'asc' | 'desc' } = {}) => {
+      const search = new URLSearchParams()
+      if (params.limit != null) search.set('limit', String(params.limit))
+      if (params.offset != null) search.set('offset', String(params.offset))
+      if (params.sortBy) search.set('sort_by', params.sortBy)
+      if (params.sortDir) search.set('sort_dir', params.sortDir)
+      const qs = search.toString()
+      return request<UnnamedClustersPage>(`/persons/unnamed${qs ? `?${qs}` : ''}`)
+    },    delete: (clusterId: number) =>
       request(`/persons/clusters/${clusterId}`, { method: 'DELETE' }),
     similar: (clusterId: number) =>
       request<SimilarCluster[]>(`/persons/clusters/${clusterId}/similar`),
@@ -574,10 +593,20 @@ export interface WsEvent {
 
 export interface Cluster {
   id: number
+  created_at?: string | null
   member_count: number
   intra_similarity: number | null
   is_high_conf: number
   representative_thumbnail: string | null
+}
+
+export interface UnnamedClustersPage {
+  items: Cluster[]
+  total: number
+  limit: number
+  offset: number
+  sort_by: 'member_count' | 'created_at'
+  sort_dir: 'asc' | 'desc'
 }
 
 export interface Person {
@@ -1011,4 +1040,14 @@ export interface ContactsMatchStats {
 export interface ContactsMatchResult {
   matches: ContactsMatchSuggestion[]
   stats: ContactsMatchStats
+}
+
+export type ManualPilotModel = 'tag' | 'florence' | 'clip_index' | 'analyse'
+export type ManualPilotScope = 'whole' | 'unindexed'
+
+export interface ManualPilotSummary {
+  tag: Record<ManualPilotScope, number>
+  florence: Record<ManualPilotScope, number>
+  clip_index: Record<ManualPilotScope, number>
+  analyse: Record<ManualPilotScope, number>
 }

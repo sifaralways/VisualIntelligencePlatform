@@ -34,13 +34,15 @@ export default function PipelinePanel({ profileId, collapsed, onToggle, onPipeli
   const [resumeBusy, setResumeBusy] = useState(false)
   const [stopBusy, setStopBusy] = useState(false)
   const [resumePendingBusy, setResumePendingBusy] = useState(false)
+  const [resumeFlorenceBusy, setResumeFlorenceBusy] = useState(false)
   const wsRef  = useRef<WebSocket | null>(null)
   const logRef = useRef<HTMLDivElement>(null)
 
   const isRunning = status === 'running'
+  const isPausing = status === 'pausing'
   const isPaused = status === 'paused'
   const isStopping = status === 'stopping'
-  const isBusy = isRunning || isPaused || isStopping
+  const isBusy = isRunning || isPausing || isPaused || isStopping
 
   // ── WebSocket — persistent, auto-reconnecting ─────────────────────────────
   useEffect(() => {
@@ -187,8 +189,22 @@ export default function PipelinePanel({ profileId, collapsed, onToggle, onPipeli
     }
   }
 
+  async function resumeFlorencePendingPipeline() {
+    setResumeFlorenceBusy(true)
+    try {
+      await api.pipeline.resumeFlorencePending()
+      setEvents([])
+      setStatus('running')
+      setResumable(false)
+    } catch {
+      // status poll will reconcile
+    } finally {
+      setResumeFlorenceBusy(false)
+    }
+  }
+
   async function resumePipeline() {
-    if (!isPaused) {
+    if (!(isPaused || isPausing)) {
       await resumePendingPipeline()
       return
     }
@@ -233,6 +249,7 @@ export default function PipelinePanel({ profileId, collapsed, onToggle, onPipeli
           <span className="text-xs font-semibold text-gray-300 uppercase tracking-wider">⚙️ Pipeline</span>
           <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
             isRunning        ? 'bg-yellow-600 text-white' :
+            isPausing        ? 'bg-sky-700 text-white' :
             isPaused         ? 'bg-amber-600 text-white' :
             isStopping       ? 'bg-orange-700 text-white' :
             status === 'error' ? 'bg-red-700 text-white' :
@@ -297,13 +314,22 @@ export default function PipelinePanel({ profileId, collapsed, onToggle, onPipeli
           </button>
           <button
             onClick={resumePipeline}
-            disabled={(!isPaused && !resumable) || pauseBusy || resumeBusy || stopBusy || resumePendingBusy || statusError != null}
+            disabled={(!isPaused && !isPausing && !resumable) || pauseBusy || resumeBusy || stopBusy || resumePendingBusy || resumeFlorenceBusy || statusError != null}
             className="flex-1 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-40 text-white text-xs font-medium rounded-lg px-2 py-1.5 transition-colors"
-            title={isPaused ? 'Resume a paused pipeline' : 'Resume pending pipeline work after interruption'}
+            title={(isPaused || isPausing) ? 'Resume a paused pipeline' : 'Resume pending pipeline work after interruption'}
           >
-            {(resumeBusy || resumePendingBusy) ? 'Resuming…' : (isPaused ? 'Resume' : 'Resume Pending')}
+            {(resumeBusy || resumePendingBusy) ? 'Resuming…' : ((isPaused || isPausing) ? 'Resume' : 'Resume Pending')}
           </button>
         </div>
+
+        <button
+          onClick={resumeFlorencePendingPipeline}
+          disabled={isBusy || pendingFlorence <= 0 || resumeFlorenceBusy || pauseBusy || resumeBusy || stopBusy || resumePendingBusy || statusError != null}
+          className="w-full bg-cyan-700 hover:bg-cyan-600 disabled:opacity-40 text-white text-xs font-medium rounded-lg px-2 py-1.5 transition-colors"
+          title="Run only remaining Florence enrichment without rerunning tag/clip/analyse"
+        >
+          {resumeFlorenceBusy ? 'Starting Florence…' : `Run Pending Florence${pendingFlorence > 0 ? ` (${pendingFlorence.toLocaleString()})` : ''}`}
+        </button>
 
         <button
           onClick={stopPipeline}

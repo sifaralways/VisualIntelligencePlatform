@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
@@ -13,6 +14,7 @@ from pydantic import BaseModel
 from backend.database.db import get_db
 from backend.pipeline.control import (
     PipelineStopRequested,
+    is_pause_requested,
     is_paused,
     mark_pipeline_finished,
     mark_pipeline_started,
@@ -59,6 +61,11 @@ class RescanRequest(BaseModel):
 class FolderRescanRequest(BaseModel):
     folder_id: int
     path_prefix: str | None = None
+
+
+class ManualPilotRequest(BaseModel):
+    models: list[str]
+    scope: Literal["whole", "unindexed"] = "unindexed"
 
 
 @router.post("/scan")
@@ -209,13 +216,19 @@ async def get_status():
     state = dict(_state(profile_id))
     runtime = await get_runtime_state()
 
-    # Process restart recovery: DB says running but this process is not.
-    if runtime.get("status") == "running" and state.get("status") != "running":
+    # Process restart recovery: DB may still say running/paused/stopping while
+    # this process has no active in-memory run state for the profile.
+    if runtime.get("status") in {"running", "paused", "stopping"} and state.get("status") != "running":
         await mark_interrupted_resumable()
         runtime = await get_runtime_state()
 
     if state.get("status") == "running":
-        effective_status = "paused" if is_paused(profile_id) else "running"
+        if is_paused(profile_id):
+            effective_status = "paused"
+        elif is_pause_requested(profile_id):
+            effective_status = "pausing"
+        else:
+            effective_status = "running"
     else:
         effective_status = runtime.get("status") or state.get("status") or "idle"
 
@@ -248,6 +261,119 @@ async def get_status():
     }
 
 
+@router.get("/manual_pilot_summary")
+async def get_manual_pilot_summary():
+        """Summary counts for manual model pilot actions."""
+        from backend.ml.analysis_builder import MODEL_VERSION
+
+        async with get_db() as db:
+                def _fetch_count(query: str, params: tuple = ()):
+                        return db.execute(query, params)
+
+                row = await (await _fetch_count(
+                        """
+                        SELECT COUNT(*) AS cnt
+                        FROM media_files
+                        WHERE is_stub = 0
+                            AND removed_from_app = 0
+                            AND ingest_state IN ('embedded', 'clustered', 'tagged')
+                        """
+                )).fetchone()
+                tag_whole = int(row["cnt"]) if row else 0
+
+                row = await (await _fetch_count(
+                        """
+                        SELECT COUNT(*) AS cnt
+                        FROM media_files
+                        WHERE is_stub = 0
+                            AND removed_from_app = 0
+                            AND ingest_state IN ('embedded', 'clustered', 'tagged')
+                            AND tags_done = 0
+                        """
+                )).fetchone()
+                tag_unindexed = int(row["cnt"]) if row else 0
+
+                row = await (await _fetch_count(
+                        """
+                        SELECT COUNT(*) AS cnt
+                        FROM media_files
+                        WHERE is_stub = 0
+                            AND removed_from_app = 0
+                            AND ingest_state = 'tagged'
+                            AND tags_done = 1
+                        """
+                )).fetchone()
+                florence_whole = int(row["cnt"]) if row else 0
+
+                row = await (await _fetch_count(
+                        """
+                        SELECT COUNT(*) AS cnt
+                        FROM media_files
+                        WHERE is_stub = 0
+                            AND removed_from_app = 0
+                            AND ingest_state = 'tagged'
+                            AND tags_done = 1
+                            AND florence_done = 0
+                        """
+                )).fetchone()
+                florence_unindexed = int(row["cnt"]) if row else 0
+
+                row = await (await _fetch_count(
+                        """
+                        SELECT COUNT(*) AS cnt
+                        FROM media_files
+                        WHERE is_stub = 0
+                            AND removed_from_app = 0
+                        """
+                )).fetchone()
+                clip_whole = int(row["cnt"]) if row else 0
+
+                row = await (await _fetch_count(
+                        """
+                        SELECT COUNT(*) AS cnt
+                        FROM media_files mf
+                        LEFT JOIN clip_embeddings ce ON ce.media_file_id = mf.id
+                        WHERE mf.is_stub = 0
+                            AND mf.removed_from_app = 0
+                            AND mf.tags_done = 1
+                            AND ce.media_file_id IS NULL
+                        """
+                )).fetchone()
+                clip_unindexed = int(row["cnt"]) if row else 0
+
+                row = await (await _fetch_count(
+                        """
+                        SELECT COUNT(*) AS cnt
+                        FROM media_files
+                        WHERE ingest_state = 'tagged'
+                            AND is_stub = 0
+                            AND removed_from_app = 0
+                        """
+                )).fetchone()
+                analyse_whole = int(row["cnt"]) if row else 0
+
+                row = await (await _fetch_count(
+                        """
+                        SELECT COUNT(*) AS cnt
+                        FROM media_files mf
+                        LEFT JOIN photo_analysis pa ON pa.media_file_id = mf.id
+                        WHERE mf.ingest_state = 'tagged'
+                            AND mf.is_stub = 0
+                            AND mf.removed_from_app = 0
+                            AND (pa.id IS NULL OR pa.model_version != ?)
+                        """,
+                        (MODEL_VERSION,),
+                )).fetchone()
+                analyse_unindexed = int(row["cnt"]) if row else 0
+
+        return {
+                "tag": {"whole": tag_whole, "unindexed": tag_unindexed},
+                "florence": {"whole": florence_whole, "unindexed": florence_unindexed},
+                "clip_index": {"whole": clip_whole, "unindexed": clip_unindexed},
+                "analyse": {"whole": analyse_whole, "unindexed": analyse_unindexed},
+        }
+
+
 @router.post("/pause")
 async def pause_pipeline():
     """Request cooperative pipeline pause for the active profile."""
@@ -258,8 +384,7 @@ async def pause_pipeline():
     changed = request_pause(profile_id)
     if not changed:
         raise HTTPException(status_code=409, detail="Pipeline already paused")
-    await mark_paused()
-    return {"status": "paused"}
+    return {"status": "pausing"}
 
 
 @router.post("/resume")
@@ -332,6 +457,75 @@ async def resume_pending_pipeline(background_tasks: BackgroundTasks):
     mark_pipeline_started(profile_id)
     background_tasks.add_task(run_in_profile, profile_id, _run_resume_pending, runtime)
     return {"status": "started"}
+
+
+@router.post("/resume_florence_pending")
+async def resume_florence_pending_pipeline(background_tasks: BackgroundTasks):
+    """Resume only pending Florence enrichment work."""
+    profile_id = get_current_profile_id()
+    pipeline_state = _state(profile_id)
+    if pipeline_state["status"] == "running":
+        raise HTTPException(status_code=409, detail="Pipeline already running")
+
+    pending_florence = 0
+    async with get_db() as db:
+        row = await (await db.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM media_files
+            WHERE is_stub = 0
+              AND removed_from_app = 0
+              AND ingest_state = 'tagged'
+              AND tags_done = 1
+              AND florence_done = 0
+            """
+        )).fetchone()
+    if row:
+        pending_florence = int(row["cnt"])
+
+    if pending_florence <= 0:
+        raise HTTPException(status_code=409, detail="No pending Florence work found")
+
+    pipeline_state.update({
+        "status": "running",
+        "folder": "[resume florence pending]",
+        "error": None,
+    })
+    await begin_run("resume_florence_pending", "[resume florence pending]", None)
+    mark_pipeline_started(profile_id)
+    background_tasks.add_task(run_in_profile, profile_id, _run_resume_florence_pending)
+    return {"status": "started", "pending_florence": pending_florence}
+
+
+@router.post("/manual_pilot")
+async def run_manual_pilot_pipeline(req: ManualPilotRequest, background_tasks: BackgroundTasks):
+    """Run selected model phases manually (whole or unindexed scope)."""
+    profile_id = get_current_profile_id()
+    pipeline_state = _state(profile_id)
+    if pipeline_state["status"] == "running":
+        raise HTTPException(status_code=409, detail="Pipeline already running")
+
+    allowed = {"tag", "florence", "clip_index", "analyse"}
+    selected = []
+    seen: set[str] = set()
+    for raw in req.models:
+        name = str(raw).strip().lower()
+        if not name or name in seen:
+            continue
+        if name not in allowed:
+            raise HTTPException(status_code=400, detail=f"Unknown model '{name}'. Allowed: {sorted(allowed)}")
+        seen.add(name)
+        selected.append(name)
+
+    if not selected:
+        raise HTTPException(status_code=400, detail="Select at least one model")
+
+    label = f"[manual pilot:{req.scope}]"
+    pipeline_state.update({"status": "running", "folder": label, "error": None})
+    await begin_run("manual_pilot", label, None)
+    mark_pipeline_started(profile_id)
+    background_tasks.add_task(run_in_profile, profile_id, _run_manual_pilot, selected, req.scope)
+    return {"status": "started", "scope": req.scope, "models": selected}
 
 
 async def _run_pipeline(folder: str, use_existing_vip_data: bool = False) -> None:
@@ -605,6 +799,52 @@ async def _run_resume_pending(runtime: dict) -> None:
         await mark_stopped_resumable()
     except Exception as e:
         logger.exception("Resume pending error")
+        pipeline_state["status"] = "error"
+        pipeline_state["error"] = str(e)
+        await mark_error(str(e))
+    finally:
+        mark_pipeline_finished(profile_id)
+
+
+async def _run_resume_florence_pending() -> None:
+    from backend.pipeline.ingest import run_resume_florence_pending
+
+    profile_id = get_current_profile_id()
+    pipeline_state = _state(profile_id)
+    try:
+        await run_resume_florence_pending()
+        pipeline_state["status"] = "idle"
+        await mark_succeeded_idle()
+    except PipelineStopRequested:
+        pipeline_state["status"] = "stopped"
+        pipeline_state["error"] = None
+        await mark_stopped_resumable()
+    except Exception as e:
+        logger.exception("Resume Florence pending error")
+        pipeline_state["status"] = "error"
+        pipeline_state["error"] = str(e)
+        await mark_error(str(e))
+    finally:
+        mark_pipeline_finished(profile_id)
+
+
+async def _run_manual_pilot(models: list[str], scope: str) -> None:
+    from backend.pipeline.ingest import run_manual_pilot
+
+    profile_id = get_current_profile_id()
+    pipeline_state = _state(profile_id)
+    try:
+        counts = await run_manual_pilot(models, scope)
+        pipeline_state["status"] = "idle"
+        pipeline_state["error"] = None
+        logger.info("Manual pilot complete (scope=%s, models=%s, counts=%s)", scope, ",".join(models), counts)
+        await mark_succeeded_idle()
+    except PipelineStopRequested:
+        pipeline_state["status"] = "stopped"
+        pipeline_state["error"] = None
+        await mark_stopped_resumable()
+    except Exception as e:
+        logger.exception("Manual pilot error")
         pipeline_state["status"] = "error"
         pipeline_state["error"] = str(e)
         await mark_error(str(e))

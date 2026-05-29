@@ -8,7 +8,7 @@ import uuid as _uuid
 from typing import Literal, Optional
 
 import numpy as np
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from pydantic import BaseModel
 
 from backend.database.db import get_db
@@ -477,6 +477,15 @@ async def _rescore_after_person_update(person_id: int) -> None:
         logger.warning("_rescore_after_person_update failed (non-fatal): %s", exc)
 
 
+async def _refresh_person_after_identity_change(person_id: int) -> None:
+    """Refresh centroid, suggestions, and co-occurrence after membership changes."""
+    async with get_db() as db:
+        await update_person_centroid(db, person_id)
+
+    await _rescore_after_person_update(person_id)
+    await _update_cooccurrence_for_person(person_id)
+
+
 async def _update_cooccurrence_for_person(person_id: int) -> None:
     """Incrementally refresh co-occurrence edges for a newly named/updated person.
 
@@ -612,12 +621,40 @@ async def list_persons():
 
 
 @router.get("/unnamed")
-async def list_unnamed_clusters():
+async def list_unnamed_clusters(
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    sort_by: Literal["member_count", "created_at"] = Query("member_count"),
+    sort_dir: Literal["asc", "desc"] = Query("desc"),
+):
     """Clusters with no current non-merged owner person."""
+    order_column = "member_count" if sort_by == "member_count" else "created_at"
+    order_direction = "ASC" if sort_dir == "asc" else "DESC"
+
     async with get_db() as db:
-        rows = await db.execute_fetchall("""
+        total_row = await (
+            await db.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM (
+                    SELECT c.id
+                    FROM clusters c
+                    LEFT JOIN faces f ON f.cluster_id = c.id
+                    LEFT JOIN media_files mf ON mf.id = f.media_file_id
+                    LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
+                    LEFT JOIN persons owner_person ON owner_person.person_guid = cpc.person_guid AND owner_person.is_merged = 0
+                    WHERE owner_person.id IS NULL
+                    GROUP BY c.id
+                    HAVING COUNT(DISTINCT CASE WHEN mf.removed_from_app = 0 THEN f.media_file_id END) > 0
+                ) unnamed
+                """
+            )
+        ).fetchone()
+
+        rows = await db.execute_fetchall(f"""
             SELECT c.id,
                    c.cluster_guid,
+                   c.created_at,
                    COUNT(DISTINCT CASE WHEN mf.removed_from_app = 0 THEN f.id END) AS member_count,
                    c.intra_similarity,
                    c.is_high_conf,
@@ -630,9 +667,17 @@ async def list_unnamed_clusters():
             WHERE owner_person.id IS NULL
             GROUP BY c.id
             HAVING COUNT(DISTINCT CASE WHEN mf.removed_from_app = 0 THEN f.media_file_id END) > 0
-            ORDER BY member_count DESC
-        """)
-    return [dict(r) for r in rows]
+            ORDER BY {order_column} {order_direction}, c.id DESC
+            LIMIT ? OFFSET ?
+        """, (limit, offset))
+    return {
+        "items": [dict(r) for r in rows],
+        "total": int(total_row["total"] if total_row and total_row["total"] is not None else 0),
+        "limit": limit,
+        "offset": offset,
+        "sort_by": sort_by,
+        "sort_dir": sort_dir,
+    }
 
 
 @router.get("/clusters/{cluster_id}/similar")
@@ -1162,12 +1207,13 @@ async def name_person(person_id: int, req: NamePersonRequest, background_tasks: 
             WHERE p.id = ?
         """, (person_id,))
 
-        # Persist centroid so this person is recognisable in future scans
-        await update_person_centroid(db, person_id)
-
     profile_id = get_current_profile_id()
-    background_tasks.add_task(run_in_profile, profile_id, _rescore_after_person_update, person_id)
-    background_tasks.add_task(run_in_profile, profile_id, _update_cooccurrence_for_person, person_id)
+    background_tasks.add_task(
+        run_in_profile,
+        profile_id,
+        _refresh_person_after_identity_change,
+        person_id,
+    )
     return {"status": "ok", "name": req.name}
 
 
@@ -1364,12 +1410,13 @@ async def merge_named_persons(
         # 7. Refresh the denormalised photo_count column.
         await _sync_photo_count(db, survivor_id)
 
-        # 8. Recompute centroid from all merged embeddings.
-        await update_person_centroid(db, survivor_id)
-
     profile_id = get_current_profile_id()
-    background_tasks.add_task(run_in_profile, profile_id, _rescore_after_person_update, survivor_id)
-    background_tasks.add_task(run_in_profile, profile_id, _update_cooccurrence_for_person, survivor_id)
+    background_tasks.add_task(
+        run_in_profile,
+        profile_id,
+        _refresh_person_after_identity_change,
+        survivor_id,
+    )
     return {
         "status": "merged",
         "survivor_id": survivor_id,
@@ -1481,11 +1528,13 @@ async def assign_lone_face_to_person(face_id: int, req: NameClusterRequest, back
                 VALUES (?, 'pending', datetime('now'))
             """, (face_row["media_file_id"],))
 
-        await update_person_centroid(db, person_id)
-
     profile_id = get_current_profile_id()
-    background_tasks.add_task(run_in_profile, profile_id, _rescore_after_person_update, person_id)
-    background_tasks.add_task(run_in_profile, profile_id, _update_cooccurrence_for_person, person_id)
+    background_tasks.add_task(
+        run_in_profile,
+        profile_id,
+        _refresh_person_after_identity_change,
+        person_id,
+    )
     return {"status": "assigned", "face_id": face_id, "person_id": person_id}
 
 
@@ -1535,12 +1584,13 @@ async def create_person_from_cluster(cluster_id: int, req: NameClusterRequest, b
             SELECT DISTINCT media_file_id FROM faces WHERE cluster_id=?
         """, (cluster_id,))
 
-        # Persist centroid — this person now has embeddings to match against
-        await update_person_centroid(db, person_id)
-
     profile_id = get_current_profile_id()
-    background_tasks.add_task(run_in_profile, profile_id, _rescore_after_person_update, person_id)
-    background_tasks.add_task(run_in_profile, profile_id, _update_cooccurrence_for_person, person_id)
+    background_tasks.add_task(
+        run_in_profile,
+        profile_id,
+        _refresh_person_after_identity_change,
+        person_id,
+    )
     return {"status": "created", "person_id": person_id, "uuid": person_uuid}
 
 
@@ -1602,12 +1652,13 @@ async def add_cluster_to_person(person_id: int, cluster_id: int, background_task
             SELECT DISTINCT media_file_id FROM faces WHERE cluster_id=?
         """, (cluster_id,))
 
-        # Refresh centroid with the newly-added cluster's embeddings
-        await update_person_centroid(db, person_id)
-
     profile_id = get_current_profile_id()
-    background_tasks.add_task(run_in_profile, profile_id, _rescore_after_person_update, person_id)
-    background_tasks.add_task(run_in_profile, profile_id, _update_cooccurrence_for_person, person_id)
+    background_tasks.add_task(
+        run_in_profile,
+        profile_id,
+        _refresh_person_after_identity_change,
+        person_id,
+    )
     return {"status": "merged", "person_id": person_id}
 
 
@@ -2069,7 +2120,7 @@ async def get_merge_suggestions(person_id: int, limit: int = 1):
 
 
 @router.post("/find-similar-all")
-async def find_similar_all(request: FindSimilarAllRequest):
+async def find_similar_all(request: FindSimilarAllRequest, background_tasks: BackgroundTasks):
     """
     Scan every named person against every unnamed cluster.
 
@@ -2086,6 +2137,7 @@ async def find_similar_all(request: FindSimilarAllRequest):
 
     auto_merged: list[dict] = []
     suggestions: list[dict] = []
+    refresh_person_ids: set[int] = set()
 
     async with get_db() as db:
         named_persons = await db.execute_fetchall("""
@@ -2224,7 +2276,7 @@ async def find_similar_all(request: FindSimilarAllRequest):
                         SELECT DISTINCT media_file_id FROM faces WHERE cluster_id=?
                     """, (cid,))
                     await _sync_photo_count(db, person_id)
-                    await update_person_centroid(db, person_id)
+                    refresh_person_ids.add(int(person_id))
                     for other_cid in co_clusters:
                         same_photo_conflicts.add((int(person_id), int(other_cid)))
                     already_merged_cluster_ids.add(cid)
@@ -2270,6 +2322,15 @@ async def find_similar_all(request: FindSimilarAllRequest):
             deduped.append(s)
         if len(deduped) >= max_suggestions:
             break
+
+    profile_id = get_current_profile_id()
+    for person_id in refresh_person_ids:
+        background_tasks.add_task(
+            run_in_profile,
+            profile_id,
+            _refresh_person_after_identity_change,
+            person_id,
+        )
     return {"auto_merged": auto_merged, "suggestions": deduped}
 
 
