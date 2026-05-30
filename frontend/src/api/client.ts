@@ -212,7 +212,16 @@ export const api = {
   // ─── Folders ──────────────────────────────────────────────────────────────
   folders: {
     list: () => request<FolderItem[]>('/folders'),    subfolders: (folderId: number) =>
-      request<SubfolderItem[]>(`/folders/${folderId}/subfolders`),    removeFromApp: (folderId: number, force = false) =>
+      request<SubfolderItem[]>(`/folders/${folderId}/subfolders`),
+    writeback: (folderId: number, pathPrefix?: string) =>
+      request<{ status: string; scope: string; pending: number; written: number; failed: number }>(
+        `/folders/${folderId}/writeback`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ path_prefix: pathPrefix ?? null }),
+        },
+      ),
+    removeFromApp: (folderId: number, force = false) =>
       request<RemoveResult>(`/folders/${folderId}/remove-from-app?force=${force}`, {
         method: 'POST',
       }),
@@ -520,6 +529,7 @@ export interface SubfolderItem {
   path: string
   name: string
   photo_count: number
+  pending_writeback_count: number
 }
 
 export interface RemoveResult {

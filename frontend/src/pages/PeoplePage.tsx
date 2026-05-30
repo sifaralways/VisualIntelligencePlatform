@@ -133,6 +133,18 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   const [findSimilarError, setFindSimilarError] = useState<string | null>(null)
   const [bulkSuggestionQueue, setBulkSuggestionQueue] = useState<FindSimilarSuggestion[]>([])
   const [bulkSuggestionWorking, setBulkSuggestionWorking] = useState(false)
+  const suggestionRunIdRef = useRef(0)
+
+  function logPeopleFlow(event: string, startedAt: number, extra?: Record<string, unknown>) {
+    const durationMs = Math.round(performance.now() - startedAt)
+    // Lightweight observability for user-perceived latency.
+    console.info('[VIP][PeopleFlow]', { event, duration_ms: durationMs, ...(extra || {}) })
+  }
+
+  function scheduleNextSuggestionFetch(personId: number, reason: string) {
+    const runId = ++suggestionRunIdRef.current
+    void fetchNextSuggestion(personId, runId, reason)
+  }
 
   async function handleFindSimilar() {
     setFindSimilarOpen(false)
@@ -151,22 +163,35 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
       const claimedClusterIds = new Set<number>(
         result.auto_merged.map(m => m.cluster_id)
       )
+      const startedAt = performance.now()
       let autoMergedCount = result.auto_merged.length
-      for (const s of highConf) {
-        if (claimedClusterIds.has(s.cluster_id)) continue
-        try {
+      const pendingHighConf = highConf.filter(s => !claimedClusterIds.has(s.cluster_id))
+      const settled = await Promise.allSettled(
+        pendingHighConf.map(async s => {
           await api.persons.addCluster(s.person_id, s.cluster_id)
-          claimedClusterIds.add(s.cluster_id)
-          autoMergedCount++
-        } catch {
-          // Cluster was assigned by a concurrent operation — skip silently
-        }
+          return s
+        }),
+      )
+      for (const item of settled) {
+        if (item.status !== 'fulfilled') continue
+        const s = item.value
+        if (claimedClusterIds.has(s.cluster_id)) continue
+        claimedClusterIds.add(s.cluster_id)
+        autoMergedCount++
+        const merged = clusters.find(c => c.id === s.cluster_id)
+        applyAcceptedSuggestionLocally(s.person_id, {
+          id: s.cluster_id,
+          member_count: merged?.member_count ?? s.member_count,
+          representative_thumbnail: merged?.representative_thumbnail ?? s.representative_thumbnail,
+        })
       }
+      logPeopleFlow('find_similar_all_high_conf', startedAt, {
+        attempted: pendingHighConf.length,
+        merged: autoMergedCount,
+      })
 
       // Filter manual queue: drop clusters already claimed this run
       const dedupedReview = needsReview.filter(s => !claimedClusterIds.has(s.cluster_id))
-
-      if (autoMergedCount > 0) await load()
 
       setBulkSuggestionQueue(dedupedReview)
       setFindSimilarResult({ autoMerged: autoMergedCount, suggestionsFound: dedupedReview.length })
@@ -229,12 +254,15 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     }))
   }
 
-  async function fetchNextSuggestion(personId: number) {
+  async function fetchNextSuggestion(personId: number, runId: number, reason: string) {
     const autoThreshold = activeSuggestionThresholdRef.current
+    const startedAt = performance.now()
     try {
       // eslint-disable-next-line no-constant-condition
       while (true) {
+        if (runId !== suggestionRunIdRef.current) return
         const list = await api.persons.mergeSuggestions(personId)
+        if (runId !== suggestionRunIdRef.current) return
         if (list.length === 0) { setSuggestion(null); break }
         const s = list[0]
         const shouldAutoMerge = s.is_high_conf === 1 || s.similarity >= autoThreshold
@@ -255,6 +283,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
           break
         }
       }
+      logPeopleFlow('fetch_next_suggestion', startedAt, { person_id: personId, reason })
     } catch {
       setSuggestion(null)
     }
@@ -263,30 +292,42 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   async function startSuggestions(personId: number, name: string) {
     setSuggestionPersonId(personId)
     setSuggestionPersonName(name)
-    await fetchNextSuggestion(personId)
+    scheduleNextSuggestionFetch(personId, 'start')
   }
 
   async function acceptSuggestion() {
     if (!suggestionPersonId || !suggestion) return
     setSuggestionBusy(true)
+    const startedAt = performance.now()
+    const current = suggestion
+    setSuggestion(null)
     try {
-      const merged = clusters.find(c => c.id === suggestion.cluster_id)
-      await api.persons.addCluster(suggestionPersonId, suggestion.cluster_id)
+      const merged = clusters.find(c => c.id === current.cluster_id)
+      await api.persons.addCluster(suggestionPersonId, current.cluster_id)
       applyAcceptedSuggestionLocally(suggestionPersonId, {
-        id: suggestion.cluster_id,
-        member_count: merged?.member_count ?? suggestion.member_count,
-        representative_thumbnail: merged?.representative_thumbnail ?? suggestion.representative_thumbnail,
+        id: current.cluster_id,
+        member_count: merged?.member_count ?? current.member_count,
+        representative_thumbnail: merged?.representative_thumbnail ?? current.representative_thumbnail,
       })
-      await fetchNextSuggestion(suggestionPersonId)
+      scheduleNextSuggestionFetch(suggestionPersonId, 'accept')
+      logPeopleFlow('accept_suggestion', startedAt, { person_id: suggestionPersonId, cluster_id: current.cluster_id })
+    } catch {
+      setSuggestion(current)
     } finally { setSuggestionBusy(false) }
   }
 
   async function rejectSuggestion() {
     if (!suggestionPersonId || !suggestion) return
     setSuggestionBusy(true)
+    const startedAt = performance.now()
+    const current = suggestion
+    setSuggestion(null)
     try {
-      await api.persons.rejectSuggestion(suggestionPersonId, suggestion.cluster_id)
-      await fetchNextSuggestion(suggestionPersonId)
+      await api.persons.rejectSuggestion(suggestionPersonId, current.cluster_id)
+      scheduleNextSuggestionFetch(suggestionPersonId, 'reject')
+      logPeopleFlow('reject_suggestion', startedAt, { person_id: suggestionPersonId, cluster_id: current.cluster_id })
+    } catch {
+      setSuggestion(current)
     } finally { setSuggestionBusy(false) }
   }
 
@@ -296,10 +337,11 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     activeSuggestionThresholdRef.current = findSimilarThreshold
     setSuggestionPersonId(personSimilarDialogPerson.id)
     setSuggestionPersonName(personSimilarDialogPerson.name)
-    await fetchNextSuggestion(personSimilarDialogPerson.id)
+    scheduleNextSuggestionFetch(personSimilarDialogPerson.id, 'person_similar_dialog')
   }
 
   function dismissSuggestions() {
+    suggestionRunIdRef.current += 1
     setSuggestion(null)
     setSuggestionPersonId(null)
     setSuggestionPersonName(null)
@@ -739,26 +781,47 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     }
     setSaving(true)
     try {
-      await api.persons.fromCluster(clusterId, name)
+      const startedAt = performance.now()
+      const sourceCluster = clusters.find(c => c.id === clusterId)
+      const created = await api.persons.fromCluster(clusterId, name)
       setNamingId(null)
       setNameInput('')
-      const refreshed = await api.persons.list()
-      setPersons(refreshed)
-      // Kick off proactive suggestions for the newly named person
-      const newPerson = refreshed.find(p => p.name?.toLowerCase() === name.toLowerCase())
-      if (newPerson) startSuggestions(newPerson.id, newPerson.name!)
-      load()
+      setClusters(prev => prev.filter(c => c.id !== clusterId))
+      setUnnamedTotal(prev => Math.max(0, prev - 1))
+      setPersons(prev => {
+        if (prev.some(p => p.id === created.person_id)) return prev
+        return [
+          {
+            id: created.person_id,
+            uuid: created.uuid,
+            name,
+            photo_count: sourceCluster?.member_count ?? 0,
+            representative_thumbnail: sourceCluster?.representative_thumbnail ?? null,
+            name_written: 0,
+          },
+          ...prev,
+        ]
+      })
+      startSuggestions(created.person_id, name)
+      logPeopleFlow('name_from_cluster', startedAt, { cluster_id: clusterId, person_id: created.person_id })
     } finally { setSaving(false) }
   }
 
   async function handleMerge(clusterId: number, personId: number) {
     setSaving(true)
     try {
+      const startedAt = performance.now()
+      const merged = clusters.find(c => c.id === clusterId)
       await api.persons.addCluster(personId, clusterId)
+      applyAcceptedSuggestionLocally(personId, {
+        id: clusterId,
+        member_count: merged?.member_count ?? 0,
+        representative_thumbnail: merged?.representative_thumbnail ?? null,
+      })
       setMergeCandidate(null)
       setNamingId(null)
       setNameInput('')
-      load()
+      logPeopleFlow('manual_merge_cluster', startedAt, { cluster_id: clusterId, person_id: personId })
     } finally { setSaving(false) }
   }
 
@@ -1369,8 +1432,29 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
               <button onClick={async () => {
                 setSaving(true)
                 try {
-                  await api.persons.fromCluster(namingId!, nameInput.trim() + ' (2)')
-                  setMergeCandidate(null); setNamingId(null); setNameInput(''); load()
+                  const altName = nameInput.trim() + ' (2)'
+                  const sourceCluster = clusters.find(c => c.id === namingId!)
+                  const created = await api.persons.fromCluster(namingId!, altName)
+                  setClusters(prev => prev.filter(c => c.id !== namingId!))
+                  setUnnamedTotal(prev => Math.max(0, prev - 1))
+                  setPersons(prev => {
+                    if (prev.some(p => p.id === created.person_id)) return prev
+                    return [
+                      {
+                        id: created.person_id,
+                        uuid: created.uuid,
+                        name: altName,
+                        photo_count: sourceCluster?.member_count ?? 0,
+                        representative_thumbnail: sourceCluster?.representative_thumbnail ?? null,
+                        name_written: 0,
+                      },
+                      ...prev,
+                    ]
+                  })
+                  setMergeCandidate(null)
+                  setNamingId(null)
+                  setNameInput('')
+                  startSuggestions(created.person_id, altName)
                 } finally { setSaving(false) }
               }} disabled={saving}
                 className="flex-1 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-white rounded-lg py-2 text-sm font-medium">

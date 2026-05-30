@@ -14,6 +14,7 @@ import uuid as _uuid
 # Media
 # ---------------------------------------------------------------------------
 class MediaFileBase(BaseModel):
+    asset_id: Optional[str] = None
     file_path: str
     file_hash: str
     file_size: Optional[int] = None

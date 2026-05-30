@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid as _uuid
 from typing import Literal, Optional
 
@@ -268,6 +269,48 @@ async def _load_cluster_centroid(db, cluster_id: int) -> np.ndarray | None:
     return _weighted_centroid_from_rows(rows)
 
 
+async def _load_unnamed_cluster_rows_by_ids(db, cluster_ids: list[int]) -> list[dict]:
+    if not cluster_ids:
+        return []
+
+    cluster_ph = ",".join("?" for _ in cluster_ids)
+    return await db.execute_fetchall(
+        f"""
+        SELECT c.id AS cluster_id, c.member_count, c.intra_similarity, c.is_high_conf, c.centroid,
+             COALESCE(MIN(f_current.thumbnail_path), MIN(f_legacy.thumbnail_path)) AS representative_thumbnail
+        FROM clusters c
+         LEFT JOIN v_face_cluster_current fcc ON fcc.cluster_guid = c.cluster_guid
+         LEFT JOIN faces f_current ON f_current.face_guid = fcc.face_guid AND f_current.thumbnail_path IS NOT NULL
+         LEFT JOIN faces f_legacy ON f_legacy.cluster_id = c.id AND f_legacy.thumbnail_path IS NOT NULL
+        LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
+        LEFT JOIN persons owner_person ON owner_person.person_guid = cpc.person_guid AND owner_person.is_merged = 0
+        WHERE owner_person.id IS NULL
+          AND c.id IN ({cluster_ph})
+        GROUP BY c.id
+        """,
+        cluster_ids,
+    )
+
+
+async def _load_cluster_centroids_by_ids(db, cluster_ids: list[int]) -> dict[int, np.ndarray | None]:
+    if not cluster_ids:
+        return {}
+
+    cluster_ph = ",".join("?" for _ in cluster_ids)
+    rows = await db.execute_fetchall(
+        f"""
+        SELECT id, centroid
+        FROM clusters
+        WHERE id IN ({cluster_ph})
+        """,
+        cluster_ids,
+    )
+    return {
+        int(r["id"]): _normalise_vector(load_centroid(r["centroid"])) if r["centroid"] else None
+        for r in rows
+    }
+
+
 # ---------------------------------------------------------------------------
 # Post-merge FAISS re-score
 # ---------------------------------------------------------------------------
@@ -300,27 +343,26 @@ async def _rescore_after_person_update(person_id: int) -> None:
         if _faiss.total == 0:
             return
 
-        # Load the person's current centroid
         async with get_db() as db:
+            # Load the person's current centroid.
             p_row = await (await db.execute(
                 "SELECT name, centroid FROM persons WHERE id=? AND is_merged=0",
                 (person_id,),
             )).fetchone()
-        if not p_row or not p_row["centroid"]:
-            return
+            if not p_row or not p_row["centroid"]:
+                return
 
-        person_name = p_row["name"]
-        person_centroid = load_centroid(p_row["centroid"])
+            person_name = p_row["name"]
+            person_centroid = load_centroid(p_row["centroid"])
 
-        # FAISS NN search — get the 30 closest face embeddings
-        hits = _faiss.search(person_centroid, k=30, threshold=suggest_th)
-        if not hits:
-            return
+            # FAISS NN search — get the 30 closest face embeddings.
+            hits = _faiss.search(person_centroid, k=30, threshold=suggest_th)
+            if not hits:
+                return
 
-        # Map hit face_ids → cluster info in one DB query
-        hit_face_ids = [fid for fid, _ in hits]
-        ph = ",".join("?" * len(hit_face_ids))
-        async with get_db() as db:
+            # Map hit face_ids → cluster info and batch-load all centroids in one DB session.
+            hit_face_ids = [fid for fid, _ in hits]
+            ph = ",".join("?" * len(hit_face_ids))
             rows = await db.execute_fetchall(f"""
                 SELECT f.id AS face_id,
                        COALESCE(c_current.id, f.cluster_id) AS cluster_id,
@@ -362,66 +404,56 @@ async def _rescore_after_person_update(person_id: int) -> None:
                 """,
                 (person_id,),
             )
-
             blocked_ids = await _blocked_person_ids(db, person_id)
 
-        rejected_cluster_ids = {r["cluster_id"] for r in rejected_rows}
-        candidate_cluster_ids = list({int(r["cluster_id"]) for r in rows if r["cluster_id"] is not None})
-        async with get_db() as db:
+            rejected_cluster_ids = {int(r["cluster_id"]) for r in rejected_rows}
+            candidate_cluster_ids = list(dict.fromkeys(int(r["cluster_id"]) for r in rows if r["cluster_id"] is not None))
             same_photo_conflicts = await _load_same_photo_conflicts(db, [person_id], candidate_cluster_ids)
-        competitor_centroids = [
-            (int(r["id"]), _normalise_vector(load_centroid(r["centroid"])))
-            for r in competitor_rows
-            if r["centroid"]
-        ]
+            cluster_centroid_cache = await _load_cluster_centroids_by_ids(db, candidate_cluster_ids)
+            competitor_centroids = [
+                (int(r["id"]), _normalise_vector(load_centroid(r["centroid"])))
+                for r in competitor_rows
+                if r["centroid"]
+            ]
 
-        hit_map: dict[int, dict] = {r["face_id"]: dict(r) for r in rows}
-        cluster_centroid_cache: dict[int, np.ndarray | None] = {}
+            hit_map: dict[int, dict] = {int(r["face_id"]): dict(r) for r in rows}
 
-        suggestions: list[dict] = []
-        auto_named = 0
-        seen_clusters: set[int] = set()
+            suggestions: list[dict] = []
+            auto_named = 0
+            seen_clusters: set[int] = set()
 
-        for face_id, sim in hits:
-            info = hit_map.get(face_id)
-            if info is None:
-                continue
-            cluster_id = info["cluster_id"]
-            if cluster_id in seen_clusters:
-                continue
-            # Skip faces that already belong to this person or another named person
-            if info["cluster_person_id"] is not None:
-                # Allow if it belongs to THIS person (already named, skip)
-                # Skip if it belongs to a DIFFERENT person
+            for face_id, sim in hits:
+                info = hit_map.get(face_id)
+                if info is None:
+                    continue
+                cluster_id = int(info["cluster_id"])
+                if cluster_id in seen_clusters:
+                    continue
+                # Skip faces that already belong to this person or another named person.
+                if info["cluster_person_id"] is not None:
+                    seen_clusters.add(cluster_id)
+                    continue
+                if cluster_id in rejected_cluster_ids:
+                    seen_clusters.add(cluster_id)
+                    continue
+                if (person_id, cluster_id) in same_photo_conflicts:
+                    seen_clusters.add(cluster_id)
+                    continue
+
                 seen_clusters.add(cluster_id)
-                continue
-            if cluster_id in rejected_cluster_ids:
-                seen_clusters.add(cluster_id)
-                continue
-            if (person_id, int(cluster_id)) in same_photo_conflicts:
-                seen_clusters.add(cluster_id)
-                continue
 
-            seen_clusters.add(cluster_id)
+                cluster_centroid = cluster_centroid_cache.get(cluster_id)
+                if cluster_centroid is None:
+                    continue
 
-            if cluster_id not in cluster_centroid_cache:
-                async with get_db() as db:
-                    cluster_centroid_cache[cluster_id] = await _load_cluster_centroid(db, cluster_id)
+                competing_id, competing_sim = _best_competing_person(cluster_centroid, competitor_centroids)
+                margin = float("inf") if competing_sim is None else (sim - competing_sim)
 
-            cluster_centroid = cluster_centroid_cache.get(cluster_id)
-            if cluster_centroid is None:
-                continue
+                if competing_id is not None and competing_id in blocked_ids and competing_sim is not None and competing_sim >= suggest_th:
+                    continue
 
-            competing_id, competing_sim = _best_competing_person(cluster_centroid, competitor_centroids)
-            margin = float("inf") if competing_sim is None else (sim - competing_sim)
-
-            if competing_id is not None and competing_id in blocked_ids and competing_sim is not None and competing_sim >= suggest_th:
-                continue
-
-            if sim >= auto_th and margin >= _AUTO_NAME_MIN_MARGIN:
-                # Auto-assign this unnamed cluster to the person
-                async with get_db() as db:
-                    co_clusters = await _load_cooccurring_unnamed_clusters_for_cluster(db, int(cluster_id))
+                if sim >= auto_th and margin >= _AUTO_NAME_MIN_MARGIN:
+                    co_clusters = await _load_cooccurring_unnamed_clusters_for_cluster(db, cluster_id)
                     await db.execute(
                         UPDATE_CLUSTER_PERSON_SQL,
                         (person_id, cluster_id),
@@ -441,36 +473,36 @@ async def _rescore_after_person_update(person_id: int) -> None:
                         SELECT DISTINCT media_file_id FROM faces WHERE cluster_id=?
                     """, (cluster_id,))
                     await update_person_centroid(db, person_id)
-                for other_cid in co_clusters:
-                    same_photo_conflicts.add((int(person_id), int(other_cid)))
-                auto_named += 1
+                    for other_cid in co_clusters:
+                        same_photo_conflicts.add((int(person_id), int(other_cid)))
+                    auto_named += 1
+                    logger.info(
+                        "Post-merge FAISS: auto-named cluster %d → '%s' (sim=%.3f)",
+                        cluster_id, person_name, sim,
+                    )
+
+                elif sim >= suggest_th and margin >= _SUGGEST_MIN_MARGIN:
+                    suggestions.append({
+                        "person_id":       person_id,
+                        "person_name":     person_name,
+                        "person_face_id":  None,
+                        "cluster_id":      cluster_id,
+                        "cluster_face_id": face_id,
+                        "similarity":      round(sim, 3),
+                        "competing_person_id": competing_id,
+                        "competing_similarity": round(competing_sim, 3) if competing_sim is not None else None,
+                        "margin": round(margin, 3) if np.isfinite(margin) else None,
+                        "member_count":    info["member_count"] or 1,
+                    })
+
+            if suggestions:
+                # Deduplicate and cap at 5 — don't flood the UI.
+                suggestions.sort(key=lambda s: s["similarity"], reverse=True)
+                await broadcast("merge_suggestions", suggestions=suggestions[:5])
                 logger.info(
-                    "Post-merge FAISS: auto-named cluster %d → '%s' (sim=%.3f)",
-                    cluster_id, person_name, sim,
+                    "Post-merge FAISS: %d auto-named, %d suggestions for '%s'",
+                    auto_named, len(suggestions), person_name,
                 )
-
-            elif sim >= suggest_th and margin >= _SUGGEST_MIN_MARGIN:
-                suggestions.append({
-                    "person_id":       person_id,
-                    "person_name":     person_name,
-                    "person_face_id":  None,
-                    "cluster_id":      cluster_id,
-                    "cluster_face_id": face_id,
-                    "similarity":      round(sim, 3),
-                    "competing_person_id": competing_id,
-                    "competing_similarity": round(competing_sim, 3) if competing_sim is not None else None,
-                    "margin": round(margin, 3) if np.isfinite(margin) else None,
-                    "member_count":    info["member_count"] or 1,
-                })
-
-        if suggestions:
-            # Deduplicate and cap at 5 — don't flood the UI
-            suggestions.sort(key=lambda s: s["similarity"], reverse=True)
-            await broadcast("merge_suggestions", suggestions=suggestions[:5])
-            logger.info(
-                "Post-merge FAISS: %d auto-named, %d suggestions for '%s'",
-                auto_named, len(suggestions), person_name,
-            )
 
     except Exception as exc:
         # Non-fatal — log and continue; the user action already succeeded
@@ -480,6 +512,7 @@ async def _rescore_after_person_update(person_id: int) -> None:
 async def _refresh_person_after_identity_change(person_id: int) -> None:
     """Refresh centroid, suggestions, and co-occurrence after membership changes."""
     async with get_db() as db:
+        await _sync_photo_count(db, person_id)
         await update_person_centroid(db, person_id)
 
     await _rescore_after_person_update(person_id)
@@ -745,19 +778,55 @@ async def _score_similar_unnamed_clusters(
     limit: int | None = None,
 ) -> list[dict]:
     exclude_cluster_ids = exclude_cluster_ids or set()
-    candidates = await db.execute_fetchall(
-        """
-        SELECT c.id AS cluster_id, c.member_count, c.intra_similarity,
-               c.is_high_conf, c.centroid,
-               MIN(f.thumbnail_path) AS representative_thumbnail
-        FROM clusters c
-        LEFT JOIN faces f ON f.cluster_id = c.id AND f.thumbnail_path IS NOT NULL
-        LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
-        LEFT JOIN persons owner_person ON owner_person.person_guid = cpc.person_guid AND owner_person.is_merged = 0
-        WHERE owner_person.id IS NULL
-        GROUP BY c.id
-        """
-    )
+    candidates = None
+
+    try:
+        from backend.pipeline.ingest import _faiss
+
+        if _faiss.total > 0:
+            shortlist_k = min(max((limit or 50) * 40, 250), min(_faiss.total, 2000))
+            face_hits = _faiss.search(source_vec, k=shortlist_k, threshold=0.0)
+            if face_hits:
+                hit_face_ids = [fid for fid, _ in face_hits]
+                ph = ",".join("?" for _ in hit_face_ids)
+                cluster_rows = await db.execute_fetchall(
+                    f"""
+                    SELECT DISTINCT COALESCE(c_current.id, f.cluster_id) AS cluster_id
+                    FROM faces f
+                    LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                    LEFT JOIN clusters c_current ON c_current.cluster_guid = fcc.cluster_guid
+                    LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = COALESCE(fcc.cluster_guid, c_current.cluster_guid)
+                    LEFT JOIN persons owner_person ON owner_person.person_guid = cpc.person_guid AND owner_person.is_merged = 0
+                    WHERE f.id IN ({ph})
+                      AND COALESCE(c_current.id, f.cluster_id) IS NOT NULL
+                      AND owner_person.id IS NULL
+                    """,
+                    hit_face_ids,
+                )
+                candidate_cluster_ids = list(dict.fromkeys(
+                    int(r["cluster_id"]) for r in cluster_rows if r["cluster_id"] is not None
+                ))
+                if candidate_cluster_ids:
+                    candidates = await _load_unnamed_cluster_rows_by_ids(db, candidate_cluster_ids)
+    except Exception:
+        candidates = None
+
+    if not candidates:
+        candidates = await db.execute_fetchall(
+            """
+            SELECT c.id AS cluster_id, c.member_count, c.intra_similarity,
+                   c.is_high_conf, c.centroid,
+                 COALESCE(MIN(f_current.thumbnail_path), MIN(f_legacy.thumbnail_path)) AS representative_thumbnail
+            FROM clusters c
+             LEFT JOIN v_face_cluster_current fcc ON fcc.cluster_guid = c.cluster_guid
+             LEFT JOIN faces f_current ON f_current.face_guid = fcc.face_guid AND f_current.thumbnail_path IS NOT NULL
+             LEFT JOIN faces f_legacy ON f_legacy.cluster_id = c.id AND f_legacy.thumbnail_path IS NOT NULL
+            LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
+            LEFT JOIN persons owner_person ON owner_person.person_guid = cpc.person_guid AND owner_person.is_merged = 0
+            WHERE owner_person.id IS NULL
+            GROUP BY c.id
+            """
+        )
 
     rejected_cluster_ids: set[int] = set()
     if rejected_for_person_id is not None:
@@ -771,6 +840,10 @@ async def _score_similar_unnamed_clusters(
     for cand in candidates:
         cid = int(cand["cluster_id"])
         if cid in exclude_cluster_ids or cid in rejected_cluster_ids or not cand["centroid"]:
+            continue
+        if not cand["representative_thumbnail"]:
+            # Do not surface clusters that cannot render in merge UI.
+            # This also filters orphan/stale clusters that have centroids but no current face rows.
             continue
         vec = _normalise_vector(np.frombuffer(cand["centroid"], dtype=np.float32))
         sim = float(np.dot(source_vec, vec))
@@ -1597,6 +1670,7 @@ async def create_person_from_cluster(cluster_id: int, req: NameClusterRequest, b
 @router.post("/{person_id}/add-cluster/{cluster_id}")
 async def add_cluster_to_person(person_id: int, cluster_id: int, background_tasks: BackgroundTasks):
     """Assign an existing cluster to an existing person (merge path)."""
+    started_at = time.perf_counter()
     async with get_db() as db:
         existing = await (
             await db.execute("SELECT id FROM persons WHERE id=? AND is_merged=0", (person_id,))
@@ -1658,6 +1732,12 @@ async def add_cluster_to_person(person_id: int, cluster_id: int, background_task
         profile_id,
         _refresh_person_after_identity_change,
         person_id,
+    )
+    logger.info(
+        "add_cluster_to_person person_id=%d cluster_id=%d elapsed_ms=%d",
+        person_id,
+        cluster_id,
+        int((time.perf_counter() - started_at) * 1000),
     )
     return {"status": "merged", "person_id": person_id}
 
@@ -2014,6 +2094,7 @@ async def get_merge_suggestions(person_id: int, limit: int = 1):
     ranked by cosine similarity between embedding centroids.
     Only clusters not previously rejected for this person are returned.
     """
+    started_at = time.perf_counter()
     async with get_db() as db:
         person = await (
             await db.execute(
@@ -2040,30 +2121,24 @@ async def get_merge_suggestions(person_id: int, limit: int = 1):
         if person_centroid is None:
             return []
 
-        # Unnamed clusters not yet rejected for this person
-        candidates = await db.execute_fetchall("""
-            SELECT c.id AS cluster_id, c.member_count,
-                   c.intra_similarity, c.is_high_conf,
-                   MIN(f.thumbnail_path) AS representative_thumbnail
-            FROM clusters c
-            JOIN faces f ON f.cluster_id = c.id
-            LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
-            LEFT JOIN persons p ON p.person_guid = cpc.person_guid AND p.is_merged = 0 AND p.is_ignored = 0
-            WHERE p.id IS NULL
-              AND c.id NOT IN (
-                  SELECT cluster_id FROM rejected_suggestions WHERE person_id = ?
-              )
-            GROUP BY c.id
-        """, (person_id,))
-
-        if not candidates:
+        # Use indexed shortlist first, then exact centroid scoring/filters.
+        shortlist = await _score_similar_unnamed_clusters(
+            db,
+            person_centroid,
+            rejected_for_person_id=person_id,
+            limit=max(limit * 50, 250),
+        )
+        if not shortlist:
             return []
+
+        candidate_cluster_ids = [int(c["cluster_id"]) for c in shortlist]
 
         same_photo_conflicts = await _load_same_photo_conflicts(
             db,
             [person_id],
-            [int(c["cluster_id"]) for c in candidates],
+            candidate_cluster_ids,
         )
+        centroid_by_cluster = await _load_cluster_centroids_by_ids(db, candidate_cluster_ids)
 
         competitor_rows = await db.execute_fetchall(
             """
@@ -2084,38 +2159,40 @@ async def get_merge_suggestions(person_id: int, limit: int = 1):
             if r["centroid"]
         ]
 
-        # Score each candidate
         scored: list[dict] = []
-        for cand in candidates:
-            cid = cand["cluster_id"]
+        for cand in shortlist:
+            cid = int(cand["cluster_id"])
             if (person_id, int(cid)) in same_photo_conflicts:
                 continue
-            cand_embs = await db.execute_fetchall("""
-                SELECT e.vector, f.detection_conf, f.bbox_w, f.bbox_h
-                FROM embeddings e
-                JOIN faces f ON f.id = e.face_id
-                WHERE f.cluster_id = ?
-            """, (cid,))
-            centroid = _weighted_centroid_from_rows(cand_embs)
+            centroid = centroid_by_cluster.get(cid)
             if centroid is None:
                 continue
-            sim = float(np.dot(person_centroid, centroid))
-            if sim >= _SUGGEST_THRESHOLD:
-                competing_id, competing_sim = _best_competing_person(centroid, competitor_centroids)
-                if competing_id is not None and competing_id in blocked_ids and competing_sim is not None and competing_sim >= _SUGGEST_THRESHOLD:
-                    continue
-                margin = float("inf") if competing_sim is None else (sim - competing_sim)
-                if margin < _SUGGEST_MIN_MARGIN:
-                    continue
-                scored.append({
-                    **dict(cand),
-                    "similarity": round(sim, 3),
-                    "competing_person_id": competing_id,
-                    "competing_similarity": round(competing_sim, 3) if competing_sim is not None else None,
-                    "margin": round(margin, 3) if np.isfinite(margin) else None,
-                })
+            sim = float(cand["similarity"])
+            if sim < _SUGGEST_THRESHOLD:
+                continue
+            competing_id, competing_sim = _best_competing_person(centroid, competitor_centroids)
+            if competing_id is not None and competing_id in blocked_ids and competing_sim is not None and competing_sim >= _SUGGEST_THRESHOLD:
+                continue
+            margin = float("inf") if competing_sim is None else (sim - competing_sim)
+            if margin < _SUGGEST_MIN_MARGIN:
+                continue
+            scored.append({
+                **dict(cand),
+                "similarity": round(sim, 3),
+                "competing_person_id": competing_id,
+                "competing_similarity": round(competing_sim, 3) if competing_sim is not None else None,
+                "margin": round(margin, 3) if np.isfinite(margin) else None,
+            })
 
         scored.sort(key=lambda x: x["similarity"], reverse=True)
+        logger.info(
+            "merge_suggestions person_id=%d limit=%d shortlist=%d returned=%d elapsed_ms=%d",
+            person_id,
+            limit,
+            len(shortlist),
+            min(len(scored), limit),
+            int((time.perf_counter() - started_at) * 1000),
+        )
         return scored[:limit]
 
 
@@ -2134,6 +2211,7 @@ async def find_similar_all(request: FindSimilarAllRequest, background_tasks: Bac
     auto_threshold = max(_SUGGEST_THRESHOLD, min(1.0, request.auto_threshold))
     max_suggestions = max(50, min(5000, int(request.max_suggestions or 500)))
     max_per_person = max(5, min(100, max_suggestions // 10))
+    started_at = time.perf_counter()
 
     auto_merged: list[dict] = []
     suggestions: list[dict] = []
@@ -2186,17 +2264,18 @@ async def find_similar_all(request: FindSimilarAllRequest, background_tasks: Bac
                 continue
             cluster_centroids[cid] = c_vec
 
-        cluster_by_id = {c["cluster_id"]: c for c in unnamed_clusters}
-        named_person_ids = [int(p["id"]) for p in named_persons]
-        unnamed_cluster_ids = [int(c["cluster_id"]) for c in unnamed_clusters]
-        same_photo_conflicts = await _load_same_photo_conflicts(
-            db,
-            named_person_ids,
-            unnamed_cluster_ids,
-        )
+        cluster_by_id = {int(c["cluster_id"]): c for c in unnamed_clusters}
 
         # Track clusters already auto-merged this run — don't suggest them again
         already_merged_cluster_ids: set[int] = set()
+        face_index = None
+        try:
+            from backend.pipeline.ingest import _faiss
+
+            if _faiss.total > 0:
+                face_index = _faiss
+        except Exception:
+            face_index = None
 
         for person in named_persons:
             person_id = person["id"]
@@ -2240,16 +2319,50 @@ async def find_similar_all(request: FindSimilarAllRequest, background_tasks: Bac
             rejected = await db.execute_fetchall(
                 "SELECT cluster_id FROM rejected_suggestions WHERE person_id = ?", (person_id,)
             )
-            rejected_ids = {r["cluster_id"] for r in rejected}
+            rejected_ids = {int(r["cluster_id"]) for r in rejected}
             person_suggestions: list[dict] = []
+            candidate_cluster_ids = list(cluster_centroids.keys())
 
-            for cid, c_vec in cluster_centroids.items():
+            if face_index is not None:
+                shortlist_k = min(max(max_per_person * 60, 500), min(face_index.total, 5000))
+                face_hits = face_index.search(p_centroid, k=shortlist_k, threshold=0.0)
+                if face_hits:
+                    hit_face_ids = [fid for fid, _ in face_hits]
+                    ph = ",".join("?" for _ in hit_face_ids)
+                    hit_clusters = await db.execute_fetchall(
+                        f"""
+                        SELECT DISTINCT COALESCE(c_current.id, f.cluster_id) AS cluster_id
+                        FROM faces f
+                        LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                        LEFT JOIN clusters c_current ON c_current.cluster_guid = fcc.cluster_guid
+                        LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = COALESCE(fcc.cluster_guid, c_current.cluster_guid)
+                        LEFT JOIN persons owner_person ON owner_person.person_guid = cpc.person_guid AND owner_person.is_merged = 0 AND owner_person.is_ignored = 0
+                        WHERE f.id IN ({ph})
+                          AND COALESCE(c_current.id, f.cluster_id) IS NOT NULL
+                          AND owner_person.id IS NULL
+                        """,
+                        hit_face_ids,
+                    )
+                    candidate_cluster_ids = [
+                        int(r["cluster_id"])
+                        for r in hit_clusters
+                        if r["cluster_id"] is not None and int(r["cluster_id"]) in cluster_centroids
+                    ]
+
+            same_photo_conflicts = await _load_same_photo_conflicts(db, [person_id], candidate_cluster_ids)
+
+            for cid in candidate_cluster_ids:
+                c_vec = cluster_centroids.get(int(cid))
+                if c_vec is None:
+                    continue
                 if cid in rejected_ids or cid in already_merged_cluster_ids:
                     continue
                 if (int(person_id), int(cid)) in same_photo_conflicts:
                     continue
                 sim = float(np.dot(p_centroid, c_vec))
-                cluster = cluster_by_id[cid]
+                cluster = cluster_by_id.get(int(cid))
+                if cluster is None:
+                    continue
                 competing_id, competing_sim = _best_competing_person(c_vec, competitor_centroids)
                 if competing_id is not None and competing_id in blocked_ids and competing_sim is not None and competing_sim >= _SUGGEST_THRESHOLD:
                     continue
@@ -2275,7 +2388,6 @@ async def find_similar_all(request: FindSimilarAllRequest, background_tasks: Bac
                         INSERT OR REPLACE INTO writeback_queue (media_file_id)
                         SELECT DISTINCT media_file_id FROM faces WHERE cluster_id=?
                     """, (cid,))
-                    await _sync_photo_count(db, person_id)
                     refresh_person_ids.add(int(person_id))
                     for other_cid in co_clusters:
                         same_photo_conflicts.add((int(person_id), int(other_cid)))
@@ -2331,6 +2443,14 @@ async def find_similar_all(request: FindSimilarAllRequest, background_tasks: Bac
             _refresh_person_after_identity_change,
             person_id,
         )
+    logger.info(
+        "find_similar_all auto_threshold=%.3f persons=%d auto_merged=%d suggestions=%d elapsed_ms=%d",
+        auto_threshold,
+        len(named_persons) if 'named_persons' in locals() else 0,
+        len(auto_merged),
+        len(deduped),
+        int((time.perf_counter() - started_at) * 1000),
+    )
     return {"auto_merged": auto_merged, "suggestions": deduped}
 
 

@@ -1185,7 +1185,13 @@ async def _phase_scan(folder: Path, use_existing_vip_data: bool = True) -> None:
                 file_hash = path_to_hash[str(file_path)]
                 meta = exif_map.get(str(file_path)) or {}
 
-                skip, existing_id = await check_idempotency(db, file_hash, file_path_str)
+                stable_identifier = meta.get("xmp_identifier") if use_existing_vip_data else None
+                skip, existing_id = await check_idempotency(
+                    db,
+                    file_hash,
+                    file_path_str,
+                    stable_identifier=stable_identifier,
+                )
                 if skip:
                     skipped += 1
                     continue
@@ -1198,14 +1204,14 @@ async def _phase_scan(folder: Path, use_existing_vip_data: bool = True) -> None:
                     # Re-evaluation: update existing record (also clears removed_from_app)
                     await db.execute("""
                         UPDATE media_files SET
-                            file_path=?, file_size=?, file_format=?, camera_make=?, camera_model=?,
+                            file_path=?, file_hash=?, file_size=?, file_format=?, camera_make=?, camera_model=?,
                             date_taken=?, gps_lat=?, gps_lon=?, width=?, height=?,
                             is_stub=?, exposure_time_s=?,
                             ingest_state='scanned', needs_reprocess=0, removed_from_app=0,
                             last_seen_at=datetime('now')
                         WHERE id=?
                     """, (
-                        file_path_str, stat.st_size, meta.get("file_format"),
+                        file_path_str, file_hash, stat.st_size, meta.get("file_format"),
                         meta.get("camera_make"), meta.get("camera_model"),
                         meta.get("date_taken"), meta.get("gps_lat"), meta.get("gps_lon"),
                         meta.get("width"), meta.get("height"), int(is_stub),
@@ -1220,11 +1226,14 @@ async def _phase_scan(folder: Path, use_existing_vip_data: bool = True) -> None:
                     _candidate_id = meta.get("xmp_identifier") if use_existing_vip_data else None
                     if _candidate_id:
                         _taken = await (await db.execute(
-                            "SELECT 1 FROM media_files WHERE vip_id=?", (_candidate_id,)
+                            "SELECT 1 FROM media_files WHERE vip_id=? OR asset_id=?",
+                            (_candidate_id, _candidate_id),
                         )).fetchone()
-                        new_vip_id = _candidate_id if _taken is None else str(uuid.uuid4())
+                        new_asset_id = _candidate_id if _taken is None else str(uuid.uuid4())
                     else:
-                        new_vip_id = str(uuid.uuid4())
+                        new_asset_id = str(uuid.uuid4())
+                    # Keep vip_id in sync for compatibility with existing features.
+                    new_vip_id = new_asset_id
 
                     # Build a one-time snapshot of whatever rich XMP/IPTC data
                     # existed in the file *before* VIP touches it.  This snapshot
@@ -1244,12 +1253,13 @@ async def _phase_scan(folder: Path, use_existing_vip_data: bool = True) -> None:
 
                     await db.execute("""
                         INSERT INTO media_files
-                            (vip_id, file_path, file_hash, file_size, file_format, camera_make, camera_model,
+                            (vip_id, asset_id, file_path, file_hash, file_size, file_format, camera_make, camera_model,
                              date_taken, gps_lat, gps_lon, width, height, is_stub, exposure_time_s,
                              ingest_state, external_exif)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'scanned',?)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'scanned',?)
                     """, (
                         new_vip_id,
+                        new_asset_id,
                         file_path_str, file_hash, stat.st_size, meta.get("file_format"),
                         meta.get("camera_make"), meta.get("camera_model"),
                         meta.get("date_taken"), meta.get("gps_lat"), meta.get("gps_lon"),

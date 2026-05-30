@@ -391,7 +391,10 @@ export default function PhotoDetail({
 
           {/* Header */}
           <div className="flex items-start justify-between gap-2 p-5 pb-3">
-            <p className="text-sm font-medium text-white truncate">{filename}</p>
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-white truncate">{filename}</p>
+              <p className="mt-1 text-[11px] text-gray-500 break-all leading-snug">{filePath}</p>
+            </div>
             <button
               onClick={onClose}
               className="shrink-0 text-gray-400 hover:text-white text-lg leading-none"

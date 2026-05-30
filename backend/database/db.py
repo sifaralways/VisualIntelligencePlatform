@@ -108,6 +108,22 @@ async def init_db() -> None:
             await db.commit()
             logger.info("vip_id backfill complete")
 
+        # Backfill asset_id for rows that pre-date migration 026 or were
+        # created before the app upgrade.  Prefer vip_id for continuity.
+        asset_null_rows = await db.execute_fetchall(
+            "SELECT id, vip_id FROM media_files WHERE asset_id IS NULL"
+        )
+        if asset_null_rows:
+            logger.info("Backfilling asset_id for %d existing media rows…", len(asset_null_rows))
+            for r in asset_null_rows:
+                seed = r[1] if r[1] else str(_uuid_mod.uuid4())
+                await db.execute(
+                    "UPDATE media_files SET asset_id=? WHERE id=?",
+                    (seed, r[0]),
+                )
+            await db.commit()
+            logger.info("asset_id backfill complete")
+
     logger.info("Database ready.")
 
 

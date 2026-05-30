@@ -137,6 +137,9 @@ export default function App() {
   const [folderRescanBusy, setFolderRescanBusy] = useState(false)
   const [folderRescanMsg, setFolderRescanMsg] = useState<string | null>(null)
   const [folderRescanError, setFolderRescanError] = useState<string | null>(null)
+  const [folderWritebackBusy, setFolderWritebackBusy] = useState(false)
+  const [folderWritebackMsg, setFolderWritebackMsg] = useState<string | null>(null)
+  const [folderWritebackError, setFolderWritebackError] = useState<string | null>(null)
   // Subfolders keyed by scanned folder id — loaded lazily on expand
   const [subfolderMap, setSubfolderMap] = useState<Record<number, SubfolderItem[]>>({})
 
@@ -370,6 +373,8 @@ export default function App() {
   function openFiltered(filter: MediaFilter, title: string, backTo: SidebarSection, folderId?: number, pathPrefix?: string) {
     setFolderRescanMsg(null)
     setFolderRescanError(null)
+    setFolderWritebackMsg(null)
+    setFolderWritebackError(null)
     setFiltered({ filter, title, backTo, folderId, pathPrefix })
   }
 
@@ -377,12 +382,16 @@ export default function App() {
   function closeFiltered() {
     setFolderRescanMsg(null)
     setFolderRescanError(null)
+    setFolderWritebackMsg(null)
+    setFolderWritebackError(null)
     setFiltered(null)
   }
 
   /** Switch sidebar section — clears any filtered sub-view */
   function navigate(s: SidebarSection) {
     setSection(s)
+    setFolderWritebackMsg(null)
+    setFolderWritebackError(null)
     setFiltered(null)
   }
 
@@ -427,6 +436,23 @@ export default function App() {
     }
   }
 
+  async function handleFolderWriteback() {
+    if (!filtered?.folderId) return
+    setFolderWritebackBusy(true)
+    setFolderWritebackMsg(null)
+    setFolderWritebackError(null)
+    try {
+      const result = await api.folders.writeback(filtered.folderId, filtered.pathPrefix)
+      setFolderWritebackMsg(`Writeback complete for scope: written=${result.written}, failed=${result.failed}.`)
+      await loadFolders()
+      await loadSubfolders(filtered.folderId)
+    } catch (e: unknown) {
+      setFolderWritebackError(e instanceof Error ? e.message : 'Folder writeback failed')
+    } finally {
+      setFolderWritebackBusy(false)
+    }
+  }
+
   if (profileLoading && !selectedProfile) {
     return <div className="h-screen overflow-hidden bg-gray-950 text-gray-100 flex items-center justify-center">Loading profiles…</div>
   }
@@ -461,15 +487,34 @@ export default function App() {
   let mainContent: React.ReactNode
 
   if (filtered) {
+    const rootFolder = filtered.folderId ? folders.find(f => f.id === filtered.folderId) : null
+    const scopedPendingWriteback = filtered.folderId
+      ? (filtered.pathPrefix
+        ? (subfolderMap[filtered.folderId]?.find(s => s.path === filtered.pathPrefix)?.pending_writeback_count ?? 0)
+        : (rootFolder?.pending_writeback_count ?? 0))
+      : 0
+
     const folderRescanSlot = filtered.folderId ? (
-      <button
-        onClick={handleFolderRescan}
-        disabled={folderRescanBusy}
-        className="text-xs px-3 py-1.5 rounded-lg font-medium bg-indigo-700 text-white hover:bg-indigo-600 disabled:opacity-40 transition-colors"
-        title="Re-run all enabled models for this folder scope"
-      >
-        {folderRescanBusy ? 'Queuing…' : '⟳ Rescan Folder'}
-      </button>
+      <div className="flex items-center gap-2">
+        <button
+          onClick={handleFolderWriteback}
+          disabled={folderWritebackBusy || scopedPendingWriteback <= 0}
+          className="text-xs px-3 py-1.5 rounded-lg font-medium bg-emerald-700 text-white hover:bg-emerald-600 disabled:opacity-40 transition-colors"
+          title="Write pending metadata to files in this folder scope only"
+        >
+          {folderWritebackBusy
+            ? 'Writing…'
+            : `✍ Write Back (${scopedPendingWriteback.toLocaleString()} pending)`}
+        </button>
+        <button
+          onClick={handleFolderRescan}
+          disabled={folderRescanBusy}
+          className="text-xs px-3 py-1.5 rounded-lg font-medium bg-indigo-700 text-white hover:bg-indigo-600 disabled:opacity-40 transition-colors"
+          title="Re-run all enabled models for this folder scope"
+        >
+          {folderRescanBusy ? 'Queuing…' : '⟳ Rescan Folder'}
+        </button>
+      </div>
     ) : null
 
     mainContent = (
@@ -488,6 +533,16 @@ export default function App() {
         {filtered.folderId && folderRescanError && (
           <div className="text-xs text-red-300 bg-red-900/20 border border-red-700/30 rounded-lg px-3 py-2">
             {folderRescanError}
+          </div>
+        )}
+        {filtered.folderId && folderWritebackMsg && (
+          <div className="text-xs text-emerald-300 bg-emerald-900/20 border border-emerald-700/30 rounded-lg px-3 py-2">
+            {folderWritebackMsg}
+          </div>
+        )}
+        {filtered.folderId && folderWritebackError && (
+          <div className="text-xs text-red-300 bg-red-900/20 border border-red-700/30 rounded-lg px-3 py-2">
+            {folderWritebackError}
           </div>
         )}
         <PhotoGrid
@@ -1361,6 +1416,7 @@ interface TreeNode {
   path: string
   name: string
   photo_count: number
+  pending_writeback_count: number
   children: TreeNode[]
 }
 
@@ -1371,7 +1427,13 @@ function buildTree(root: string, items: SubfolderItem[]): TreeNode[] {
   const roots: TreeNode[] = []
 
   for (const item of items) {
-    const node: TreeNode = { path: item.path, name: item.name, photo_count: item.photo_count, children: [] }
+    const node: TreeNode = {
+      path: item.path,
+      name: item.name,
+      photo_count: item.photo_count,
+      pending_writeback_count: item.pending_writeback_count ?? 0,
+      children: [],
+    }
     nodeMap.set(item.path, node)
     const parentPath = item.path.substring(0, item.path.lastIndexOf('/'))
     const parent = parentPath === root ? null : nodeMap.get(parentPath)
@@ -1424,6 +1486,11 @@ function FolderTreeNode({
         >
           <span className="shrink-0">📁</span>
           <span className="truncate">{node.name}</span>
+          {node.pending_writeback_count > 0 && (
+            <span className={`shrink-0 rounded px-1.5 py-0.5 text-[9px] font-medium ${isActive ? 'bg-amber-200/20 text-amber-100' : 'bg-amber-900/40 text-amber-300'}`}>
+              {node.pending_writeback_count} pending
+            </span>
+          )}
           {node.photo_count > 0 && (
             <span className={`ml-auto pl-1 shrink-0 text-[10px] ${isActive ? 'text-indigo-200' : 'text-gray-600'}`}>
               {node.photo_count}
@@ -1503,6 +1570,11 @@ function FolderTreeRoot({
         <button onClick={onRootClick} className="flex-1 flex items-center gap-1.5 min-w-0 text-left px-1">
           <span className="text-base leading-none shrink-0">📁</span>
           <span className="truncate">{name}</span>
+          {folder.pending_writeback_count > 0 && (
+            <span className={`shrink-0 rounded px-1.5 py-0.5 text-[9px] font-medium ${isRootActive ? 'bg-amber-200/20 text-amber-100' : 'bg-amber-900/40 text-amber-300'}`}>
+              {folder.pending_writeback_count} pending
+            </span>
+          )}
           {folder.active_count > 0 && (
             <span className={`ml-auto pl-1 shrink-0 text-[10px] ${isRootActive ? 'text-indigo-200' : 'text-gray-600'}`}>
               {folder.active_count}

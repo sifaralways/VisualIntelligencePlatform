@@ -143,7 +143,7 @@ function SearchTile({ result, onClick }: { result: NaturalSearchResult; onClick:
   return (
     <button
       onClick={onClick}
-      title={`${filename}${date ? `  •  ${date}` : ''}`}
+      title={result.file_path}
       className="relative aspect-square bg-gray-900 rounded overflow-hidden group transition-all focus:outline-none hover:ring-2 hover:ring-indigo-400 focus:ring-2 focus:ring-indigo-400"
     >
       {errored ? (
@@ -163,6 +163,7 @@ function SearchTile({ result, onClick }: { result: NaturalSearchResult; onClick:
       {/* Hover overlay */}
       <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/40 to-transparent p-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
         <p className="text-white text-[10px] truncate">{filename}</p>
+        <p className="text-gray-300 text-[9px] truncate" title={result.file_path}>{result.file_path}</p>
         {date && <p className="text-gray-300 text-[9px]">{date}</p>}
         {result.persons?.length > 0 && (
           <p className="text-indigo-300 text-[9px] truncate">{result.persons.join(', ')}</p>

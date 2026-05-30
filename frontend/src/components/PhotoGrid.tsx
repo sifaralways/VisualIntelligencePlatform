@@ -373,7 +373,7 @@ function PhotoTile({
   return (
     <button
       onClick={onClick}
-      title={`${filename}${date ? `  •  ${date}` : ''}`}
+      title={photo.file_path}
       className={`relative aspect-square bg-gray-900 rounded overflow-hidden group transition-all focus:outline-none
         ${isSelected
           ? 'ring-2 ring-indigo-400'
@@ -396,6 +396,7 @@ function PhotoTile({
       {/* Hover overlay with filename */}
       <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/40 to-transparent p-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
         <p className="text-white text-[10px] truncate">{filename}</p>
+        <p className="text-gray-300 text-[9px] truncate" title={photo.file_path}>{photo.file_path}</p>
         {date && <p className="text-gray-300 text-[9px]">{date}</p>}
       </div>
       {selectable && (showCheckboxes || isSelected) && (

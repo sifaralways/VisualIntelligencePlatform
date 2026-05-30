@@ -182,7 +182,7 @@ async def list_media(
 # ---------------------------------------------------------------------------
 
 @router.get("/quality")
-async def quality_issues(issue: str = Query("all", regex="^(blurry|closed_eyes|all)$")):
+async def quality_issues(issue: str = Query("all", pattern="^(blurry|closed_eyes|all)$")):
     """Return media files flagged with quality issues.
 
     issue: 'blurry' | 'closed_eyes' | 'all'
