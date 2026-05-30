@@ -280,7 +280,13 @@ export const api = {
       request<MergeSuggestion[]>(`/persons/${personId}/merge-suggestions?limit=1`),
     rejectSuggestion: (personId: number, clusterId: number) =>
       request(`/persons/${personId}/reject-suggestion/${clusterId}`, { method: 'POST' }),
-    listIgnored: () => request<IgnoredPerson[]>('/persons/ignored'),
+    listIgnored: (params: { sortBy?: 'photo_count' | 'created_at'; sortDir?: 'asc' | 'desc' } = {}) => {
+      const search = new URLSearchParams()
+      if (params.sortBy) search.set('sort_by', params.sortBy)
+      if (params.sortDir) search.set('sort_dir', params.sortDir)
+      const qs = search.toString()
+      return request<IgnoredPerson[]>(`/persons/ignored${qs ? `?${qs}` : ''}`)
+    },
     unignore: (personId: number) =>
       request<{ status: string; person_id: number }>(`/persons/${personId}/unignore`, { method: 'POST' }),
     ignoredSuggestions: (personId: number, threshold: number, limit = 8) =>

@@ -1,4 +1,4 @@
-"""VIP API — Persons routes."""
+"""VIP API - Persons routes."""
 
 from __future__ import annotations
 
@@ -326,12 +326,12 @@ async def _rescore_after_person_update(person_id: int) -> None:
     1. Load the person's stored centroid from DB.
     2. Query the in-memory FAISS index for the k nearest face embeddings.
     3. For each hit that belongs to an unnamed cluster:
-       - sim >= auto_name_threshold  → auto-assign silently (same as Phase 3b)
-       - sim >= merge_suggest_threshold → broadcast as a suggestion card
+       - sim >= auto_name_threshold  -> auto-assign silently (same as Phase 3b)
+       - sim >= merge_suggest_threshold -> broadcast as a suggestion card
     4. Broadcast the suggestions via WebSocket so the frontend can show cards.
 
     This runs as a fire-and-forget background task so the API response is
-    instant — the WebSocket event arrives shortly after.
+    instant - the WebSocket event arrives shortly after.
     """
     try:
         from backend.pipeline.ingest import _faiss
@@ -355,12 +355,12 @@ async def _rescore_after_person_update(person_id: int) -> None:
             person_name = p_row["name"]
             person_centroid = load_centroid(p_row["centroid"])
 
-            # FAISS NN search — get the 30 closest face embeddings.
+            # FAISS NN search - get the 30 closest face embeddings.
             hits = _faiss.search(person_centroid, k=30, threshold=suggest_th)
             if not hits:
                 return
 
-            # Map hit face_ids → cluster info and batch-load all centroids in one DB session.
+            # Map hit face_ids -> cluster info and batch-load all centroids in one DB session.
             hit_face_ids = [fid for fid, _ in hits]
             ph = ",".join("?" * len(hit_face_ids))
             rows = await db.execute_fetchall(f"""
@@ -477,7 +477,7 @@ async def _rescore_after_person_update(person_id: int) -> None:
                         same_photo_conflicts.add((int(person_id), int(other_cid)))
                     auto_named += 1
                     logger.info(
-                        "Post-merge FAISS: auto-named cluster %d → '%s' (sim=%.3f)",
+                        "Post-merge FAISS: auto-named cluster %d -> '%s' (sim=%.3f)",
                         cluster_id, person_name, sim,
                     )
 
@@ -496,7 +496,7 @@ async def _rescore_after_person_update(person_id: int) -> None:
                     })
 
             if suggestions:
-                # Deduplicate and cap at 5 — don't flood the UI.
+                # Deduplicate and cap at 5 - don't flood the UI.
                 suggestions.sort(key=lambda s: s["similarity"], reverse=True)
                 await broadcast("merge_suggestions", suggestions=suggestions[:5])
                 logger.info(
@@ -505,7 +505,7 @@ async def _rescore_after_person_update(person_id: int) -> None:
                 )
 
     except Exception as exc:
-        # Non-fatal — log and continue; the user action already succeeded
+        # Non-fatal - log and continue; the user action already succeeded
         logger.warning("_rescore_after_person_update failed (non-fatal): %s", exc)
 
 
@@ -598,7 +598,7 @@ class NamePersonRequest(BaseModel):
 
 
 class MergeRequest(BaseModel):
-    into_person_id: int     # merge source → target (kept for backward compat)
+    into_person_id: int     # merge source -> target (kept for backward compat)
 
 
 class MergeNamedPersonsRequest(BaseModel):
@@ -623,7 +623,7 @@ class IgnoredPersonSuggestionRequest(BaseModel):
 
 @router.get("")
 async def list_persons():
-    """All persons — named and unnamed (clusters awaiting a name)."""
+    """All persons - named and unnamed (clusters awaiting a name)."""
     async with get_db() as db:
         rows = await db.execute_fetchall("""
             SELECT p.id, p.uuid, p.person_guid, p.name, p.created_at, p.named_at,
@@ -720,7 +720,7 @@ async def get_similar_clusters(cluster_id: int, limit: int = 8):
     ranked by cosine similarity between stored centroids.
 
     Used in the dismiss modal to help the user understand which other
-    face tiles would also be affected by an ‘always ignore’ decision.
+    face tiles would also be affected by an ‘always ignore' decision.
     """
     async with get_db() as db:
         source = await _load_cluster_for_ignore_actions(db, cluster_id)
@@ -965,11 +965,11 @@ async def delete_cluster(cluster_id: int):
 @router.post("/clusters/{cluster_id}/ignore")
 async def ignore_cluster(cluster_id: int):
     """
-    Mark an unnamed cluster as ‘always ignore’.
+    Mark an unnamed cluster as ‘always ignore'.
 
     Creates a hidden person record (is_ignored=1) and assigns the cluster to
     it.  During future pipeline runs, face detections whose ArcFace centroid
-    is close enough to this person’s centroid are automatically suppressed
+    is close enough to this person's centroid are automatically suppressed
     without surfacing in the unnamed clusters list or suggestion cards.
     """
     async with get_db() as db:
@@ -1037,15 +1037,19 @@ async def ignore_cluster_with_suggestions(cluster_id: int, request: IgnoreSugges
 
 
 @router.get("/ignored")
-async def list_ignored_persons():
+async def list_ignored_persons(
+    sort_by: Literal["photo_count", "created_at"] = Query("photo_count"),
+    sort_dir: Literal["asc", "desc"] = Query("desc"),
+):
     """
     Return all always-ignored persons.
 
     Each entry has a representative face thumbnail so the user can see
     which face they previously chose to hide.
     """
-    async with get_db() as db:
-        rows = await db.execute_fetchall("""
+    order_col = "photo_count" if sort_by == "photo_count" else "p.created_at"
+    order_dir = "ASC" if sort_dir == "asc" else "DESC"
+    sql = f"""
             SELECT p.id, p.uuid, p.created_at,
                    COUNT(DISTINCT f.media_file_id) AS photo_count,
                    COUNT(DISTINCT c.id)            AS cluster_count,
@@ -1056,8 +1060,11 @@ async def list_ignored_persons():
             LEFT JOIN faces f ON f.cluster_id = c.id
             WHERE p.is_ignored = 1 AND p.is_merged = 0
             GROUP BY p.id
-            ORDER BY photo_count DESC
-        """)
+            ORDER BY {order_col} {order_dir}, p.id DESC
+        """
+
+    async with get_db() as db:
+        rows = await db.execute_fetchall(sql)
     return [dict(r) for r in rows]
 
 
@@ -1080,11 +1087,11 @@ async def unignore_person(person_id: int):
         if not row:
             raise HTTPException(status_code=404, detail="Ignored person not found.")
 
-        # Detach faces → they go back to unowned pool
+        # Detach faces -> they go back to unowned pool
         await db.execute(
             "UPDATE faces SET person_id=NULL WHERE person_id=?", (person_id,)
         )
-        # Detach clusters → they return to the unnamed cluster list
+        # Detach clusters -> they return to the unnamed cluster list
         cluster_rows = await db.execute_fetchall(
             """
             SELECT c.id
@@ -1180,7 +1187,7 @@ async def delete_person(person_id: int, background_tasks: BackgroundTasks):
     Un-name a person: remove their name assignment and release all associated
     clusters back to the unnamed pool.
 
-    Does NOT delete faces or embeddings — the face detections are kept and
+    Does NOT delete faces or embeddings - the face detections are kept and
     will reappear in the Unnamed Faces tab after the next cluster run.
     """
     async with get_db() as db:
@@ -1249,7 +1256,7 @@ async def delete_person(person_id: int, background_tasks: BackgroundTasks):
         # 7. Delete the person row itself
         await db.execute("DELETE FROM persons WHERE id=?", (person_id,))
 
-    logger.info("Person %d ('%s') un-named — clusters released to unnamed pool", person_id, person["name"])
+    logger.info("Person %d ('%s') un-named - clusters released to unnamed pool", person_id, person["name"])
     return {"status": "deleted", "person_id": person_id}
 
 
@@ -1292,7 +1299,7 @@ async def name_person(person_id: int, req: NamePersonRequest, background_tasks: 
 
 @router.post("/merge")
 async def merge_persons(req: MergeRequest, source_id: int):
-    """Merge two persons (legacy endpoint — use /{a}/merge-with/{b} instead)."""
+    """Merge two persons (legacy endpoint - use /{a}/merge-with/{b} instead)."""
     async with get_db() as db:
         cluster_rows = await db.execute_fetchall(
             """
@@ -1370,7 +1377,7 @@ async def merge_named_persons(
         if row_b["is_merged"]:
             raise HTTPException(status_code=400, detail=f"Person {person_b_id} is already merged.")
 
-        # Determine survivor = person with more associated photos; ties → person_a.
+        # Determine survivor = person with more associated photos; ties -> person_a.
         count_a_row = await (
             await db.execute(
                 """
@@ -1714,7 +1721,7 @@ async def add_cluster_to_person(person_id: int, cluster_id: int, background_task
         await _promote_cluster_rejections_to_person_cannot_link(db, cluster_id, person_id)
         await _sync_photo_count(db, person_id)
 
-        # Clear any rejection record — user just accepted this cluster
+        # Clear any rejection record - user just accepted this cluster
         await db.execute(
             "DELETE FROM rejected_suggestions WHERE person_id=? AND cluster_id=?",
             (person_id, cluster_id),
@@ -2266,7 +2273,7 @@ async def find_similar_all(request: FindSimilarAllRequest, background_tasks: Bac
 
         cluster_by_id = {int(c["cluster_id"]): c for c in unnamed_clusters}
 
-        # Track clusters already auto-merged this run — don't suggest them again
+        # Track clusters already auto-merged this run - don't suggest them again
         already_merged_cluster_ids: set[int] = set()
         face_index = None
         try:

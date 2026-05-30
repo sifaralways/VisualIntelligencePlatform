@@ -35,6 +35,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   const [ignoredPersons, setIgnoredPersons] = useState<IgnoredPerson[]>([])
   const [ignoredLoading, setIgnoredLoading] = useState(false)
   const [ignoredLoaded, setIgnoredLoaded] = useState(false)
+  const [ignoredSort, setIgnoredSort] = useState<'photos_desc' | 'photos_asc' | 'newest' | 'oldest'>('photos_desc')
   const [unignoringId, setUnignoringId] = useState<number | null>(null)
   const [namingId, setNamingId] = useState<number | null>(null)  // cluster id being named
   const [nameInput, setNameInput] = useState('')
@@ -77,6 +78,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   // ── Named faces search ────────────────────────────────────────────────────
   const [nameSearch, setNameSearch] = useState('')
   const [namedMergeResult, setNamedMergeResult] = useState<MergePersonsResult | null>(null)
+  const unnamedTotalPages = Math.max(1, Math.ceil(unnamedTotal / UNNAMED_PAGE_SIZE))
 
   function toggleNamedSelect(id: number) {
     setNamedSelected(prev => {
@@ -243,6 +245,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     if (!mergedCluster) return
 
     setClusters(prev => prev.filter(c => c.id !== mergedCluster.id))
+    setUnnamedTotal(prev => Math.max(0, prev - 1))
 
     setPersons(prev => prev.map(p => {
       if (p.id !== personId) return p
@@ -431,6 +434,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     try {
       await Promise.all([...selected].map(id => api.clusters.delete(id)))
       setClusters(prev => prev.filter(c => !selected.has(c.id)))
+      setUnnamedTotal(prev => Math.max(0, prev - selected.size))
       exitSelectMode()
     } finally { setBulkWorking(false) }
   }
@@ -441,6 +445,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     try {
       await Promise.all([...selected].map(id => api.clusters.ignore(id)))
       setClusters(prev => prev.filter(c => !selected.has(c.id)))
+      setUnnamedTotal(prev => Math.max(0, prev - selected.size))
       exitSelectMode()
     } finally { setBulkWorking(false) }
   }
@@ -488,6 +493,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     try {
       await api.clusters.delete(clusterId)
       setClusters(prev => prev.filter(c => c.id !== clusterId))
+      setUnnamedTotal(prev => Math.max(0, prev - 1))
       setDismissTarget(null)
       setSimilarClusters([])
       if (ignoredLoaded) await loadIgnored()
@@ -499,6 +505,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     try {
       await api.clusters.ignore(clusterId)
       setClusters(prev => prev.filter(c => c.id !== clusterId))
+      setUnnamedTotal(prev => Math.max(0, prev - 1))
       setDismissTarget(null)
       setSimilarClusters([])
       if (ignoredLoaded) await loadIgnored()
@@ -621,7 +628,9 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   async function loadIgnored() {
     setIgnoredLoading(true)
     try {
-      const items = await api.persons.listIgnored()
+      const sortBy = ignoredSort === 'newest' || ignoredSort === 'oldest' ? 'created_at' : 'photo_count'
+      const sortDir = ignoredSort === 'photos_asc' || ignoredSort === 'oldest' ? 'asc' : 'desc'
+      const items = await api.persons.listIgnored({ sortBy, sortDir })
       setIgnoredPersons(items)
       setIgnoredLoaded(true)
     } finally {
@@ -656,6 +665,12 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
       loadIgnored()
     }
   }, [activeTab])
+
+  useEffect(() => {
+    if (activeTab === 'ignored' && ignoredLoaded) {
+      loadIgnored()
+    }
+  }, [ignoredSort])
 
   async function loadReviewPage(personId: number, page: number) {
     setReviewLoading(true)
@@ -873,11 +888,11 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
           }`}
         >
           Unnamed Faces
-          {clusters.length > 0 && (
+          {unnamedTotal > 0 && (
             <span className={`ml-1.5 text-xs px-1.5 py-0.5 rounded-full ${
               activeTab === 'unnamed' ? 'bg-indigo-600 text-white' : 'bg-gray-800 text-gray-500'
             }`}>
-              {clusters.length}
+              {unnamedTotal}
             </span>
           )}
         </button>
@@ -1488,7 +1503,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
         <section className="mb-8">
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
-              Unnamed clusters ({unnamedTotal})
+              Page {unnamedPage + 1} of {unnamedTotalPages}
             </h2>
             <div className="flex items-center gap-2">
               <label className="text-xs text-gray-500">Sort</label>
@@ -2221,6 +2236,19 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
             <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
               Always-ignored faces ({ignoredPersons.length})
             </h2>
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-gray-500">Sort</label>
+              <select
+                value={ignoredSort}
+                onChange={e => setIgnoredSort(e.target.value as 'photos_desc' | 'photos_asc' | 'newest' | 'oldest')}
+                className="text-xs px-2.5 py-1 rounded-lg border border-gray-600 bg-gray-800 text-gray-300"
+              >
+                <option value="photos_desc">Most photos</option>
+                <option value="photos_asc">Least photos</option>
+                <option value="newest">Recently ignored</option>
+                <option value="oldest">Oldest ignored</option>
+              </select>
+            </div>
           </div>
 
           {ignoredLoading && (
