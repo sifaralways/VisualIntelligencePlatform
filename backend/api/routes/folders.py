@@ -195,8 +195,12 @@ async def remove_folder_from_app(folder_id: int, force: bool = False):
     Soft-remove all photos in a scanned folder.
 
     Sets removed_from_app=1 on every active media_file whose path is under
-    the folder's root.  The DB rows (file_hash, vip_id…) are preserved so
+    the folder's root. The DB rows (file_hash, vip_id…) are preserved so
     a rescan can re-use them.
+
+    Non-face artifacts for those photos are purged so they can be rebuilt on
+    re-scan: media_tags, photo_analysis, clip_embeddings, writeback_queue.
+    Face-related rows (faces/embeddings/clusters/person links) are kept.
 
     If force=False and there are pending writeback entries, returns a warning
     payload.  The client should confirm with the user and re-call with
@@ -237,6 +241,51 @@ async def remove_folder_from_app(folder_id: int, force: bool = False):
 
         result = await db.execute(
             "UPDATE media_files SET removed_from_app=1 WHERE file_path LIKE ? AND removed_from_app=0",
+            (path_prefix,),
+        )
+        tags_result = await db.execute(
+            """
+            DELETE FROM media_tags
+            WHERE media_file_id IN (
+                SELECT id FROM media_files WHERE file_path LIKE ?
+            )
+            """,
+            (path_prefix,),
+        )
+        analysis_result = await db.execute(
+            """
+            DELETE FROM photo_analysis
+            WHERE media_file_id IN (
+                SELECT id FROM media_files WHERE file_path LIKE ?
+            )
+            """,
+            (path_prefix,),
+        )
+        clip_result = await db.execute(
+            """
+            DELETE FROM clip_embeddings
+            WHERE media_file_id IN (
+                SELECT id FROM media_files WHERE file_path LIKE ?
+            )
+            """,
+            (path_prefix,),
+        )
+        queue_result = await db.execute(
+            """
+            DELETE FROM writeback_queue
+            WHERE media_file_id IN (
+                SELECT id FROM media_files WHERE file_path LIKE ?
+            )
+            """,
+            (path_prefix,),
+        )
+        await db.execute(
+            """
+            UPDATE media_files
+            SET tags_done = 0,
+                florence_done = 0
+            WHERE file_path LIKE ?
+            """,
             (path_prefix,),
         )
         # Remove the scan_state row so the folder disappears from the sidebar
@@ -283,5 +332,9 @@ async def remove_folder_from_app(folder_id: int, force: bool = False):
         )
 
     return {"status": "ok", "removed": result.rowcount,
+            "non_face_tags_deleted": tags_result.rowcount,
+            "photo_analysis_deleted": analysis_result.rowcount,
+            "clip_embeddings_deleted": clip_result.rowcount,
+            "writeback_rows_deleted": queue_result.rowcount,
             "deleted_photo_thumbs": deleted_thumbs,
             "deleted_previews": deleted_previews}

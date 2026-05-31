@@ -285,6 +285,28 @@ class FaceDetector:
 
         fast_results = self._run_session(self._app_fast, img, img_w, img_h, image_path)
 
+        # Near-threshold edge case: fast pass may detect a valid face just below
+        # confidence threshold while accurate pass would pass it. If fast saw any
+        # raw face but filtering produced zero accepted faces, escalate once.
+        if not fast_results:
+            try:
+                raw_fast_faces = self._app_fast.get(img)  # type: ignore[attr-defined]
+            except Exception as exc:
+                logger.debug(
+                    "Intelligent [%s]: fast raw probe failed: %s",
+                    image_path.name,
+                    exc,
+                )
+                raw_fast_faces = []
+            if raw_fast_faces:
+                logger.debug(
+                    "Intelligent [%s]: fast saw %d raw face(s) but none passed filters "
+                    "→ escalating to accurate (1280)",
+                    image_path.name,
+                    len(raw_fast_faces),
+                )
+                return self._run_session(self._app_accurate, img, img_w, img_h, image_path)
+
         min_face_w = min((f.bbox_w for f in fast_results), default=1.0)
         should_escalate = (
             len(fast_results) >= self._ESCALATE_MIN_FACES

@@ -263,7 +263,15 @@ async def remove_from_app(body: RemoveFromAppRequest):
             f"UPDATE media_files SET removed_from_app=1 WHERE id IN ({placeholders})",
             body.media_ids,
         )
-    return {"status": "ok", "removed": result.rowcount}
+        queue_result = await db.execute(
+            f"DELETE FROM writeback_queue WHERE media_file_id IN ({placeholders})",
+            body.media_ids,
+        )
+    return {
+        "status": "ok",
+        "removed": result.rowcount,
+        "writeback_rows_deleted": queue_result.rowcount,
+    }
 
 
 # ---------------------------------------------------------------------------
