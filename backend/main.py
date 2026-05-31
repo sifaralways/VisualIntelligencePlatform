@@ -147,7 +147,9 @@ from backend.config import settings, ensure_dirs
 from backend.database.db import init_db
 from backend.api.routes import media, persons, faces, search, pipeline, writeback, admin, tags, analysis, settings as settings_route, folders, remote, chat, profiles
 from backend.api.websocket import router as ws_router
-from backend.profiles import bootstrap_profiles, get_active_profile, get_profile, reset_current_profile, set_current_profile
+from backend.pipeline.suggestion_worker import run_quality_suggestion_worker
+from backend.profiles import bootstrap_profiles, get_active_profile, get_profile, reset_current_profile, run_in_profile, set_current_profile
+from backend.runtime.activity import mark_user_activity
 
 
 def _patch_insightface_skimage() -> None:
@@ -323,6 +325,7 @@ async def lifespan(app: FastAPI):
     active_profile = bootstrap_profiles()
     token = set_current_profile(active_profile.id)
     warmup_task: asyncio.Task[None] | None = None
+    suggestion_worker_task: asyncio.Task[None] | None = None
     try:
         ensure_dirs()
         await init_db()
@@ -331,12 +334,17 @@ async def lifespan(app: FastAPI):
         await load_cache()
         apply_log_level(int(_get_setting('log_level')))
         warmup_task = asyncio.create_task(_warm_start_models(active_profile.id))
+        suggestion_worker_task = asyncio.create_task(
+            run_in_profile(active_profile.id, run_quality_suggestion_worker)
+        )
     finally:
         reset_current_profile(token)
     yield
     # Cleanup on shutdown (none required currently)
     if warmup_task is not None and not warmup_task.done():
         warmup_task.cancel()
+    if suggestion_worker_task is not None and not suggestion_worker_task.done():
+        suggestion_worker_task.cancel()
 
 
 app = FastAPI(
@@ -368,6 +376,7 @@ app.add_middleware(
 
 @app.middleware("http")
 async def profile_context_middleware(request: Request, call_next):
+    mark_user_activity()
     requested_profile_id = request.headers.get("X-VIP-Profile")
     profile = get_profile(requested_profile_id) if requested_profile_id else get_active_profile()
     if requested_profile_id and profile is None:

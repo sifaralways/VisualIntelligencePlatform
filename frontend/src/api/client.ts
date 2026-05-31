@@ -272,12 +272,31 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ name }),
       }),
-    addCluster: (personId: number, clusterId: number) =>
-      request(`/persons/${personId}/add-cluster/${clusterId}`, { method: 'POST' }),
+    addCluster: (personId: number, clusterId: number, opts?: { forceSamePhotoOverride?: boolean }) => {
+      const params = new URLSearchParams()
+      if (opts?.forceSamePhotoOverride) params.set('force_same_photo_override', '1')
+      const qs = params.toString()
+      return request(`/persons/${personId}/add-cluster/${clusterId}${qs ? `?${qs}` : ''}`, { method: 'POST' })
+    },
     addIgnoredCluster: (personId: number, clusterId: number) =>
       request(`/persons/ignored/${personId}/add-cluster/${clusterId}`, { method: 'POST' }),
     mergeSuggestions: (personId: number) =>
       request<MergeSuggestion[]>(`/persons/${personId}/merge-suggestions?limit=1`),
+    pendingSuggestions: (params: { limit?: number; offset?: number; personId?: number } = {}) => {
+      const q = new URLSearchParams()
+      if (params.limit != null) q.set('limit', String(params.limit))
+      if (params.offset != null) q.set('offset', String(params.offset))
+      if (params.personId != null) q.set('person_id', String(params.personId))
+      const qs = q.toString()
+      return request<PendingSuggestionsPage>(`/persons/suggestions/pending${qs ? `?${qs}` : ''}`)
+    },
+    pendingSuggestionsSummary: (params: { limit?: number; offset?: number } = {}) => {
+      const q = new URLSearchParams()
+      if (params.limit != null) q.set('limit', String(params.limit))
+      if (params.offset != null) q.set('offset', String(params.offset))
+      const qs = q.toString()
+      return request<PendingSuggestionSummaryPage>(`/persons/suggestions/summary${qs ? `?${qs}` : ''}`)
+    },
     rejectSuggestion: (personId: number, clusterId: number) =>
       request(`/persons/${personId}/reject-suggestion/${clusterId}`, { method: 'POST' }),
     listIgnored: (params: { sortBy?: 'photo_count' | 'created_at'; sortDir?: 'asc' | 'desc' } = {}) => {
@@ -605,6 +624,10 @@ export interface WsEvent {
   merged?: number
   message?: string
   folder?: string
+  reason?: string
+  generated?: number
+  elapsed_ms?: number
+  persons?: number
 }
 
 export interface Cluster {
@@ -653,6 +676,43 @@ export interface MergeSuggestion {
   is_high_conf: number
   representative_thumbnail: string | null
   similarity: number   // cosine similarity to the named person's centroid
+}
+
+export interface PendingSuggestion {
+  id: number
+  person_id: number
+  person_name: string | null
+  person_thumbnail: string | null
+  cluster_id: number
+  member_count: number
+  representative_thumbnail: string | null
+  similarity: number
+  competing_person_id: number | null
+  competing_similarity: number | null
+  margin: number | null
+  generated_at: string
+}
+
+export interface PendingSuggestionsPage {
+  items: PendingSuggestion[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface PendingSuggestionSummary {
+  person_id: number
+  person_name: string | null
+  person_thumbnail: string | null
+  suggestion_count: number
+  latest_generated_at: string | null
+}
+
+export interface PendingSuggestionSummaryPage {
+  items: PendingSuggestionSummary[]
+  total: number
+  limit: number
+  offset: number
 }
 
 export interface FindSimilarSuggestion extends MergeSuggestion {
@@ -756,6 +816,7 @@ export interface MediaResult {
   date_taken: string | null
   camera_model: string | null
   persons: string | null
+  tags?: string | null
 }
 
 export interface NaturalSearchRequest {

@@ -519,7 +519,7 @@ function ContactsMatchPanel() {
 // ─── Main component ─────────────────────────────────────────────────────────
 
 export default function AdminPage() {
-  const [activeTab, setActiveTab] = useState<AdminTab>('overview')
+  const [activeTab, setActiveTab] = useState<AdminTab>('settings')
   const [stats, setStats] = useState<Stats | null>(null)
   const [loading, setLoading] = useState(true)
   const [confirm, setConfirm] = useState<Scope | null>(null)
@@ -707,7 +707,6 @@ export default function AdminPage() {
       <p className="text-sm text-gray-500 mb-6">Database stats and selective data reset.</p>
 
       <div className="flex flex-wrap gap-2 mb-6">
-        <TabButton active={activeTab === 'overview'} label="Overview" onClick={() => setActiveTab('overview')} />
         <TabButton active={activeTab === 'settings'} label="Settings" onClick={() => setActiveTab('settings')} />
         <TabButton active={activeTab === 'pilot'} label="Manual Pilot" onClick={() => setActiveTab('pilot')} />
         <TabButton active={activeTab === 'ml'} label="ML" onClick={() => setActiveTab('ml')} />
@@ -731,7 +730,7 @@ export default function AdminPage() {
               <StatCard label="Embeddings"   value={stats.embeddings} />
               <StatCard label="Clusters"     value={stats.clusters} />
               <StatCard label="Named persons" value={stats.persons} />
-              <StatCard label="Writeback queue" value={stats.writeback_queue} />
+              <StatCard label="Writeback pending" value={stats.writeback_queue} />
               <StatCard label="Thumbnail files" value={stats.thumbnail_files} />
             </div>
             {stats.media_by_state && Object.keys(stats.media_by_state).length > 0 && (

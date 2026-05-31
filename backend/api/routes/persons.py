@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from backend.database.db import get_db
 from backend.database.identity import append_identity_event, get_current_cluster_id_for_face, get_current_person_id_for_cluster, link_cluster_to_person, relink_face_to_cluster
 from backend.database.models import Person
+from backend.database.settings_store import get as get_setting
 from backend.pipeline.centroid import update_person_centroid, load_centroid
 from backend.api.websocket import broadcast
 from backend.profiles import get_current_profile_id, run_in_profile
@@ -860,6 +861,88 @@ async def _score_similar_unnamed_clusters(
     return scored[:limit] if limit is not None else scored
 
 
+def _build_person_anchor_vectors(
+    emb_rows: list,
+    person_centroid: np.ndarray,
+    portrait_face_id: int | None,
+    *,
+    max_anchors: int,
+) -> list[np.ndarray]:
+    """Build small anchor set to improve lookalike recall with bounded cost."""
+    anchors: list[np.ndarray] = [person_centroid]
+    if max_anchors <= 1 or not emb_rows:
+        return anchors[:1]
+
+    # 1) Portrait anchor (if present)
+    portrait_vec: np.ndarray | None = None
+    if portrait_face_id is not None:
+        for r in emb_rows:
+            if int(r["face_id"]) == int(portrait_face_id):
+                portrait_vec = _normalise_vector(np.frombuffer(r["vector"], dtype=np.float32))
+                break
+    if portrait_vec is not None and all(float(np.dot(portrait_vec, a)) < 0.999 for a in anchors):
+        anchors.append(portrait_vec)
+        if len(anchors) >= max_anchors:
+            return anchors
+
+    # 2) Variation anchors: high-quality faces farthest from centroid.
+    scored_rows: list[tuple[float, np.ndarray]] = []
+    for r in emb_rows:
+        vec = _normalise_vector(np.frombuffer(r["vector"], dtype=np.float32))
+        sim_to_centroid = float(np.dot(person_centroid, vec))
+        variation = max(0.0, 1.0 - sim_to_centroid)
+        quality = _face_sample_weight(r["detection_conf"], r["bbox_w"], r["bbox_h"])
+        score = variation * quality
+        scored_rows.append((score, vec))
+
+    scored_rows.sort(key=lambda x: x[0], reverse=True)
+    for _, vec in scored_rows:
+        if len(anchors) >= max_anchors:
+            break
+        if all(float(np.dot(vec, a)) < 0.995 for a in anchors):
+            anchors.append(vec)
+
+    return anchors
+
+
+async def _score_similar_unnamed_clusters_multi_anchor(
+    db,
+    anchors: list[np.ndarray],
+    *,
+    rejected_for_person_id: int,
+    limit: int,
+) -> list[dict]:
+    """Union per-anchor shortlist results and keep best score per cluster."""
+    if not anchors:
+        return []
+    if len(anchors) == 1:
+        return await _score_similar_unnamed_clusters(
+            db,
+            anchors[0],
+            rejected_for_person_id=rejected_for_person_id,
+            limit=limit,
+        )
+
+    per_anchor_limit = max(80, min(limit, 320) // len(anchors) + 16)
+    merged: dict[int, dict] = {}
+    for anchor in anchors:
+        scored = await _score_similar_unnamed_clusters(
+            db,
+            anchor,
+            rejected_for_person_id=rejected_for_person_id,
+            limit=per_anchor_limit,
+        )
+        for item in scored:
+            cid = int(item["cluster_id"])
+            prev = merged.get(cid)
+            if prev is None or float(item["similarity"]) > float(prev["similarity"]):
+                merged[cid] = item
+
+    out = list(merged.values())
+    out.sort(key=lambda x: x["similarity"], reverse=True)
+    return out[:limit]
+
+
 async def _create_ignored_person(db, source_vec: np.ndarray | None = None, centroid_n: int = 0) -> int:
     new_uuid = str(_uuid.uuid4())
     cursor = await db.execute(
@@ -1675,7 +1758,12 @@ async def create_person_from_cluster(cluster_id: int, req: NameClusterRequest, b
 
 
 @router.post("/{person_id}/add-cluster/{cluster_id}")
-async def add_cluster_to_person(person_id: int, cluster_id: int, background_tasks: BackgroundTasks):
+async def add_cluster_to_person(
+    person_id: int,
+    cluster_id: int,
+    background_tasks: BackgroundTasks,
+    force_same_photo_override: bool = Query(False),
+):
     """Assign an existing cluster to an existing person (merge path)."""
     started_at = time.perf_counter()
     async with get_db() as db:
@@ -1696,7 +1784,7 @@ async def add_cluster_to_person(person_id: int, cluster_id: int, background_task
             raise HTTPException(status_code=409, detail="Cluster is already assigned to another person")
 
         conflicts = await _load_same_photo_conflicts(db, [person_id], [cluster_id])
-        if (int(person_id), int(cluster_id)) in conflicts:
+        if (int(person_id), int(cluster_id)) in conflicts and not force_same_photo_override:
             raise HTTPException(
                 status_code=409,
                 detail="Cannot merge: this cluster co-appears with the selected person in the same photo.",
@@ -1713,7 +1801,11 @@ async def add_cluster_to_person(person_id: int, cluster_id: int, background_task
                 db,
                 cluster_id=cluster_id,
                 person_id=person_id,
-                source="manual_merge_cluster",
+                source=(
+                    "manual_merge_cluster_force_same_photo_override"
+                    if force_same_photo_override
+                    else "manual_merge_cluster"
+                ),
                 actor="api.add_cluster_to_person",
             )
         except ValueError:
@@ -1725,6 +1817,27 @@ async def add_cluster_to_person(person_id: int, cluster_id: int, background_task
         await db.execute(
             "DELETE FROM rejected_suggestions WHERE person_id=? AND cluster_id=?",
             (person_id, cluster_id),
+        )
+
+        # Mark queued background suggestions as reviewed so the same card
+        # does not loop after user accepts this merge.
+        await db.execute(
+            """
+            UPDATE person_suggestion_queue
+            SET status='accepted', reviewed_at=datetime('now')
+            WHERE person_id=? AND cluster_id=? AND status='pending'
+            """,
+            (person_id, cluster_id),
+        )
+        # This cluster is now assigned; pending suggestions for other people
+        # are stale and should not remain visible.
+        await db.execute(
+            """
+            UPDATE person_suggestion_queue
+            SET status='claimed_elsewhere', reviewed_at=datetime('now')
+            WHERE cluster_id=? AND person_id<>? AND status='pending'
+            """,
+            (cluster_id, person_id),
         )
 
         # Queue photos for writeback
@@ -2105,7 +2218,7 @@ async def get_merge_suggestions(person_id: int, limit: int = 1):
     async with get_db() as db:
         person = await (
             await db.execute(
-                "SELECT id, name FROM persons WHERE id=? AND is_merged=0", (person_id,)
+                "SELECT id, name, portrait_face_id FROM persons WHERE id=? AND is_merged=0", (person_id,)
             )
         ).fetchone()
         if not person:
@@ -2113,7 +2226,7 @@ async def get_merge_suggestions(person_id: int, limit: int = 1):
 
         # Person's embeddings
         emb_rows = await db.execute_fetchall("""
-            SELECT e.vector, f.detection_conf, f.bbox_w, f.bbox_h
+            SELECT e.face_id, e.vector, f.detection_conf, f.bbox_w, f.bbox_h
             FROM embeddings e
             JOIN faces f ON f.id = e.face_id
             JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
@@ -2128,13 +2241,30 @@ async def get_merge_suggestions(person_id: int, limit: int = 1):
         if person_centroid is None:
             return []
 
-        # Use indexed shortlist first, then exact centroid scoring/filters.
-        shortlist = await _score_similar_unnamed_clusters(
-            db,
-            person_centroid,
-            rejected_for_person_id=person_id,
-            limit=max(limit * 50, 250),
-        )
+        shortlist_limit = max(limit * 50, 250)
+        multi_anchor_enabled = bool(int(get_setting("merge_multi_anchor_enabled") or 0))
+        multi_anchor_max = max(1, min(6, int(get_setting("merge_multi_anchor_max") or 4)))
+
+        if multi_anchor_enabled:
+            anchors = _build_person_anchor_vectors(
+                emb_rows,
+                person_centroid,
+                int(person["portrait_face_id"]) if person["portrait_face_id"] is not None else None,
+                max_anchors=multi_anchor_max,
+            )
+            shortlist = await _score_similar_unnamed_clusters_multi_anchor(
+                db,
+                anchors,
+                rejected_for_person_id=person_id,
+                limit=shortlist_limit,
+            )
+        else:
+            shortlist = await _score_similar_unnamed_clusters(
+                db,
+                person_centroid,
+                rejected_for_person_id=person_id,
+                limit=shortlist_limit,
+            )
         if not shortlist:
             return []
 
@@ -2193,14 +2323,174 @@ async def get_merge_suggestions(person_id: int, limit: int = 1):
 
         scored.sort(key=lambda x: x["similarity"], reverse=True)
         logger.info(
-            "merge_suggestions person_id=%d limit=%d shortlist=%d returned=%d elapsed_ms=%d",
+            "merge_suggestions person_id=%d limit=%d shortlist=%d returned=%d multi_anchor=%s elapsed_ms=%d",
             person_id,
             limit,
             len(shortlist),
             min(len(scored), limit),
+            str(multi_anchor_enabled).lower(),
             int((time.perf_counter() - started_at) * 1000),
         )
         return scored[:limit]
+
+
+@router.get("/suggestions/pending")
+async def list_pending_suggestions(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    person_id: int | None = Query(None),
+):
+    """Return quality-first background suggestions pending user review."""
+    async with get_db() as db:
+        where = [
+            "q.status='pending'",
+            "q.source='quality_background'",
+            "NOT EXISTS ("
+            "SELECT 1 FROM faces fp "
+            "JOIN faces fc ON fc.media_file_id = fp.media_file_id AND fc.id != fp.id "
+            "JOIN media_files mf ON mf.id = fp.media_file_id "
+            "WHERE fp.person_id = q.person_id "
+            "AND fc.cluster_id = q.cluster_id "
+            "AND fc.person_id IS NULL "
+            "AND mf.removed_from_app = 0 "
+            "AND COALESCE(fp.bbox_w, 0) * COALESCE(fp.bbox_h, 0) >= 0.015 "
+            "AND COALESCE(fc.bbox_w, 0) * COALESCE(fc.bbox_h, 0) >= 0.015"
+            ")",
+        ]
+        params: list = []
+        if person_id is not None:
+            where.append("q.person_id=?")
+            params.append(person_id)
+
+        where_sql = " AND ".join(where)
+        total_row = await (
+            await db.execute(
+                f"SELECT COUNT(*) AS total FROM person_suggestion_queue q WHERE {where_sql}",
+                tuple(params),
+            )
+        ).fetchone()
+
+        rows = await db.execute_fetchall(
+            f"""
+            SELECT q.id,
+                   q.person_id,
+                   p.name AS person_name,
+                   COALESCE(pf.thumbnail_path, MIN(f_person.thumbnail_path)) AS person_thumbnail,
+                   q.cluster_id,
+                   q.cluster_member_count AS member_count,
+                   q.cluster_thumbnail_path AS representative_thumbnail,
+                   q.similarity,
+                   q.competing_person_id,
+                   q.competing_similarity,
+                   q.margin,
+                   q.generated_at
+            FROM person_suggestion_queue q
+            JOIN persons p ON p.id = q.person_id
+            LEFT JOIN faces pf ON pf.id = p.portrait_face_id
+            LEFT JOIN v_cluster_person_current cpc_person ON cpc_person.person_guid = p.person_guid
+            LEFT JOIN clusters c_person ON c_person.cluster_guid = cpc_person.cluster_guid
+            LEFT JOIN faces f_person ON f_person.cluster_id = c_person.id AND f_person.thumbnail_path IS NOT NULL
+            WHERE {where_sql}
+            GROUP BY q.id
+            ORDER BY q.generated_at DESC, q.similarity DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple([*params, limit, offset]),
+        )
+
+    return {
+        "items": [dict(r) for r in rows],
+        "total": int(total_row["total"] if total_row and total_row["total"] is not None else 0),
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@router.get("/suggestions/summary")
+async def list_pending_suggestion_summary(
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """Return pending quality-background suggestion counts grouped by person."""
+    async with get_db() as db:
+        total_row = await (
+            await db.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM (
+                    SELECT q.person_id
+                    FROM person_suggestion_queue q
+                    JOIN persons p ON p.id = q.person_id
+                    WHERE q.status='pending'
+                      AND q.source='quality_background'
+                      AND p.is_merged = 0
+                      AND p.is_ignored = 0
+                                            AND NOT EXISTS (
+                                                    SELECT 1
+                                                    FROM faces fp
+                                                    JOIN faces fc ON fc.media_file_id = fp.media_file_id AND fc.id != fp.id
+                                                    JOIN media_files mf ON mf.id = fp.media_file_id
+                                                    WHERE fp.person_id = q.person_id
+                                                        AND fc.cluster_id = q.cluster_id
+                                                        AND fc.person_id IS NULL
+                                                        AND mf.removed_from_app = 0
+                                                        AND COALESCE(fp.bbox_w, 0) * COALESCE(fp.bbox_h, 0) >= 0.015
+                                                        AND COALESCE(fc.bbox_w, 0) * COALESCE(fc.bbox_h, 0) >= 0.015
+                                            )
+                    GROUP BY q.person_id
+                ) grouped
+                """
+            )
+        ).fetchone()
+
+        rows = await db.execute_fetchall(
+            """
+            SELECT q.person_id,
+                   p.name AS person_name,
+                   COALESCE(
+                       pf.thumbnail_path,
+                       (
+                           SELECT MIN(f2.thumbnail_path)
+                           FROM v_cluster_person_current cpc2
+                           JOIN clusters c2 ON c2.cluster_guid = cpc2.cluster_guid
+                           JOIN faces f2 ON f2.cluster_id = c2.id AND f2.thumbnail_path IS NOT NULL
+                           WHERE cpc2.person_guid = p.person_guid
+                       )
+                   ) AS person_thumbnail,
+                   COUNT(DISTINCT q.id) AS suggestion_count,
+                   MAX(q.generated_at) AS latest_generated_at
+            FROM person_suggestion_queue q
+            JOIN persons p ON p.id = q.person_id
+            LEFT JOIN faces pf ON pf.id = p.portrait_face_id
+            WHERE q.status='pending'
+              AND q.source='quality_background'
+              AND p.is_merged = 0
+              AND p.is_ignored = 0
+                            AND NOT EXISTS (
+                                    SELECT 1
+                                    FROM faces fp
+                                    JOIN faces fc ON fc.media_file_id = fp.media_file_id AND fc.id != fp.id
+                                    JOIN media_files mf ON mf.id = fp.media_file_id
+                                    WHERE fp.person_id = q.person_id
+                                        AND fc.cluster_id = q.cluster_id
+                                        AND fc.person_id IS NULL
+                                        AND mf.removed_from_app = 0
+                                        AND COALESCE(fp.bbox_w, 0) * COALESCE(fp.bbox_h, 0) >= 0.015
+                                        AND COALESCE(fc.bbox_w, 0) * COALESCE(fc.bbox_h, 0) >= 0.015
+                            )
+            GROUP BY q.person_id
+            ORDER BY suggestion_count DESC, latest_generated_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        )
+
+    return {
+        "items": [dict(r) for r in rows],
+        "total": int(total_row["total"] if total_row and total_row["total"] is not None else 0),
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @router.post("/find-similar-all")
@@ -2470,6 +2760,14 @@ async def reject_merge_suggestion(person_id: int, cluster_id: int):
     async with get_db() as db:
         await db.execute(
             "INSERT OR IGNORE INTO rejected_suggestions (person_id, cluster_id) VALUES (?,?)",
+            (person_id, cluster_id),
+        )
+        await db.execute(
+            """
+            UPDATE person_suggestion_queue
+            SET status='rejected', reviewed_at=datetime('now')
+            WHERE person_id=? AND cluster_id=? AND status='pending'
+            """,
             (person_id, cluster_id),
         )
         cluster_person_id = await get_current_person_id_for_cluster(db, cluster_id)

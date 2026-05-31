@@ -1256,7 +1256,7 @@ async def _phase_scan(folder: Path, use_existing_vip_data: bool = True) -> None:
                             (vip_id, asset_id, file_path, file_hash, file_size, file_format, camera_make, camera_model,
                              date_taken, gps_lat, gps_lon, width, height, is_stub, exposure_time_s,
                              ingest_state, external_exif)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'scanned',?)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'scanned',?)
                     """, (
                         new_vip_id,
                         new_asset_id,

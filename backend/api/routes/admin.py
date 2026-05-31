@@ -50,12 +50,26 @@ async def get_stats():
 
         tables = [
             "media_files", "faces", "embeddings",
-            "clusters", "persons", "writeback_queue",
+            "clusters", "persons",
         ]
         result = {}
         for t in tables:
             rows = await db.execute_fetchall(f"SELECT COUNT(*) as n FROM {t}")
             result[t] = rows[0]["n"]
+
+        # Queue semantics: dashboard expects pending items to write, not history.
+        pending_row = await (await db.execute(
+            "SELECT COUNT(*) AS n FROM writeback_queue WHERE status='pending'"
+        )).fetchone()
+        total_row = await (await db.execute(
+            "SELECT COUNT(*) AS n FROM writeback_queue"
+        )).fetchone()
+        failed_row = await (await db.execute(
+            "SELECT COUNT(*) AS n FROM writeback_queue WHERE status='failed'"
+        )).fetchone()
+        result["writeback_queue"] = int(pending_row["n"] if pending_row else 0)
+        result["writeback_queue_total"] = int(total_row["n"] if total_row else 0)
+        result["writeback_queue_failed"] = int(failed_row["n"] if failed_row else 0)
 
         # Extra detail
         rows = await db.execute_fetchall(

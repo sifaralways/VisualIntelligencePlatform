@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import LibraryPage from './pages/LibraryPage'
+import DashboardPage from './pages/DashboardPage'
 import PeoplePage from './pages/PeoplePage'
 import DiscoverPage from './pages/DiscoverPage'
 import SearchPage from './pages/SearchPage'
@@ -19,7 +20,7 @@ import './index.css'
 // View state machine
 // ---------------------------------------------------------------------------
 
-type SidebarSection = 'library' | 'people' | 'animals' | 'places' | 'things' | 'search' | 'assistant' | 'assistant_v2' | 'tags' | 'writeback' | 'quality' | 'explicit'
+type SidebarSection = 'dashboard' | 'library' | 'people' | 'animals' | 'places' | 'things' | 'search' | 'assistant' | 'assistant_v2' | 'tags' | 'writeback' | 'quality' | 'explicit'
 
 interface FilteredView {
   title: string
@@ -52,6 +53,10 @@ export default function App() {
   const [filtered, setFiltered]     = useState<FilteredView | null>(null)
   const [headerSearchQuery, setHeaderSearchQuery] = useState('')
   const [activeSearchQuery, setActiveSearchQuery] = useState('')
+  const [searchMode, setSearchMode] = useState<'natural' | 'classic'>('classic')
+  const [desktopNotifyEnabled, setDesktopNotifyEnabled] = useState(false)
+  const [desktopNotifyStatus, setDesktopNotifyStatus] = useState<'off' | 'on' | 'blocked' | 'unavailable'>('off')
+  const [showNotifyBlockedHelp, setShowNotifyBlockedHelp] = useState(false)
 
   // Pipeline panel collapse state (persisted in sessionStorage for comfort)
   const [pipelineCollapsed, setPipelineCollapsed] = useState(() => {
@@ -181,6 +186,7 @@ export default function App() {
     setFiltered(null)
     setHeaderSearchQuery('')
     setActiveSearchQuery('')
+    setSearchMode('classic')
     setFolders([])
     setFolderLoadError(false)
     setAllPhotosExpanded(false)
@@ -319,6 +325,119 @@ export default function App() {
   }, [refreshProfiles])
 
   useEffect(() => {
+    if (typeof Notification === 'undefined') {
+      setDesktopNotifyStatus('unavailable')
+      setDesktopNotifyEnabled(false)
+      return
+    }
+    const remembered = localStorage.getItem('vip_desktop_notify_enabled')
+    if (Notification.permission === 'granted') {
+      // Permission already granted — restore enabled state if user had it on.
+      if (remembered === '1') {
+        setDesktopNotifyStatus('on')
+        setDesktopNotifyEnabled(true)
+      } else {
+        setDesktopNotifyStatus('off')
+        setDesktopNotifyEnabled(false)
+      }
+      return
+    }
+    if (Notification.permission === 'denied') {
+      setDesktopNotifyStatus('blocked')
+      setDesktopNotifyEnabled(false)
+      return
+    }
+    setDesktopNotifyStatus('off')
+    setDesktopNotifyEnabled(false)
+  }, [])
+
+  // Re-check permission when user returns to the tab (e.g. after changing browser settings).
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState !== 'visible') return
+      if (typeof Notification === 'undefined') return
+      if (Notification.permission === 'granted') {
+        setDesktopNotifyStatus(prev => {
+          if (prev === 'blocked' || prev === 'off') {
+            // Auto-enable since permission is now granted.
+            setDesktopNotifyEnabled(true)
+            setShowNotifyBlockedHelp(false)
+            localStorage.setItem('vip_desktop_notify_enabled', '1')
+            return 'on'
+          }
+          return prev
+        })
+      } else if (Notification.permission === 'denied') {
+        setDesktopNotifyEnabled(false)
+        setDesktopNotifyStatus('blocked')
+      }
+    }
+    document.addEventListener('visibilitychange', handleVisibility)
+    return () => document.removeEventListener('visibilitychange', handleVisibility)
+  }, [])
+
+  function sendDesktopNotification(title: string, body: string, tag: string) {
+    if (!desktopNotifyEnabled) return
+    if (typeof Notification === 'undefined') return
+    if (Notification.permission !== 'granted') return
+    try {
+      new Notification(title, { body, tag })
+    } catch {
+      // Ignore notification API failures in unsupported contexts.
+    }
+  }
+
+  async function enableDesktopNotifications() {
+    if (desktopNotifyEnabled) {
+      setDesktopNotifyEnabled(false)
+      setDesktopNotifyStatus('off')
+      localStorage.setItem('vip_desktop_notify_enabled', '0')
+      return
+    }
+
+    if (typeof Notification === 'undefined') {
+      setDesktopNotifyStatus('unavailable')
+      return
+    }
+
+    if (Notification.permission === 'denied') {
+      // Already denied — try calling requestPermission anyway; some browsers
+      // may re-prompt when the site has been un-blocked in settings.
+      const result = await Notification.requestPermission().catch(() => 'denied' as NotificationPermission)
+      if (result === 'granted') {
+        setDesktopNotifyEnabled(true)
+        setDesktopNotifyStatus('on')
+        setShowNotifyBlockedHelp(false)
+        localStorage.setItem('vip_desktop_notify_enabled', '1')
+        sendDesktopNotification('VIP Notifications Enabled', 'You will receive background process updates.', 'vip-notify-enabled')
+        return
+      }
+      // Still denied — show help popover with macOS instructions.
+      setDesktopNotifyStatus('blocked')
+      setShowNotifyBlockedHelp(true)
+      return
+    }
+
+    if (Notification.permission === 'granted') {
+      setDesktopNotifyEnabled(true)
+      setDesktopNotifyStatus('on')
+      localStorage.setItem('vip_desktop_notify_enabled', '1')
+      sendDesktopNotification('VIP Notifications Enabled', 'You will receive background process updates.', 'vip-notify-enabled')
+      return
+    }
+
+    const result = await Notification.requestPermission()
+    const enabled = result === 'granted'
+    setDesktopNotifyEnabled(enabled)
+    setDesktopNotifyStatus(enabled ? 'on' : (result === 'denied' ? 'blocked' : 'off'))
+    if (result === 'denied') setShowNotifyBlockedHelp(true)
+    localStorage.setItem('vip_desktop_notify_enabled', enabled ? '1' : '0')
+    if (enabled) {
+      sendDesktopNotification('VIP Notifications Enabled', 'You will receive background process updates.', 'vip-notify-enabled')
+    }
+  }
+
+  useEffect(() => {
     if (!selectedProfile) return
     const activeProfileId = selectedProfile.id
     loadFolders()
@@ -338,9 +457,40 @@ export default function App() {
           }
           if (ev.event === 'quality_issues_found' && ev.count) {
             setQualityCount(ev.count)
+            sendDesktopNotification('VIP Quality Check', `${ev.count} quality issues found`, 'vip-quality')
+          }
+          if (ev.event === 'pipeline_start') {
+            sendDesktopNotification('VIP Background Process Started', ev.folder ? `Started: ${ev.folder}` : 'Pipeline started', 'vip-pipeline-start')
           }
           if (ev.event === 'pipeline_complete') {
             loadFolders()
+            sendDesktopNotification('VIP Background Process Completed', ev.folder ? `Completed: ${ev.folder}` : 'Pipeline completed', 'vip-pipeline-complete')
+          }
+          if (ev.event === 'pipeline_pausing') {
+            sendDesktopNotification('VIP Pipeline Pausing', ev.message ?? 'Pause requested', 'vip-pipeline-pausing')
+          }
+          if (ev.event === 'pipeline_resumed') {
+            sendDesktopNotification('VIP Pipeline Resumed', ev.message ?? 'Pipeline resumed', 'vip-pipeline-resumed')
+          }
+          if (ev.event === 'pipeline_stopping') {
+            sendDesktopNotification('VIP Pipeline Stopping', ev.message ?? 'Stop requested', 'vip-pipeline-stopping')
+          }
+          if (ev.event === 'suggestion_worker_started') {
+            sendDesktopNotification('VIP Suggestions Worker Started', ev.message ?? 'Background suggestions started', 'vip-worker-started')
+          }
+          if (ev.event === 'suggestion_worker_paused') {
+            sendDesktopNotification('VIP Suggestions Worker Paused', ev.message ?? 'Background suggestions paused', 'vip-worker-paused')
+          }
+          if (ev.event === 'suggestion_worker_resumed') {
+            sendDesktopNotification('VIP Suggestions Worker Resumed', ev.message ?? 'Background suggestions resumed', 'vip-worker-resumed')
+          }
+          if (ev.event === 'suggestion_worker_cycle') {
+            const generated = typeof ev.generated === 'number' ? ev.generated : 0
+            const persons = typeof ev.persons === 'number' ? ev.persons : 0
+            sendDesktopNotification('VIP Suggestions Cycle', `Processed ${persons} person(s), generated ${generated} suggestion(s)`, 'vip-worker-cycle')
+          }
+          if (ev.event === 'suggestion_worker_stopped') {
+            sendDesktopNotification('VIP Suggestions Worker Stopped', ev.message ?? 'Background suggestions stopped', 'vip-worker-stopped')
           }
         } catch {}
       }
@@ -398,6 +548,7 @@ export default function App() {
   function runHeaderSearch() {
     const q = headerSearchQuery.trim()
     if (!q) return
+    setSearchMode('classic')
     setActiveSearchQuery(q)
     setSection('search')
     setFiltered(null)
@@ -556,6 +707,9 @@ export default function App() {
     )
   } else {
     switch (section) {
+      case 'dashboard':
+        mainContent = <DashboardPage />
+        break
       case 'library':
         mainContent = <LibraryPage onScanStarted={() => { loadFolders() }} />
         break
@@ -615,12 +769,13 @@ export default function App() {
         )
         break
       case 'search':
-        mainContent = <SearchPage initialQuery={activeSearchQuery} />
+        mainContent = <SearchPage initialQuery={activeSearchQuery} mode={searchMode} />
         break
       case 'assistant':
         mainContent = (
           <AssistantPage
             onOpenSearch={(query) => {
+              setSearchMode('natural')
               setActiveSearchQuery(query)
               setSection('search')
               setFiltered(null)
@@ -633,6 +788,7 @@ export default function App() {
         mainContent = (
           <AssistantPage
             onOpenSearch={(query) => {
+              setSearchMode('natural')
               setActiveSearchQuery(query)
               setSection('search')
               setFiltered(null)
@@ -667,13 +823,71 @@ export default function App() {
           Profile: {selectedProfile.name}
         </button>
 
+        <div className="relative">
+          <button
+            onClick={enableDesktopNotifications}
+            title={
+              desktopNotifyStatus === 'blocked'
+                ? 'Notifications blocked — click for instructions'
+                : desktopNotifyStatus === 'on'
+                  ? 'Notifications on — click to turn off'
+                  : 'Enable desktop notifications'
+            }
+            className={`h-7 rounded-lg border px-2 text-[11px] transition-colors ${
+              desktopNotifyStatus === 'on'
+                ? 'border-emerald-600 bg-emerald-900/30 text-emerald-300'
+                : desktopNotifyStatus === 'blocked'
+                  ? 'border-amber-700 bg-amber-900/30 text-amber-400 animate-pulse'
+                  : desktopNotifyStatus === 'unavailable'
+                    ? 'border-gray-700 bg-gray-900 text-gray-500 cursor-not-allowed'
+                    : 'border-gray-700 bg-gray-900 text-gray-300 hover:border-indigo-500 hover:text-white'
+            }`}
+          >
+            {desktopNotifyStatus === 'on' && '🔔 On'}
+            {desktopNotifyStatus === 'off' && '🔔 Off'}
+            {desktopNotifyStatus === 'blocked' && '🔕 Blocked'}
+            {desktopNotifyStatus === 'unavailable' && '🔕 N/A'}
+          </button>
+
+          {/* Blocked-help popover */}
+          {showNotifyBlockedHelp && (
+            <div className="absolute left-0 top-9 z-50 w-80 rounded-xl border border-amber-700 bg-gray-900 shadow-2xl p-4 text-xs text-gray-300">
+              <div className="flex justify-between items-start mb-2">
+                <p className="font-semibold text-amber-300">Notifications blocked by browser</p>
+                <button onClick={() => setShowNotifyBlockedHelp(false)} className="text-gray-500 hover:text-white ml-2">✕</button>
+              </div>
+              <p className="mb-3 text-gray-400">Your browser has blocked notifications for this site. To allow them:</p>
+              <div className="space-y-2">
+                <div>
+                  <p className="font-medium text-white mb-0.5">Safari</p>
+                  <p className="text-gray-400">Safari menu → Settings → Websites → Notifications → find <span className="text-gray-200">localhost</span> → Allow</p>
+                </div>
+                <div>
+                  <p className="font-medium text-white mb-0.5">Chrome / Arc</p>
+                  <p className="text-gray-400">Click the 🔒 lock icon in the address bar → Notifications → Allow</p>
+                </div>
+                <div>
+                  <p className="font-medium text-white mb-0.5">Firefox</p>
+                  <p className="text-gray-400">Click the shield icon in the address bar → Permissions → Allow Notifications</p>
+                </div>
+              </div>
+              <button
+                onClick={enableDesktopNotifications}
+                className="mt-3 w-full rounded-lg bg-amber-700 hover:bg-amber-600 py-1.5 text-white font-medium transition-colors"
+              >
+                Re-check permission
+              </button>
+            </div>
+          )}
+        </div>
+
         <div className="flex-1 max-w-2xl ml-2">
           <div className="relative">
             <input
               value={headerSearchQuery}
               onChange={e => setHeaderSearchQuery(e.target.value)}
               onKeyDown={e => { if (e.key === 'Enter') runHeaderSearch() }}
-              placeholder="Search photos in natural language..."
+              placeholder="Search people, filenames, folders, tags, Florence text (* and ? supported)..."
               className="w-full h-8 rounded-lg border border-gray-700 bg-gray-900 pl-9 pr-20 text-xs text-gray-100 placeholder:text-gray-500 outline-none focus:border-indigo-500"
             />
             <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 text-xs">🔎</span>
@@ -700,8 +914,9 @@ export default function App() {
         {/* ── Nav sidebar ── */}
         <aside
           style={{ width: sidebarWidth }}
-          className="shrink-0 min-h-0 border-r border-gray-800 py-3 flex flex-col gap-1 overflow-y-auto bg-gray-950"
+          className="shrink-0 min-h-0 border-r border-gray-800 py-3 flex flex-col bg-gray-950"
         >
+          <div className="min-h-0 overflow-y-auto flex flex-col gap-1">
           <NavGroup label="Browse">
             <NavItem id="assistant" icon="💬" label="Assistant"    active={section === 'assistant' && !filtered} onClick={() => navigate('assistant')} />
             <NavItem id="assistant_v2" icon="🧪" label="Assistant V2" active={section === 'assistant_v2' && !filtered} onClick={() => navigate('assistant_v2')} />
@@ -772,6 +987,21 @@ export default function App() {
               )}
             </div>
           </NavGroup>
+          </div>
+
+          <div className="mt-auto border-t border-gray-800 pt-2 px-2">
+            <button
+              onClick={() => navigate('dashboard')}
+              title="Dashboard"
+              className={`w-8 h-8 rounded-lg flex items-center justify-center text-base transition-colors ${
+                section === 'dashboard' && !filtered
+                  ? 'bg-indigo-600 text-white'
+                  : 'text-gray-400 hover:text-white hover:bg-gray-800'
+              }`}
+            >
+              ◳
+            </button>
+          </div>
         </aside>
 
         {/* Sidebar resize handle */}

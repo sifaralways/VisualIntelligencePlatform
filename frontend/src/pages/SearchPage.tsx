@@ -4,15 +4,26 @@
 
 import { useEffect, useState } from 'react'
 import { api } from '../api/client'
-import type { NaturalSearchResult } from '../api/client'
+import type { NaturalSearchResult, MediaResult } from '../api/client'
 import PhotoDetail from '../components/PhotoDetail'
 
 interface SearchPageProps {
   initialQuery?: string
+  mode?: 'natural' | 'classic'
 }
 
-export default function SearchPage({ initialQuery = '' }: SearchPageProps) {
-  const [query, setQuery] = useState(initialQuery)
+function mapClassicRow(row: MediaResult): NaturalSearchResult {
+  return {
+    media_id: row.id,
+    file_path: row.file_path,
+    date_taken: row.date_taken,
+    persons: row.persons ? row.persons.split(',').map(s => s.trim()).filter(Boolean) : [],
+    tags: row.tags ? row.tags.split(',').map(s => s.trim()).filter(Boolean) : [],
+    sql_matched: true,
+  }
+}
+
+export default function SearchPage({ initialQuery = '', mode = 'natural' }: SearchPageProps) {
   const [results, setResults] = useState<NaturalSearchResult[]>([])
   const [count, setCount] = useState<number | null>(null)
   const [loading, setLoading] = useState(false)
@@ -22,30 +33,43 @@ export default function SearchPage({ initialQuery = '' }: SearchPageProps) {
   const [selected, setSelected] = useState<NaturalSearchResult | null>(null)
 
   useEffect(() => {
-    setQuery(initialQuery)
     if (initialQuery.trim()) {
       void search(initialQuery)
+    } else {
+      setResults([])
+      setCount(null)
+      setIntent('')
+      setExplanation('')
+      setError('')
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialQuery])
+  }, [initialQuery, mode])
 
   async function search(raw?: string) {
-    const q = (raw ?? query).trim()
+    const q = (raw ?? initialQuery).trim()
     if (!q) return
 
     setLoading(true)
     setError('')
     try {
-      const res = await api.search.natural({
-        query: q,
-        limit: 100,
-      })
-      setResults(res.results)
-      setCount(res.count)
-      setIntent(res.intent)
-      setExplanation(res.explanation)
-      if (res.error) {
-        setError(res.error)
+      if (mode === 'classic') {
+        const res = await api.search.query({ query: q, limit: 150, offset: 0 })
+        setResults(res.results.map(mapClassicRow))
+        setCount(res.count)
+        setIntent('CLASSIC')
+        setExplanation('Wildcard metadata search over people, filenames/folders, tags, OCR/captions/regions.')
+      } else {
+        const res = await api.search.natural({
+          query: q,
+          limit: 100,
+        })
+        setResults(res.results)
+        setCount(res.count)
+        setIntent(res.intent)
+        setExplanation(res.explanation)
+        if (res.error) {
+          setError(res.error)
+        }
       }
     } catch (e: any) {
       setError(String(e?.message || e || 'Search failed'))
@@ -60,23 +84,19 @@ export default function SearchPage({ initialQuery = '' }: SearchPageProps) {
     <div className="flex flex-col gap-4">
       <h1 className="text-xl font-semibold">Search</h1>
 
-      <div className="grid grid-cols-1 gap-3">
-        <input
-          value={query}
-          onChange={e => setQuery(e.target.value)}
-          onKeyDown={e => e.key === 'Enter' && search()}
-          placeholder="Ask in natural language, e.g. Who accompanied Akshat in Blue Mountains trip in 2016"
-          className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-indigo-500"
-        />
-      </div>
+      {initialQuery.trim() ? (
+        <p className="text-sm text-gray-300">
+          Query: <span className="text-white">{initialQuery.trim()}</span>
+        </p>
+      ) : (
+        <p className="text-sm text-gray-500">Use the top search bar to run a query.</p>
+      )}
 
-      <button
-        onClick={() => { void search() }}
-        disabled={loading}
-        className="self-start bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg px-5 py-2 text-sm font-medium"
-      >
-        {loading ? 'Searching…' : 'Search'}
-      </button>
+      {mode === 'classic' && (
+        <p className="text-xs text-gray-500 -mt-1">
+          Use <span className="text-gray-300">*</span> for any characters and <span className="text-gray-300">?</span> for one character. Matches people, filenames, folders, tags, and Florence text.
+        </p>
+      )}
 
       {(intent || explanation) && (
         <div className="rounded-lg border border-gray-800 bg-gray-900/60 px-3 py-2">
@@ -116,7 +136,9 @@ export default function SearchPage({ initialQuery = '' }: SearchPageProps) {
       )}
 
       <p className="mt-4 text-xs text-gray-600">
-        Search runs locally across SQLite metadata and CLIP embeddings.
+        {mode === 'classic'
+          ? 'Classic search runs locally over SQLite metadata and text tags.'
+          : 'Search runs locally across SQLite metadata and CLIP embeddings.'}
       </p>
 
       {/* Detail modal */}

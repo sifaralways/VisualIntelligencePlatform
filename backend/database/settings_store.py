@@ -129,6 +129,68 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         ),
         "group": "Clustering",
     },
+    "merge_multi_anchor_enabled": {
+        "value": 0, "type": "bool", "min": 0, "max": 1, "step": 1,
+        "label": "Multi-anchor merge retrieval",
+        "description": "Use multiple person anchors (centroid + portrait + variation) for merge-suggestion candidate retrieval. Improves recall, with small additional CPU.",
+        "group": "Background Suggestions",
+        "options": [
+            {"value": 0, "label": "Off"},
+            {"value": 1, "label": "On"},
+        ],
+    },
+    "merge_multi_anchor_max": {
+        "value": 4, "type": "int", "min": 1, "max": 6, "step": 1,
+        "label": "Multi-anchor max anchors",
+        "description": "Maximum number of anchors used when multi-anchor retrieval is enabled.",
+        "group": "Background Suggestions",
+    },
+    "suggestion_worker_enabled": {
+        "value": 1, "type": "bool", "min": 0, "max": 1, "step": 1,
+        "label": "Quality suggestion worker",
+        "description": "Run proactive background suggestion generation when UI is idle.",
+        "group": "Background Suggestions",
+        "options": [
+            {"value": 0, "label": "Off"},
+            {"value": 1, "label": "On"},
+        ],
+    },
+    "suggestion_worker_idle_sec": {
+        "value": 20, "type": "int", "min": 5, "max": 300, "step": 5,
+        "label": "Idle threshold (s)",
+        "description": "Minimum user-idle time before quality-first background jobs can run.",
+        "group": "Background Suggestions",
+    },
+    "suggestion_worker_sleep_sec": {
+        "value": 15, "type": "int", "min": 2, "max": 300, "step": 1,
+        "label": "Worker cycle interval (s)",
+        "description": "Delay between background suggestion cycles.",
+        "group": "Background Suggestions",
+    },
+    "suggestion_worker_person_batch": {
+        "value": 8, "type": "int", "min": 1, "max": 50, "step": 1,
+        "label": "People per cycle",
+        "description": "How many named people are refreshed per quality-first cycle.",
+        "group": "Background Suggestions",
+    },
+    "suggestion_worker_max_per_person": {
+        "value": 25, "type": "int", "min": 5, "max": 100, "step": 1,
+        "label": "Max pending suggestions per person",
+        "description": "Maximum queued quality suggestions stored for each person.",
+        "group": "Background Suggestions",
+    },
+    "suggestion_worker_min_sim": {
+        "value": 0.45, "type": "float", "min": 0.20, "max": 0.95, "step": 0.01,
+        "label": "Background min similarity",
+        "description": "Lower bound for quality-first suggestion generation.",
+        "group": "Background Suggestions",
+    },
+    "suggestion_worker_min_margin": {
+        "value": 0.02, "type": "float", "min": 0.00, "max": 0.30, "step": 0.01,
+        "label": "Background min competitor margin",
+        "description": "Minimum margin versus nearest competing person in quality-first mode.",
+        "group": "Background Suggestions",
+    },
     "yolo_conf_threshold": {
         "value": 0.50, "type": "float", "min": 0.1, "max": 0.95, "step": 0.05,
         "label": "Object detection confidence",

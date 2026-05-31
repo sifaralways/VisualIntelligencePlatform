@@ -12,6 +12,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
 from backend.database.db import get_db
+from backend.api.websocket import broadcast
 from backend.pipeline.control import (
     PipelineStopRequested,
     is_pause_requested,
@@ -384,6 +385,7 @@ async def pause_pipeline():
     changed = request_pause(profile_id)
     if not changed:
         raise HTTPException(status_code=409, detail="Pipeline already paused")
+    await broadcast("pipeline_pausing", message="Pause requested")
     return {"status": "pausing"}
 
 
@@ -398,6 +400,7 @@ async def resume_pipeline():
     if not changed:
         raise HTTPException(status_code=409, detail="Pipeline is not paused")
     await mark_running()
+    await broadcast("pipeline_resumed", message="Pipeline resumed")
     return {"status": "running"}
 
 
@@ -412,6 +415,7 @@ async def stop_pipeline():
     if not changed:
         raise HTTPException(status_code=409, detail="Pipeline stop already requested")
     await mark_stopping()
+    await broadcast("pipeline_stopping", message="Stop requested")
     return {"status": "stopping"}
 
 
