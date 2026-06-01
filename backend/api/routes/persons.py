@@ -623,10 +623,22 @@ class IgnoredPersonSuggestionRequest(BaseModel):
 
 
 @router.get("")
-async def list_persons():
+async def list_persons(
+    folder_id: int | None = None,
+    path_prefix: str | None = None,
+):
     """All persons - named and unnamed (clusters awaiting a name)."""
+    scope_where = ""
+    scope_params: list = []
+    if path_prefix is not None:
+        scope_where = " AND mf.removed_from_app = 0 AND mf.file_path LIKE ?"
+        scope_params.append(path_prefix + "/%")
+    elif folder_id is not None:
+        scope_where = " AND mf.removed_from_app = 0 AND mf.file_path LIKE (SELECT folder_path || '/%' FROM scan_state WHERE id=?)"
+        scope_params.append(folder_id)
+
     async with get_db() as db:
-        rows = await db.execute_fetchall("""
+        rows = await db.execute_fetchall(f"""
             SELECT p.id, p.uuid, p.person_guid, p.name, p.created_at, p.named_at,
                    p.is_merged, p.merged_into_id,
                    COUNT(DISTINCT f.media_file_id)            AS photo_count,
@@ -646,11 +658,12 @@ async def list_persons():
             LEFT JOIN v_cluster_person_current cpc ON cpc.person_guid = p.person_guid
             LEFT JOIN clusters c ON c.cluster_guid = cpc.cluster_guid
             LEFT JOIN faces f  ON f.cluster_id = c.id
+            LEFT JOIN media_files mf ON mf.id = f.media_file_id
             LEFT JOIN faces pf ON pf.id = p.portrait_face_id
-            WHERE p.is_merged = 0 AND p.is_ignored = 0
+            WHERE p.is_merged = 0 AND p.is_ignored = 0{scope_where}
             GROUP BY p.id
             ORDER BY photo_count DESC
-        """)
+        """, scope_params)
     return [dict(r) for r in rows]
 
 
@@ -660,15 +673,26 @@ async def list_unnamed_clusters(
     offset: int = Query(0, ge=0),
     sort_by: Literal["member_count", "created_at"] = Query("member_count"),
     sort_dir: Literal["asc", "desc"] = Query("desc"),
+    folder_id: int | None = None,
+    path_prefix: str | None = None,
 ):
     """Clusters with no current non-merged owner person."""
     order_column = "member_count" if sort_by == "member_count" else "created_at"
     order_direction = "ASC" if sort_dir == "asc" else "DESC"
 
+    scope_condition = ""
+    scope_params: list = []
+    if path_prefix is not None:
+        scope_condition = " AND mf.file_path LIKE ?"
+        scope_params.append(path_prefix + "/%")
+    elif folder_id is not None:
+        scope_condition = " AND mf.file_path LIKE (SELECT folder_path || '/%' FROM scan_state WHERE id=?)"
+        scope_params.append(folder_id)
+
     async with get_db() as db:
         total_row = await (
             await db.execute(
-                """
+                f"""
                 SELECT COUNT(*) AS total
                 FROM (
                     SELECT c.id
@@ -678,10 +702,13 @@ async def list_unnamed_clusters(
                     LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
                     LEFT JOIN persons owner_person ON owner_person.person_guid = cpc.person_guid AND owner_person.is_merged = 0
                     WHERE owner_person.id IS NULL
+                      {scope_condition}
                     GROUP BY c.id
                     HAVING COUNT(DISTINCT CASE WHEN mf.removed_from_app = 0 THEN f.media_file_id END) > 0
                 ) unnamed
                 """
+                ,
+                scope_params,
             )
         ).fetchone()
 
@@ -699,11 +726,12 @@ async def list_unnamed_clusters(
             LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
             LEFT JOIN persons owner_person ON owner_person.person_guid = cpc.person_guid AND owner_person.is_merged = 0
             WHERE owner_person.id IS NULL
+              {scope_condition}
             GROUP BY c.id
             HAVING COUNT(DISTINCT CASE WHEN mf.removed_from_app = 0 THEN f.media_file_id END) > 0
             ORDER BY {order_column} {order_direction}, c.id DESC
             LIMIT ? OFFSET ?
-        """, (limit, offset))
+        """, (*scope_params, limit, offset))
     return {
         "items": [dict(r) for r in rows],
         "total": int(total_row["total"] if total_row and total_row["total"] is not None else 0),

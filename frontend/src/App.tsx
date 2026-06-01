@@ -12,8 +12,9 @@ import QualityPage from './pages/QualityPage'
 import ExplicitPage from './pages/ExplicitPage'
 import PhotoGrid from './components/PhotoGrid'
 import PipelinePanel from './components/PipelinePanel'
+import ConnectionsGraph from './components/ConnectionsGraph'
 import { api, buildProfileWebSocketUrl, setCurrentProfileId } from './api/client'
-import type { MediaFilter, WsEvent, MergeSuggestionItem, FolderItem, SubfolderItem, RemoveResult, ProfileSummary } from './api/client'
+import type { MediaFilter, WsEvent, MergeSuggestionItem, FolderItem, SubfolderItem, RemoveResult, ProfileSummary, Person, Cluster } from './api/client'
 import './index.css'
 
 // ---------------------------------------------------------------------------
@@ -147,6 +148,25 @@ export default function App() {
   const [folderWritebackError, setFolderWritebackError] = useState<string | null>(null)
   // Subfolders keyed by scanned folder id — loaded lazily on expand
   const [subfolderMap, setSubfolderMap] = useState<Record<number, SubfolderItem[]>>({})
+  const [folderPaneNamed, setFolderPaneNamed] = useState<Person[]>([])
+  const [folderPaneUnnamed, setFolderPaneUnnamed] = useState<Cluster[]>([])
+  const [folderPaneLoading, setFolderPaneLoading] = useState(false)
+  const [folderPaneError, setFolderPaneError] = useState<string | null>(null)
+  const [folderPaneBusyKey, setFolderPaneBusyKey] = useState<string | null>(null)
+  const [folderPaneConnections, setFolderPaneConnections] = useState<{ personId: number; personName: string } | null>(null)
+  const [folderPaneNameTarget, setFolderPaneNameTarget] = useState<Cluster | null>(null)
+  const [folderPaneNameInput, setFolderPaneNameInput] = useState('')
+  const [folderPaneMergeCandidate, setFolderPaneMergeCandidate] = useState<{ personId: number; name: string } | null>(null)
+  const [folderPaneIgnoreTarget, setFolderPaneIgnoreTarget] = useState<Cluster | null>(null)
+  const [folderPaneIgnoreAllOpen, setFolderPaneIgnoreAllOpen] = useState(false)
+  const [folderPaneSelectMode, setFolderPaneSelectMode] = useState(false)
+  const [folderPaneSelectedClusterIds, setFolderPaneSelectedClusterIds] = useState<Set<number>>(new Set())
+  const [folderPaneBulkNameOpen, setFolderPaneBulkNameOpen] = useState(false)
+  const [folderPaneBulkNameInput, setFolderPaneBulkNameInput] = useState('')
+  const [folderPaneBulkIgnoreOpen, setFolderPaneBulkIgnoreOpen] = useState(false)
+  const [folderPaneCollapsed, setFolderPaneCollapsed] = useState(() => {
+    return sessionStorage.getItem('folder_faces_pane_collapsed') === 'true'
+  })
 
   const loadFolders = useCallback(async () => {
     try {
@@ -174,6 +194,219 @@ export default function App() {
       setSubfolderMap(prev => ({ ...prev, [folderId]: subs }))
     } catch { /* ignore */ }
   }, [])
+
+  const loadFolderPaneFaces = useCallback(async (opts?: { keepError?: boolean }) => {
+    if (!filtered || (!filtered.folderId && !filtered.pathPrefix)) {
+      setFolderPaneNamed([])
+      setFolderPaneUnnamed([])
+      if (!opts?.keepError) setFolderPaneError(null)
+      setFolderPaneLoading(false)
+      return
+    }
+
+    setFolderPaneLoading(true)
+    if (!opts?.keepError) setFolderPaneError(null)
+    try {
+      const scope = filtered.pathPrefix
+        ? { path_prefix: filtered.pathPrefix }
+        : (filtered.folderId ? { folder_id: filtered.folderId } : {})
+      const [persons, unnamedPage] = await Promise.all([
+        api.persons.list(scope),
+        api.clusters.unnamed({ ...scope, limit: 200, offset: 0, sortBy: 'member_count', sortDir: 'desc' }),
+      ])
+      setFolderPaneNamed(persons.filter(p => !!p.name && !p.is_merged))
+      setFolderPaneUnnamed(unnamedPage.items)
+    } catch (e: unknown) {
+      setFolderPaneError(e instanceof Error ? e.message : 'Could not load faces pane')
+    } finally {
+      setFolderPaneLoading(false)
+    }
+  }, [filtered?.folderId, filtered?.pathPrefix])
+
+  // Right-side face pane (shown in folder-scoped filtered view)
+  useEffect(() => {
+    void loadFolderPaneFaces()
+  }, [loadFolderPaneFaces])
+
+  useEffect(() => {
+    // Keep selection valid when unnamed list changes after reload/actions.
+    setFolderPaneSelectedClusterIds(prev => {
+      if (prev.size === 0) return prev
+      const visible = new Set(folderPaneUnnamed.map(c => c.id))
+      const next = new Set<number>()
+      for (const id of prev) {
+        if (visible.has(id)) next.add(id)
+      }
+      return next
+    })
+  }, [folderPaneUnnamed])
+
+  function faceThumbUrl(path: string | null | undefined): string | null {
+    if (!path) return null
+    const marker = '/thumbnails/'
+    const idx = path.indexOf(marker)
+    if (idx >= 0) return marker + path.slice(idx + marker.length)
+    return path
+  }
+
+  async function handleFolderPaneNameCluster(cluster: Cluster) {
+    setFolderPaneNameTarget(cluster)
+    setFolderPaneNameInput('')
+    setFolderPaneMergeCandidate(null)
+  }
+
+  async function handleFolderPaneConfirmName(forceSamePhotoOverride = false) {
+    if (!folderPaneNameTarget) return
+    const name = folderPaneNameInput.trim()
+    if (!name) return
+    setFolderPaneBusyKey(`name-${folderPaneNameTarget.id}`)
+    setFolderPaneError(null)
+    try {
+      const persons = await api.persons.list()
+      const existing = persons.find(p => (p.name ?? '').toLowerCase() === name.toLowerCase() && !p.is_merged)
+      if (existing) {
+        setFolderPaneMergeCandidate({ personId: existing.id, name: existing.name ?? name })
+        if (!forceSamePhotoOverride) {
+          return
+        }
+        await api.persons.addCluster(existing.id, folderPaneNameTarget.id, { forceSamePhotoOverride: true })
+      } else {
+        await api.persons.fromCluster(folderPaneNameTarget.id, name)
+      }
+      setFolderPaneNameTarget(null)
+      setFolderPaneNameInput('')
+      setFolderPaneMergeCandidate(null)
+      await loadFolderPaneFaces()
+    } catch (e: unknown) {
+      setFolderPaneError(e instanceof Error ? e.message : 'Could not name this cluster')
+      await loadFolderPaneFaces({ keepError: true })
+    } finally {
+      setFolderPaneBusyKey(null)
+    }
+  }
+
+  async function handleFolderPaneIgnoreCluster(cluster: Cluster) {
+    setFolderPaneIgnoreTarget(cluster)
+  }
+
+  async function handleFolderPaneConfirmIgnoreCluster() {
+    if (!folderPaneIgnoreTarget) return
+    setFolderPaneBusyKey(`ignore-${folderPaneIgnoreTarget.id}`)
+    setFolderPaneError(null)
+    try {
+      await api.clusters.ignore(folderPaneIgnoreTarget.id)
+      setFolderPaneIgnoreTarget(null)
+      await loadFolderPaneFaces()
+    } catch (e: unknown) {
+      setFolderPaneError(e instanceof Error ? e.message : 'Could not ignore this cluster')
+      await loadFolderPaneFaces({ keepError: true })
+    } finally {
+      setFolderPaneBusyKey(null)
+    }
+  }
+
+  async function handleFolderPaneIgnoreAllUnnamed() {
+    if (folderPaneUnnamed.length === 0) return
+    setFolderPaneIgnoreAllOpen(true)
+  }
+
+  async function handleFolderPaneConfirmIgnoreAllUnnamed() {
+    setFolderPaneBusyKey('ignore-all')
+    setFolderPaneError(null)
+    try {
+      const results = await Promise.allSettled(folderPaneUnnamed.map(cluster => api.clusters.ignore(cluster.id)))
+      const failed = results.filter(r => r.status === 'rejected').length
+      if (failed > 0) {
+        setFolderPaneError(`Ignored ${results.length - failed}/${results.length} clusters. ${failed} failed.`)
+        await loadFolderPaneFaces({ keepError: true })
+      } else {
+        await loadFolderPaneFaces()
+      }
+      setFolderPaneIgnoreAllOpen(false)
+    } catch (e: unknown) {
+      setFolderPaneError(e instanceof Error ? e.message : 'Could not ignore unnamed clusters')
+      await loadFolderPaneFaces({ keepError: true })
+    } finally {
+      setFolderPaneBusyKey(null)
+    }
+  }
+
+  function toggleFolderPaneSelect(clusterId: number) {
+    setFolderPaneSelectedClusterIds(prev => {
+      const next = new Set(prev)
+      if (next.has(clusterId)) next.delete(clusterId)
+      else next.add(clusterId)
+      return next
+    })
+  }
+
+  function exitFolderPaneSelectMode() {
+    setFolderPaneSelectMode(false)
+    setFolderPaneSelectedClusterIds(new Set())
+    setFolderPaneBulkNameOpen(false)
+    setFolderPaneBulkNameInput('')
+    setFolderPaneBulkIgnoreOpen(false)
+  }
+
+  async function handleFolderPaneBulkName() {
+    const name = folderPaneBulkNameInput.trim()
+    const selectedIds = [...folderPaneSelectedClusterIds]
+    if (!name || selectedIds.length === 0) return
+    setFolderPaneBusyKey('bulk-name')
+    setFolderPaneError(null)
+    try {
+      const persons = await api.persons.list()
+      const existing = persons.find(p => (p.name ?? '').toLowerCase() === name.toLowerCase() && !p.is_merged)
+      if (existing) {
+        const results = await Promise.allSettled(selectedIds.map(id => api.persons.addCluster(existing.id, id)))
+        const failed = results.filter(r => r.status === 'rejected').length
+        if (failed > 0) {
+          setFolderPaneError(`Named ${results.length - failed}/${results.length} clusters. ${failed} failed.`)
+        }
+      } else {
+        const [first, ...rest] = selectedIds
+        const created = await api.persons.fromCluster(first, name)
+        if (rest.length > 0) {
+          const results = await Promise.allSettled(rest.map(id => api.persons.addCluster(created.person_id, id)))
+          const failed = results.filter(r => r.status === 'rejected').length
+          if (failed > 0) {
+            setFolderPaneError(`Named ${selectedIds.length - failed}/${selectedIds.length} clusters. ${failed} failed.`)
+          }
+        }
+      }
+      setFolderPaneBulkNameOpen(false)
+      setFolderPaneBulkNameInput('')
+      exitFolderPaneSelectMode()
+      await loadFolderPaneFaces({ keepError: true })
+    } catch (e: unknown) {
+      setFolderPaneError(e instanceof Error ? e.message : 'Could not apply bulk naming')
+      await loadFolderPaneFaces({ keepError: true })
+    } finally {
+      setFolderPaneBusyKey(null)
+    }
+  }
+
+  async function handleFolderPaneBulkIgnoreSelected() {
+    const selectedIds = [...folderPaneSelectedClusterIds]
+    if (selectedIds.length === 0) return
+    setFolderPaneBusyKey('bulk-ignore')
+    setFolderPaneError(null)
+    try {
+      const results = await Promise.allSettled(selectedIds.map(id => api.clusters.ignore(id)))
+      const failed = results.filter(r => r.status === 'rejected').length
+      if (failed > 0) {
+        setFolderPaneError(`Ignored ${results.length - failed}/${results.length} clusters. ${failed} failed.`)
+      }
+      setFolderPaneBulkIgnoreOpen(false)
+      exitFolderPaneSelectMode()
+      await loadFolderPaneFaces({ keepError: true })
+    } catch (e: unknown) {
+      setFolderPaneError(e instanceof Error ? e.message : 'Could not ignore selected clusters')
+      await loadFolderPaneFaces({ keepError: true })
+    } finally {
+      setFolderPaneBusyKey(null)
+    }
+  }
 
   // ── Global pipeline notifications ─────────────────────────────────────────
   const wsRef = useRef<WebSocket | null>(null)
@@ -668,6 +901,214 @@ export default function App() {
       </div>
     ) : null
 
+    const scopeFilter: MediaFilter = filtered.pathPrefix
+      ? { path_prefix: filtered.pathPrefix }
+      : filtered.folderId
+        ? { folder_id: filtered.folderId }
+        : {}
+
+    const facesPane = (filtered.folderId || filtered.pathPrefix) ? (
+      <aside className={`${folderPaneCollapsed ? 'w-10' : 'w-[22rem]'} shrink-0 min-h-0 rounded-xl border border-gray-800 bg-gray-900/40 ${folderPaneCollapsed ? 'p-1.5' : 'p-3'} overflow-y-auto transition-all`}>
+        {folderPaneCollapsed ? (
+          <button
+            onClick={() => {
+              setFolderPaneCollapsed(false)
+              sessionStorage.setItem('folder_faces_pane_collapsed', 'false')
+            }}
+            className="w-full h-8 rounded-md border border-gray-700 bg-gray-900 text-gray-300 hover:text-white hover:border-indigo-500 transition-colors text-xs"
+            title="Expand faces pane"
+          >
+            ◂
+          </button>
+        ) : (
+          <>
+            <div className="mb-3 flex items-start justify-between gap-2">
+              <div>
+                <h3 className="text-sm font-semibold text-white">Faces</h3>
+                <p className="text-[11px] text-gray-400">People-style face cards in this folder only</p>
+              </div>
+              <button
+                onClick={() => {
+                  setFolderPaneCollapsed(true)
+                  sessionStorage.setItem('folder_faces_pane_collapsed', 'true')
+                }}
+                className="h-7 px-2 rounded-md border border-gray-700 bg-gray-900 text-gray-300 hover:text-white hover:border-indigo-500 transition-colors text-xs"
+                title="Collapse faces pane"
+              >
+                ▸
+              </button>
+            </div>
+
+            {folderPaneError && (
+              <div className="text-[11px] text-red-300 bg-red-900/20 border border-red-700/30 rounded-lg px-2 py-1.5 mb-3">
+                {folderPaneError}
+              </div>
+            )}
+
+            <div className="space-y-3">
+              <section>
+                <div className="mb-1.5 flex items-center justify-between border-l-4 border-emerald-500 pl-2">
+                  <span className="text-xs font-semibold uppercase tracking-wide text-emerald-300">Named Faces Bar</span>
+                  <span className="text-[11px] text-gray-500">{folderPaneNamed.length}</span>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  {folderPaneLoading && <p className="text-[11px] text-gray-500 px-2 py-1">Loading…</p>}
+                  {!folderPaneLoading && folderPaneNamed.length === 0 && (
+                    <p className="text-[11px] text-gray-500 px-2 py-1">No named faces</p>
+                  )}
+                  {!folderPaneLoading && folderPaneNamed.slice(0, 80).map(person => {
+                    const thumb = faceThumbUrl(person.representative_thumbnail)
+                    return (
+                      <div key={person.id} className="flex flex-col items-center gap-1.5">
+                        <button
+                          onClick={() => openFiltered(
+                            { ...scopeFilter, person_id: person.id },
+                            `👤 ${person.name}`,
+                            'library',
+                            filtered.folderId,
+                            filtered.pathPrefix,
+                          )}
+                          className="relative w-20 h-20 rounded-xl bg-gray-800 border border-gray-700 overflow-hidden hover:border-indigo-400 transition-colors"
+                          title={`View photos of ${person.name}`}
+                        >
+                          {thumb
+                            ? <img src={thumb} alt={person.name || 'person'} className="w-full h-full object-cover" />
+                            : <span className="w-full h-full flex items-center justify-center text-gray-500 text-2xl">👤</span>}
+                          <span className="absolute bottom-0 right-0 bg-indigo-700 text-white text-[10px] px-1 rounded-tl leading-tight">
+                            {person.photo_count}
+                          </span>
+                        </button>
+                        <span className="text-xs text-center text-gray-200 truncate w-full px-1">{person.name}</span>
+                        <button
+                          onClick={() => setFolderPaneConnections({ personId: person.id, personName: person.name ?? 'Unknown' })}
+                          className="text-[11px] text-gray-500 hover:text-purple-300 transition-colors"
+                        >
+                          Connections
+                        </button>
+                      </div>
+                    )
+                  })}
+                </div>
+              </section>
+
+              <section>
+                <div className="mb-1.5 flex items-center justify-between border-l-4 border-amber-500 pl-2 gap-2">
+                  <span className="text-xs font-semibold uppercase tracking-wide text-amber-300">Unnamed Faces Bar</span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-gray-500">{folderPaneUnnamed.length}</span>
+                    {folderPaneSelectMode && (
+                      <span className="text-[11px] text-gray-400">{folderPaneSelectedClusterIds.size} selected</span>
+                    )}
+                    <button
+                      onClick={() => {
+                        if (folderPaneSelectMode) exitFolderPaneSelectMode()
+                        else setFolderPaneSelectMode(true)
+                      }}
+                      disabled={folderPaneLoading || !!folderPaneBusyKey || folderPaneUnnamed.length === 0}
+                      className="text-[11px] px-2 py-0.5 rounded border border-indigo-800 bg-indigo-900/20 text-indigo-300 hover:bg-indigo-900/40 disabled:opacity-40 transition-colors"
+                      title="Select unnamed clusters for bulk actions"
+                    >
+                      {folderPaneSelectMode ? 'Cancel' : 'Select'}
+                    </button>
+                    {folderPaneSelectMode && (
+                      <>
+                        <button
+                          onClick={() => setFolderPaneBulkNameOpen(true)}
+                          disabled={!!folderPaneBusyKey || folderPaneSelectedClusterIds.size === 0}
+                          className="text-[11px] px-2 py-0.5 rounded border border-indigo-700 bg-indigo-900/20 text-indigo-300 hover:bg-indigo-900/40 disabled:opacity-40 transition-colors"
+                        >
+                          Name selected
+                        </button>
+                        <button
+                          onClick={() => setFolderPaneBulkIgnoreOpen(true)}
+                          disabled={!!folderPaneBusyKey || folderPaneSelectedClusterIds.size === 0}
+                          className="text-[11px] px-2 py-0.5 rounded border border-red-800 bg-red-900/20 text-red-300 hover:bg-red-900/40 disabled:opacity-40 transition-colors"
+                        >
+                          Ignore selected
+                        </button>
+                      </>
+                    )}
+                    <button
+                      onClick={handleFolderPaneIgnoreAllUnnamed}
+                      disabled={folderPaneSelectMode || folderPaneLoading || !!folderPaneBusyKey || folderPaneUnnamed.length === 0}
+                      className="text-[11px] px-2 py-0.5 rounded border border-red-800 bg-red-900/20 text-red-300 hover:bg-red-900/40 disabled:opacity-40 transition-colors"
+                      title="Always ignore all unnamed clusters in this folder scope"
+                    >
+                      {folderPaneBusyKey === 'ignore-all' ? 'Ignoring…' : 'Ignore all'}
+                    </button>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  {folderPaneLoading && <p className="text-[11px] text-gray-500 px-2 py-1">Loading…</p>}
+                  {!folderPaneLoading && folderPaneUnnamed.length === 0 && (
+                    <p className="text-[11px] text-gray-500 px-2 py-1">No unnamed clusters</p>
+                  )}
+                  {!folderPaneLoading && folderPaneUnnamed.slice(0, 80).map(cluster => {
+                    const thumb = faceThumbUrl(cluster.representative_thumbnail)
+                    const nameBusy = folderPaneBusyKey === `name-${cluster.id}`
+                    const ignoreBusy = folderPaneBusyKey === `ignore-${cluster.id}`
+                    const selected = folderPaneSelectedClusterIds.has(cluster.id)
+                    return (
+                      <div key={cluster.id} className="flex flex-col items-center gap-1.5">
+                        <button
+                          onClick={() => {
+                            if (folderPaneSelectMode) {
+                              toggleFolderPaneSelect(cluster.id)
+                              return
+                            }
+                            openFiltered(
+                              { ...scopeFilter, cluster_id: cluster.id },
+                              `👤 Unnamed cluster (${cluster.member_count})`,
+                              'library',
+                              filtered.folderId,
+                              filtered.pathPrefix,
+                            )
+                          }}
+                          className={`relative w-20 h-20 rounded-xl bg-gray-800 border overflow-hidden transition-colors ${selected ? 'border-indigo-500 ring-2 ring-indigo-600' : 'border-gray-700 hover:border-indigo-400'}`}
+                          title={folderPaneSelectMode ? (selected ? 'Deselect' : 'Select') : 'View cluster photos'}
+                        >
+                          {thumb
+                            ? <img src={thumb} alt="Unnamed cluster" className="w-full h-full object-cover" />
+                            : <span className="w-full h-full flex items-center justify-center text-gray-500 text-2xl">?</span>}
+                          <span className="absolute bottom-0 right-0 bg-indigo-700 text-white text-[10px] px-1 rounded-tl leading-tight">
+                            {cluster.member_count}
+                          </span>
+                          {folderPaneSelectMode && (
+                            <span className={`absolute top-1 right-1 w-5 h-5 rounded-full border-2 flex items-center justify-center text-[10px] font-bold ${selected ? 'bg-indigo-500 border-indigo-400 text-white' : 'bg-black/40 border-gray-400 text-transparent'}`}>
+                              ✓
+                            </span>
+                          )}
+                        </button>
+                        <span className="text-xs text-center text-gray-400 truncate w-full px-1">Cluster #{cluster.id}</span>
+                        {!folderPaneSelectMode && (
+                          <div className="flex items-center gap-2 text-[11px]">
+                            <button
+                              onClick={() => handleFolderPaneNameCluster(cluster)}
+                              disabled={!!folderPaneBusyKey}
+                              className="text-indigo-300 hover:text-indigo-200 disabled:opacity-40 transition-colors"
+                            >
+                              {nameBusy ? 'Naming…' : 'Name'}
+                            </button>
+                            <button
+                              onClick={() => handleFolderPaneIgnoreCluster(cluster)}
+                              disabled={!!folderPaneBusyKey}
+                              className="text-red-300 hover:text-red-200 disabled:opacity-40 transition-colors"
+                            >
+                              {ignoreBusy ? 'Ignoring…' : 'Ignore'}
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              </section>
+            </div>
+          </>
+        )}
+      </aside>
+    ) : null
+
     mainContent = (
       <div className="flex flex-col gap-4 h-full">
         <button
@@ -696,13 +1137,18 @@ export default function App() {
             {folderWritebackError}
           </div>
         )}
-        <PhotoGrid
-          filter={filtered.filter}
-          title={filtered.title}
-          selectable
-          enableReprocess
-          headerSlot={folderRescanSlot}
-        />
+        <div className="flex gap-4 min-h-0 flex-1">
+          <div className="flex-1 min-w-0 min-h-0 overflow-y-auto pr-1">
+            <PhotoGrid
+              filter={filtered.filter}
+              title={filtered.title}
+              selectable
+              enableReprocess
+              headerSlot={folderRescanSlot}
+            />
+          </div>
+          {facesPane}
+        </div>
       </div>
     )
   } else {
@@ -1091,6 +1537,232 @@ export default function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {folderPaneNameTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70">
+          <div className="bg-gray-900 border border-gray-700 rounded-2xl p-7 max-w-sm w-full shadow-2xl mx-4">
+            <p className="text-white font-semibold text-lg mb-1">Name this face</p>
+            <p className="text-gray-400 text-sm mb-4">
+              Assign this unnamed cluster to an existing or new person.
+            </p>
+            <input
+              autoFocus
+              value={folderPaneNameInput}
+              onChange={e => setFolderPaneNameInput(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter') void handleFolderPaneConfirmName(false)
+                if (e.key === 'Escape') {
+                  setFolderPaneNameTarget(null)
+                  setFolderPaneMergeCandidate(null)
+                }
+              }}
+              placeholder="Enter name…"
+              className="w-full bg-gray-800 border border-indigo-500 rounded-lg px-3 py-2 text-sm text-white outline-none mb-4"
+            />
+
+            {folderPaneMergeCandidate && (
+              <div className="mb-4 rounded-lg border border-amber-700 bg-amber-900/20 p-3">
+                <p className="text-amber-200 text-xs mb-2">
+                  "{folderPaneNameInput.trim()}" already exists as {folderPaneMergeCandidate.name}. Same person?
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={async () => {
+                      try {
+                        setFolderPaneBusyKey(`name-${folderPaneNameTarget.id}`)
+                        await api.persons.addCluster(folderPaneMergeCandidate.personId, folderPaneNameTarget.id)
+                        setFolderPaneNameTarget(null)
+                        setFolderPaneNameInput('')
+                        setFolderPaneMergeCandidate(null)
+                        await loadFolderPaneFaces()
+                      } catch (e: unknown) {
+                        setFolderPaneError(e instanceof Error ? e.message : 'Could not merge this cluster')
+                      } finally {
+                        setFolderPaneBusyKey(null)
+                      }
+                    }}
+                    disabled={!!folderPaneBusyKey}
+                    className="flex-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg py-1.5 text-xs font-medium"
+                  >
+                    Same — merge
+                  </button>
+                  <button
+                    onClick={() => void handleFolderPaneConfirmName(true)}
+                    disabled={!!folderPaneBusyKey}
+                    className="flex-1 bg-amber-700 hover:bg-amber-600 disabled:opacity-40 text-white rounded-lg py-1.5 text-xs font-medium"
+                  >
+                    Force merge
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <div className="flex gap-3">
+              <button
+                onClick={() => void handleFolderPaneConfirmName(false)}
+                disabled={!!folderPaneBusyKey || !folderPaneNameInput.trim()}
+                className="flex-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-xl py-2.5 text-sm font-semibold transition-colors"
+              >
+                {folderPaneBusyKey?.startsWith('name-') ? 'Saving…' : 'Save'}
+              </button>
+              <button
+                onClick={() => {
+                  setFolderPaneNameTarget(null)
+                  setFolderPaneMergeCandidate(null)
+                }}
+                disabled={!!folderPaneBusyKey}
+                className="flex-1 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-gray-300 rounded-xl py-2.5 text-sm font-medium transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {folderPaneIgnoreTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70">
+          <div className="bg-gray-900 border border-gray-700 rounded-2xl p-7 max-w-sm w-full shadow-2xl mx-4">
+            <p className="text-white font-semibold text-lg mb-1">Always ignore this face?</p>
+            <p className="text-gray-400 text-sm mb-6">
+              This cluster will be moved to ignored faces and removed from unnamed suggestions.
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => void handleFolderPaneConfirmIgnoreCluster()}
+                disabled={!!folderPaneBusyKey}
+                className="flex-1 bg-red-700 hover:bg-red-600 disabled:opacity-40 text-white rounded-xl py-2.5 text-sm font-semibold transition-colors"
+              >
+                {folderPaneBusyKey?.startsWith('ignore-') ? 'Ignoring…' : 'Always ignore'}
+              </button>
+              <button
+                onClick={() => setFolderPaneIgnoreTarget(null)}
+                disabled={!!folderPaneBusyKey}
+                className="flex-1 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-gray-300 rounded-xl py-2.5 text-sm font-medium transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {folderPaneIgnoreAllOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70">
+          <div className="bg-gray-900 border border-gray-700 rounded-2xl p-7 max-w-md w-full shadow-2xl mx-4">
+            <p className="text-white font-semibold text-lg mb-1">Ignore all unnamed faces?</p>
+            <p className="text-gray-400 text-sm mb-6">
+              This will always ignore all {folderPaneUnnamed.length} unnamed clusters currently shown in this folder scope.
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => void handleFolderPaneConfirmIgnoreAllUnnamed()}
+                disabled={!!folderPaneBusyKey || folderPaneUnnamed.length === 0}
+                className="flex-1 bg-red-700 hover:bg-red-600 disabled:opacity-40 text-white rounded-xl py-2.5 text-sm font-semibold transition-colors"
+              >
+                {folderPaneBusyKey === 'ignore-all' ? 'Ignoring…' : 'Ignore all'}
+              </button>
+              <button
+                onClick={() => setFolderPaneIgnoreAllOpen(false)}
+                disabled={!!folderPaneBusyKey}
+                className="flex-1 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-gray-300 rounded-xl py-2.5 text-sm font-medium transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {folderPaneBulkNameOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70">
+          <div className="bg-gray-900 border border-gray-700 rounded-2xl p-7 max-w-sm w-full shadow-2xl mx-4">
+            <p className="text-white font-semibold text-lg mb-1">Name selected faces</p>
+            <p className="text-gray-400 text-sm mb-4">
+              Assign one name to {folderPaneSelectedClusterIds.size} selected unnamed clusters.
+            </p>
+            <input
+              autoFocus
+              value={folderPaneBulkNameInput}
+              onChange={e => setFolderPaneBulkNameInput(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter') void handleFolderPaneBulkName()
+                if (e.key === 'Escape') setFolderPaneBulkNameOpen(false)
+              }}
+              placeholder="Enter name…"
+              className="w-full bg-gray-800 border border-indigo-500 rounded-lg px-3 py-2 text-sm text-white outline-none mb-4"
+            />
+            <div className="flex gap-3">
+              <button
+                onClick={() => void handleFolderPaneBulkName()}
+                disabled={!!folderPaneBusyKey || !folderPaneBulkNameInput.trim() || folderPaneSelectedClusterIds.size === 0}
+                className="flex-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-xl py-2.5 text-sm font-semibold transition-colors"
+              >
+                {folderPaneBusyKey === 'bulk-name' ? 'Saving…' : 'Save'}
+              </button>
+              <button
+                onClick={() => setFolderPaneBulkNameOpen(false)}
+                disabled={!!folderPaneBusyKey}
+                className="flex-1 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-gray-300 rounded-xl py-2.5 text-sm font-medium transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {folderPaneBulkIgnoreOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70">
+          <div className="bg-gray-900 border border-gray-700 rounded-2xl p-7 max-w-md w-full shadow-2xl mx-4">
+            <p className="text-white font-semibold text-lg mb-1">Ignore selected faces?</p>
+            <p className="text-gray-400 text-sm mb-6">
+              This will always ignore {folderPaneSelectedClusterIds.size} selected unnamed clusters in this folder scope.
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => void handleFolderPaneBulkIgnoreSelected()}
+                disabled={!!folderPaneBusyKey || folderPaneSelectedClusterIds.size === 0}
+                className="flex-1 bg-red-700 hover:bg-red-600 disabled:opacity-40 text-white rounded-xl py-2.5 text-sm font-semibold transition-colors"
+              >
+                {folderPaneBusyKey === 'bulk-ignore' ? 'Ignoring…' : 'Ignore selected'}
+              </button>
+              <button
+                onClick={() => setFolderPaneBulkIgnoreOpen(false)}
+                disabled={!!folderPaneBusyKey}
+                className="flex-1 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-gray-300 rounded-xl py-2.5 text-sm font-medium transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {folderPaneConnections && (
+        <ConnectionsGraph
+          personId={folderPaneConnections.personId}
+          personName={folderPaneConnections.personName}
+          onClose={() => setFolderPaneConnections(null)}
+          onNavigatePerson={(pid, name) => {
+            setFolderPaneConnections(null)
+            if (filtered?.folderId || filtered?.pathPrefix) {
+              const scoped: MediaFilter = filtered.pathPrefix
+                ? { path_prefix: filtered.pathPrefix }
+                : (filtered.folderId ? { folder_id: filtered.folderId } : {})
+              openFiltered(
+                { ...scoped, person_id: pid },
+                `👤 ${name}`,
+                'library',
+                filtered?.folderId,
+                filtered?.pathPrefix,
+              )
+              return
+            }
+            openFiltered({ person_id: pid }, `👤 ${name}`, 'people')
+          }}
+        />
       )}
 
       {/* ── Global notification stack (bottom-right) ── */}

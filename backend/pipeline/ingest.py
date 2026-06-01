@@ -1689,6 +1689,10 @@ async def _phase_recover_singletons() -> None:
 
     auto_th    = float(get_setting("auto_name_threshold"))   # default 0.98
     suggest_th = float(get_setting("merge_suggest_threshold"))  # default 0.63
+    unnamed_auto_th = max(
+        suggest_th,
+        float(get_setting("unnamed_auto_merge_threshold") or 0.91),
+    )
 
     # Singleton recovery uses a slightly lower auto-threshold than person
     # auto-naming.  Two near-identical embeddings that both ended up as
@@ -1696,8 +1700,8 @@ async def _phase_recover_singletons() -> None:
     singleton_auto_th = max(suggest_th, min(auto_th, 0.88))
 
     logger.info(
-        "Phase 3a: Singleton recovery (auto≥%.2f, suggest≥%.2f)",
-        singleton_auto_th, suggest_th,
+        "Phase 3a: Singleton recovery (named_auto≥%.2f, unnamed_auto≥%.2f, suggest≥%.2f)",
+        singleton_auto_th, unnamed_auto_th, suggest_th,
     )
     await broadcast("phase_start", phase="singleton_recovery")
 
@@ -1705,7 +1709,8 @@ async def _phase_recover_singletons() -> None:
     async with get_db() as db:
         singleton_rows = await db.execute_fetchall("""
             SELECT c.id AS cluster_id, c.centroid,
-                   MIN(f.id) AS face_id
+                 MIN(f.id) AS face_id,
+                 MIN(f.media_file_id) AS media_file_id
             FROM clusters c
             JOIN faces f ON f.cluster_id = c.id
                         LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
@@ -1718,7 +1723,7 @@ async def _phase_recover_singletons() -> None:
         # Build face_id → cluster_id map for all non-singleton unnamed clusters
         # (needed to find which cluster a FAISS hit belongs to)
         face_to_cluster_rows = await db.execute_fetchall("""
-            SELECT f.id AS face_id, f.cluster_id, c.member_count,
+            SELECT f.id AS face_id, f.cluster_id, c.member_count, f.media_file_id,
                    owner.id AS cluster_person_id
             FROM faces f
             JOIN clusters c ON c.id = f.cluster_id
@@ -1735,6 +1740,11 @@ async def _phase_recover_singletons() -> None:
         }
         for r in face_to_cluster_rows
     }
+    cluster_media_ids: dict[int, set[int]] = {}
+    for r in face_to_cluster_rows:
+        cid = int(r["cluster_id"])
+        mid = int(r["media_file_id"])
+        cluster_media_ids.setdefault(cid, set()).add(mid)
 
     if not singleton_rows:
         logger.info("Phase 3a: No singleton clusters to recover")
@@ -1755,6 +1765,7 @@ async def _phase_recover_singletons() -> None:
         if not row["centroid"]:
             continue
         centroid = load_centroid(row["centroid"])
+        singleton_media_id = int(row["media_file_id"])
 
         # Query FAISS — exclude the singleton's own face from hits (it's in
         # the index too; subtract 1 from k so we always get real neighbours)
@@ -1766,20 +1777,34 @@ async def _phase_recover_singletons() -> None:
         if not hits:
             continue
 
-        best_face_id, best_sim = hits[0]
-        target = face_to_cluster.get(best_face_id)
-        if target is None:
+        selected_hit: tuple[int, float, dict] | None = None
+        for cand_face_id, cand_sim in hits:
+            cand_target = face_to_cluster.get(cand_face_id)
+            if cand_target is None:
+                continue
+
+            cand_cluster_id = cand_target["cluster_id"]
+            if cand_cluster_id == singleton_cluster_id:
+                continue
+            if cand_cluster_id in deleted_clusters:
+                continue
+
+            # Apply same-photo exclusion for unnamed↔unnamed merges: two
+            # different faces from one photo must not collapse into one identity.
+            if cand_target["person_id"] is None:
+                target_media = cluster_media_ids.get(int(cand_cluster_id), set())
+                if singleton_media_id in target_media:
+                    continue
+
+            selected_hit = (cand_face_id, cand_sim, cand_target)
+            break
+
+        if selected_hit is None:
             continue
 
+        _, best_sim, target = selected_hit
         target_cluster_id = target["cluster_id"]
         target_person_id  = target["person_id"]
-
-        if target_cluster_id == singleton_cluster_id:
-            continue   # hit itself somehow
-
-        # Skip if the target cluster was deleted earlier in this same pass
-        if target_cluster_id in deleted_clusters:
-            continue
 
         # ── Social-context boost ───────────────────────────────────────────
         # If the singleton's photo also contains companions who have
@@ -1810,8 +1835,9 @@ async def _phase_recover_singletons() -> None:
             boost = min(0.10, colocated * 0.05)
 
         effective_sim = min(1.0, best_sim + boost)
+        target_auto_th = singleton_auto_th if target_person_id is not None else unnamed_auto_th
 
-        if effective_sim >= singleton_auto_th:
+        if effective_sim >= target_auto_th:
             # ── Silent auto-merge: move singleton faces into target cluster ─
             if target_cluster_id in already_targeted:
                 continue
@@ -1870,8 +1896,8 @@ async def _phase_recover_singletons() -> None:
                     info["person_id"]  = target_person_id
             auto_merged += 1
             logger.debug(
-                "Singleton %d absorbed into cluster %d (sim=%.3f boost=%.2f eff=%.3f)",
-                singleton_cluster_id, target_cluster_id, best_sim, boost, effective_sim,
+                "Singleton %d absorbed into cluster %d (sim=%.3f boost=%.2f eff=%.3f auto_th=%.2f)",
+                singleton_cluster_id, target_cluster_id, best_sim, boost, effective_sim, target_auto_th,
             )
 
         else:

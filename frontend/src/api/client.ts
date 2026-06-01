@@ -229,12 +229,14 @@ export const api = {
 
   // ─── Clusters ─────────────────────────────────────────────────────────────
   clusters: {
-    unnamed: (params: { limit?: number; offset?: number; sortBy?: 'member_count' | 'created_at'; sortDir?: 'asc' | 'desc' } = {}) => {
+    unnamed: (params: { limit?: number; offset?: number; sortBy?: 'member_count' | 'created_at'; sortDir?: 'asc' | 'desc'; folder_id?: number; path_prefix?: string } = {}) => {
       const search = new URLSearchParams()
       if (params.limit != null) search.set('limit', String(params.limit))
       if (params.offset != null) search.set('offset', String(params.offset))
       if (params.sortBy) search.set('sort_by', params.sortBy)
       if (params.sortDir) search.set('sort_dir', params.sortDir)
+      if (params.folder_id != null) search.set('folder_id', String(params.folder_id))
+      if (params.path_prefix) search.set('path_prefix', params.path_prefix)
       const qs = search.toString()
       return request<UnnamedClustersPage>(`/persons/unnamed${qs ? `?${qs}` : ''}`)
     },    delete: (clusterId: number) =>
@@ -254,7 +256,13 @@ export const api = {
 
   // ─── Persons ──────────────────────────────────────────────────────────────
   persons: {
-    list: () => request<Person[]>('/persons'),
+    list: (params: { folder_id?: number; path_prefix?: string } = {}) => {
+      const search = new URLSearchParams()
+      if (params.folder_id != null) search.set('folder_id', String(params.folder_id))
+      if (params.path_prefix) search.set('path_prefix', params.path_prefix)
+      const qs = search.toString()
+      return request<Person[]>(`/persons${qs ? `?${qs}` : ''}`)
+    },
     namePerson: (id: number, name: string) =>
       request(`/persons/${id}/name`, { method: 'PATCH', body: JSON.stringify({ name }) }),
     merge: (sourceId: number, intoId: number) =>

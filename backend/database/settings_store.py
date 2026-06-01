@@ -129,6 +129,16 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         ),
         "group": "Clustering",
     },
+    "unnamed_auto_merge_threshold": {
+        "value": 0.91, "type": "float", "min": 0.70, "max": 0.99, "step": 0.01,
+        "label": "Unnamed auto-merge threshold",
+        "description": (
+            "Cosine similarity at or above which an unnamed singleton face is automatically merged "
+            "into another unnamed cluster. Higher values reduce false merges. "
+            "Same-photo conflicts are always blocked."
+        ),
+        "group": "Clustering",
+    },
     "merge_multi_anchor_enabled": {
         "value": 0, "type": "bool", "min": 0, "max": 1, "step": 1,
         "label": "Multi-anchor merge retrieval",
