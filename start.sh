@@ -15,6 +15,9 @@ fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 
+# Suppress HuggingFace tokenizers fork warning under uvicorn --reload.
+export TOKENIZERS_PARALLELISM=false
+
 echo ""
 echo "╔══════════════════════════════════════════╗"
 echo "║   VIP — Starting                         ║"

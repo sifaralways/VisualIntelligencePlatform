@@ -139,6 +139,10 @@ def _bootstrap_missing_python_dependencies() -> None:
 
 _bootstrap_missing_python_dependencies()
 
+# Avoid HuggingFace tokenizers fork-parallelism warning/noise under dev reload
+# and child-process startup; this keeps behavior deterministic and safe.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
