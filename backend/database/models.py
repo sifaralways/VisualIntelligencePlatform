@@ -95,6 +95,10 @@ class Face(BaseModel):
     bbox_w: Optional[float] = None
     bbox_h: Optional[float] = None
     detection_conf: Optional[float] = None
+    face_sharpness: Optional[float] = None
+    pose_yaw: Optional[float] = None
+    pose_pitch: Optional[float] = None
+    pose_roll: Optional[float] = None
     thumbnail_path: Optional[str] = None
     person_id: Optional[int] = None
     cluster_id: Optional[int] = None

@@ -757,6 +757,50 @@ async def run_clip_index_rebuild() -> None:
     logger.info("=== CLIP index rebuild complete ===")
 
 
+async def run_face_index_rebuild() -> None:
+    """Rebuild the face FAISS index from all embedding rows currently in the DB."""
+    logger.info("=== Face index rebuild start ===")
+    await broadcast("pipeline_start", folder="[face index rebuild]")
+    await settings_store.load_cache()
+    _ensure_models()
+
+    await set_phase("face_index_rebuild")
+    await broadcast("progress", phase="face_index_rebuild", message="Loading face embeddings")
+
+    async with get_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT face_id, vector FROM embeddings ORDER BY face_id"
+        )
+
+    face_ids: list[int] = []
+    vectors: list[np.ndarray] = []
+    for row in rows:
+        raw = row["vector"]
+        if raw is None:
+            continue
+        vec = np.frombuffer(raw, dtype=np.float32)
+        if vec.size == 0:
+            continue
+        face_ids.append(int(row["face_id"]))
+        vectors.append(vec)
+
+    if vectors:
+        _faiss.build(face_ids, vectors)
+        _faiss.save()
+    else:
+        logger.warning("No face embeddings available for FAISS rebuild")
+
+    await broadcast(
+        "progress",
+        phase="face_index_rebuild",
+        done=len(vectors),
+        total=len(vectors),
+        message=f"Indexed {len(vectors)} face embeddings",
+    )
+    await broadcast("pipeline_complete", folder="[face index rebuild]")
+    logger.info("=== Face index rebuild complete (%d vectors) ===", len(vectors))
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline entry point
 # ---------------------------------------------------------------------------
@@ -1469,10 +1513,12 @@ async def _phase_embed(force_ids: set[int] | None = None, media_ids: set[int] | 
                     # Insert face record
                     cursor = await db.execute("""
                         INSERT INTO faces (media_file_id, bbox_x, bbox_y, bbox_w, bbox_h,
-                                           detection_conf, face_attributes)
-                        VALUES (?,?,?,?,?,?,?)
+                                     detection_conf, face_attributes,
+                                     face_sharpness, pose_yaw, pose_pitch, pose_roll)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?)
                     """, (media_id, face.bbox_x, face.bbox_y, face.bbox_w, face.bbox_h,
-                          face.detection_conf, json.dumps(face_attrs) if face_attrs else None))
+                          face.detection_conf, json.dumps(face_attrs) if face_attrs else None,
+                          face.quality_sharpness, face.pose_yaw, face.pose_pitch, face.pose_roll))
                     face_id = cursor.lastrowid
 
                     # Save thumbnail

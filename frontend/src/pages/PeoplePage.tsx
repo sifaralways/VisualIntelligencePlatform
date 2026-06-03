@@ -55,6 +55,8 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   const [reviewSortBy, setReviewSortBy] = useState<'detection_conf' | 'date_taken' | 'id'>('detection_conf')
   const [reviewSortDir, setReviewSortDir] = useState<'asc' | 'desc'>('desc')
   const [reviewPortraitFaceId, setReviewPortraitFaceId] = useState<number | null>(null)
+  const [recalculatingCentroid, setRecalculatingCentroid] = useState(false)
+  const [recalculateCentroidResult, setRecalculateCentroidResult] = useState<string | null>(null)
   const [settingPortrait, setSettingPortrait] = useState<number | null>(null)
   const [reviewFocusFaceId, setReviewFocusFaceId] = useState<number | null>(null)
   const [reviewFocusFaceClusterId, setReviewFocusFaceClusterId] = useState<number | null>(null)
@@ -839,6 +841,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     setReviewFocusPhotos([])
     setReviewFocusPhotoIndex(null)
     setConfirmUnname(false)
+    setRecalculateCentroidResult(null)
     setReviewLoading(true)
     try {
       const faces = await api.faces.byPerson(person.id, REVIEW_PAGE_SIZE, 0, 'detection_conf', 'desc')
@@ -860,6 +863,21 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
       await load()
     } finally {
       setSettingPortrait(null)
+    }
+  }
+
+  async function handleRecalculateCentroid() {
+    if (!reviewPerson) return
+    setRecalculatingCentroid(true)
+    setRecalculateCentroidResult(null)
+    try {
+      const result = await api.persons.recalculateCentroid(reviewPerson.id)
+      setRecalculateCentroidResult(`Centroid rebuilt from ${result.selected_faces} best face${result.selected_faces === 1 ? '' : 's'}.`)
+      await load()
+    } catch {
+      setRecalculateCentroidResult('Could not recalculate centroid.')
+    } finally {
+      setRecalculatingCentroid(false)
     }
   }
 
@@ -1347,18 +1365,31 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
                     </button>
                   </>
                 ) : (
-                  <button
-                    onClick={() => setConfirmUnname(true)}
-                    title="Remove name and release faces back to unnamed pool"
-                    className="text-xs px-2.5 py-1 rounded-lg border border-red-800 bg-red-900/20 text-red-400 hover:bg-red-900/40 hover:text-red-300 transition-colors"
-                  >
-                    Un-name
-                  </button>
+                  <>
+                    <button
+                      onClick={handleRecalculateCentroid}
+                      disabled={recalculatingCentroid}
+                      title="Rebuild this person's centroid from the current best-quality assigned faces"
+                      className="text-xs px-2.5 py-1 rounded-lg border border-indigo-800 bg-indigo-900/20 text-indigo-300 hover:bg-indigo-900/40 hover:text-indigo-200 disabled:opacity-40 transition-colors"
+                    >
+                      {recalculatingCentroid ? 'Recalculating…' : 'Recalculate centroid'}
+                    </button>
+                    <button
+                      onClick={() => setConfirmUnname(true)}
+                      title="Remove name and release faces back to unnamed pool"
+                      className="text-xs px-2.5 py-1 rounded-lg border border-red-800 bg-red-900/20 text-red-400 hover:bg-red-900/40 hover:text-red-300 transition-colors"
+                    >
+                      Un-name
+                    </button>
+                  </>
                 )}
                 <button onClick={() => { setReviewPerson(null); setConfirmUnname(false) }}
                   className="text-gray-400 hover:text-white text-xl leading-none px-2">✕</button>
               </div>
             </div>
+            {recalculateCentroidResult && (
+              <p className="mb-3 text-xs text-indigo-300">{recalculateCentroidResult}</p>
+            )}
             <div className="flex items-center justify-between mb-3 text-xs">
               <span className="text-gray-500">
                 Page {reviewPage + 1} · {reviewFaces.length} face{reviewFaces.length !== 1 ? 's' : ''}

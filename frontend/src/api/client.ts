@@ -139,6 +139,10 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ models, scope }),
       }),
+    rebuildFaceIndex: () =>
+      request<{ status: string }>('/pipeline/rebuild_face_index', {
+        method: 'POST',
+      }),
     rescanFolder: (folderId: number, pathPrefix?: string) =>
       request<{ status: string; folder: string }>('/pipeline/rescan_folder', {
         method: 'POST',
@@ -337,6 +341,10 @@ export const api = {
     setPortrait: (personId: number, faceId: number) =>
       request<{ status: string; person_id: number; portrait_face_id: number }>(
         `/persons/${personId}/set-portrait/${faceId}`, { method: 'POST' }
+      ),
+    recalculateCentroid: (personId: number) =>
+      request<{ status: string; person_id: number; person_name: string | null; selected_faces: number }>(
+        `/persons/${personId}/recalculate-centroid`, { method: 'POST' }
       ),
     assignFace: (faceId: number, name: string) =>
       request<{ status: string; face_id: number; person_id: number }>(
@@ -780,7 +788,7 @@ export interface SimilarCluster {
   similarity: number
 }
 
-export interface IgnoreSuggestion extends SimilarCluster {}
+export type IgnoreSuggestion = SimilarCluster
 
 export interface IgnoreSuggestionScanResult {
   status: string

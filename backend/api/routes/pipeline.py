@@ -726,6 +726,21 @@ async def rebuild_clip_index(background_tasks: BackgroundTasks):
     return {"status": "started"}
 
 
+@router.post("/rebuild_face_index")
+async def rebuild_face_index(background_tasks: BackgroundTasks):
+    """Rebuild the face FAISS index from current embeddings without re-clustering."""
+    profile_id = get_current_profile_id()
+    pipeline_state = _state(profile_id)
+    if pipeline_state["status"] == "running":
+        raise HTTPException(status_code=409, detail="Pipeline already running")
+
+    pipeline_state.update({"status": "running", "folder": "[face index rebuild]", "error": None})
+    await begin_run("rebuild_face_index", "[face index rebuild]", None)
+    mark_pipeline_started(profile_id)
+    background_tasks.add_task(run_in_profile, profile_id, _run_face_index_rebuild)
+    return {"status": "started"}
+
+
 async def _run_model_migration() -> None:
     from backend.pipeline.ingest import run_model_migration
     profile_id = get_current_profile_id()
@@ -761,6 +776,28 @@ async def _run_clip_index_rebuild() -> None:
         await mark_stopped_resumable()
     except Exception as e:
         logger.exception("CLIP index rebuild error")
+        pipeline_state["status"] = "error"
+        pipeline_state["error"] = str(e)
+        await mark_error(str(e))
+    finally:
+        mark_pipeline_finished(profile_id)
+
+
+async def _run_face_index_rebuild() -> None:
+    from backend.pipeline.ingest import run_face_index_rebuild
+
+    profile_id = get_current_profile_id()
+    pipeline_state = _state(profile_id)
+    try:
+        await run_face_index_rebuild()
+        pipeline_state["status"] = "idle"
+        await mark_succeeded_idle()
+    except PipelineStopRequested:
+        pipeline_state["status"] = "stopped"
+        pipeline_state["error"] = None
+        await mark_stopped_resumable()
+    except Exception as e:
+        logger.exception("Face index rebuild error")
         pipeline_state["status"] = "error"
         pipeline_state["error"] = str(e)
         await mark_error(str(e))

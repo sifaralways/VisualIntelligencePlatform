@@ -12,6 +12,7 @@ import numpy as np
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from pydantic import BaseModel
 
+from backend.face_quality import face_sample_weight as _shared_face_sample_weight, weighted_centroid_from_rows as _shared_weighted_centroid_from_rows
 from backend.database.db import get_db
 from backend.database.identity import append_identity_event, get_current_cluster_id_for_face, get_current_person_id_for_cluster, link_cluster_to_person, relink_face_to_cluster
 from backend.database.models import Person
@@ -41,45 +42,11 @@ def _normalise_vector(vec: np.ndarray) -> np.ndarray:
 
 
 def _face_sample_weight(detection_conf: float | None, bbox_w: float | None, bbox_h: float | None) -> float:
-    """Quality-ish weight for a face sample used in centroid building.
-
-    Uses detector confidence + normalized face area proxy to reduce influence
-    from tiny/weak detections that commonly cause sibling confusion.
-    """
-    conf = float(detection_conf) if detection_conf is not None else 0.5
-    conf = max(0.05, min(1.0, conf))
-
-    area = 0.0
-    if bbox_w is not None and bbox_h is not None:
-        area = max(0.0, float(bbox_w) * float(bbox_h))
-
-    # Normalize around a moderate face area (~2% of frame) and cap impact.
-    size_weight = max(0.4, min(1.6, area / 0.02 if area > 0 else 0.7))
-    return max(0.05, conf * size_weight)
+    return _shared_face_sample_weight(detection_conf, bbox_w, bbox_h)
 
 
 def _weighted_centroid_from_rows(rows: list) -> np.ndarray | None:
-    if not rows:
-        return None
-
-    vecs: list[np.ndarray] = []
-    weights: list[float] = []
-    for r in rows:
-        vec = np.frombuffer(r["vector"], dtype=np.float32)
-        vecs.append(vec)
-        keys = r.keys()
-        detection_conf = r["detection_conf"] if "detection_conf" in keys else None
-        bbox_w = r["bbox_w"] if "bbox_w" in keys else None
-        bbox_h = r["bbox_h"] if "bbox_h" in keys else None
-        weights.append(_face_sample_weight(detection_conf, bbox_w, bbox_h))
-
-    arr = np.stack(vecs)
-    w = np.asarray(weights, dtype=np.float32)
-    if np.all(w <= 0):
-        centroid = arr.mean(axis=0)
-    else:
-        centroid = np.average(arr, axis=0, weights=w)
-    return _normalise_vector(centroid)
+    return _shared_weighted_centroid_from_rows(rows)
 
 
 def _best_competing_person(
@@ -447,6 +414,10 @@ async def _rescore_after_person_update(person_id: int) -> None:
                 if cluster_centroid is None:
                     continue
 
+                # Second-stage exact rerank: use cluster centroid similarity,
+                # not nearest single-face ANN similarity.
+                sim = float(np.dot(person_centroid, cluster_centroid))
+
                 competing_id, competing_sim = _best_competing_person(cluster_centroid, competitor_centroids)
                 margin = float("inf") if competing_sim is None else (sim - competing_sim)
 
@@ -808,35 +779,61 @@ async def _score_similar_unnamed_clusters(
 ) -> list[dict]:
     exclude_cluster_ids = exclude_cluster_ids or set()
     candidates = None
+    faiss_used = False
 
     try:
         from backend.pipeline.ingest import _faiss
 
         if _faiss.total > 0:
-            shortlist_k = min(max((limit or 50) * 40, 250), min(_faiss.total, 2000))
-            face_hits = _faiss.search(source_vec, k=shortlist_k, threshold=0.0)
-            if face_hits:
-                hit_face_ids = [fid for fid, _ in face_hits]
-                ph = ",".join("?" for _ in hit_face_ids)
-                cluster_rows = await db.execute_fetchall(
-                    f"""
-                    SELECT DISTINCT COALESCE(c_current.id, f.cluster_id) AS cluster_id
-                    FROM faces f
-                    LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
-                    LEFT JOIN clusters c_current ON c_current.cluster_guid = fcc.cluster_guid
-                    LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = COALESCE(fcc.cluster_guid, c_current.cluster_guid)
-                    LEFT JOIN persons owner_person ON owner_person.person_guid = cpc.person_guid AND owner_person.is_merged = 0
-                    WHERE f.id IN ({ph})
-                      AND COALESCE(c_current.id, f.cluster_id) IS NOT NULL
-                      AND owner_person.id IS NULL
-                    """,
-                    hit_face_ids,
+            # If FAISS is materially out-of-sync with DB embeddings, skip ANN
+            # retrieval to avoid silently missing valid candidates.
+            emb_total_row = await (
+                await db.execute("SELECT COUNT(*) AS n FROM embeddings")
+            ).fetchone()
+            emb_total = int(emb_total_row["n"] or 0) if emb_total_row else 0
+            stale_ratio_limit = max(
+                0.0,
+                min(0.5, float(get_setting("suggestion_faiss_stale_ratio") or 0.08)),
+            )
+            delta_ratio = (
+                0.0 if emb_total <= 0 else abs(float(_faiss.total) - float(emb_total)) / float(emb_total)
+            )
+            faiss_is_stale = emb_total > 0 and delta_ratio > stale_ratio_limit
+
+            if faiss_is_stale:
+                logger.warning(
+                    "Skipping FAISS shortlist for suggestions: index_total=%d embeddings_total=%d delta_ratio=%.4f limit=%.4f",
+                    _faiss.total,
+                    emb_total,
+                    delta_ratio,
+                    stale_ratio_limit,
                 )
-                candidate_cluster_ids = list(dict.fromkeys(
-                    int(r["cluster_id"]) for r in cluster_rows if r["cluster_id"] is not None
-                ))
-                if candidate_cluster_ids:
-                    candidates = await _load_unnamed_cluster_rows_by_ids(db, candidate_cluster_ids)
+            else:
+                faiss_used = True
+                shortlist_k = min(max((limit or 50) * 40, 250), min(_faiss.total, 2000))
+                face_hits = _faiss.search(source_vec, k=shortlist_k, threshold=0.0)
+                if face_hits:
+                    hit_face_ids = [fid for fid, _ in face_hits]
+                    ph = ",".join("?" for _ in hit_face_ids)
+                    cluster_rows = await db.execute_fetchall(
+                        f"""
+                        SELECT DISTINCT COALESCE(c_current.id, f.cluster_id) AS cluster_id
+                        FROM faces f
+                        LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                        LEFT JOIN clusters c_current ON c_current.cluster_guid = fcc.cluster_guid
+                        LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = COALESCE(fcc.cluster_guid, c_current.cluster_guid)
+                        LEFT JOIN persons owner_person ON owner_person.person_guid = cpc.person_guid AND owner_person.is_merged = 0
+                        WHERE f.id IN ({ph})
+                          AND COALESCE(c_current.id, f.cluster_id) IS NOT NULL
+                          AND owner_person.id IS NULL
+                        """,
+                        hit_face_ids,
+                    )
+                    candidate_cluster_ids = list(dict.fromkeys(
+                        int(r["cluster_id"]) for r in cluster_rows if r["cluster_id"] is not None
+                    ))
+                    if candidate_cluster_ids:
+                        candidates = await _load_unnamed_cluster_rows_by_ids(db, candidate_cluster_ids)
     except Exception:
         candidates = None
 
@@ -865,7 +862,7 @@ async def _score_similar_unnamed_clusters(
         )
         rejected_cluster_ids = {int(r["cluster_id"]) for r in rejected_rows}
 
-    scored: list[dict] = []
+    scored: list[tuple[float, dict]] = []
     for cand in candidates:
         cid = int(cand["cluster_id"])
         if cid in exclude_cluster_ids or cid in rejected_cluster_ids or not cand["centroid"]:
@@ -876,17 +873,20 @@ async def _score_similar_unnamed_clusters(
             continue
         vec = _normalise_vector(np.frombuffer(cand["centroid"], dtype=np.float32))
         sim = float(np.dot(source_vec, vec))
-        scored.append({
+        scored.append((sim, {
             "cluster_id": cid,
             "member_count": int(cand["member_count"] or 0),
             "intra_similarity": cand["intra_similarity"],
             "is_high_conf": int(cand["is_high_conf"] or 0),
             "representative_thumbnail": cand["representative_thumbnail"],
             "similarity": round(sim, 3),
-        })
+        }))
 
-    scored.sort(key=lambda x: x["similarity"], reverse=True)
-    return scored[:limit] if limit is not None else scored
+    scored.sort(key=lambda x: x[0], reverse=True)
+    ranked = [item for _, item in scored]
+    if not faiss_used:
+        logger.info("Suggestion retrieval used DB fallback candidate scan")
+    return ranked[:limit] if limit is not None else ranked
 
 
 def _build_person_anchor_vectors(
@@ -1948,6 +1948,34 @@ async def set_portrait_face(person_id: int, face_id: int):
     return {"status": "ok", "person_id": person_id, "portrait_face_id": face_id}
 
 
+@router.post("/{person_id}/recalculate-centroid")
+async def recalculate_person_centroid(person_id: int):
+    async with get_db() as db:
+        person = await (
+            await db.execute(
+                "SELECT id, name FROM persons WHERE id=? AND is_merged=0",
+                (person_id,),
+            )
+        ).fetchone()
+        if not person:
+            raise HTTPException(status_code=404, detail="Person not found")
+
+        await update_person_centroid(db, person_id)
+        selected_row = await (
+            await db.execute(
+                "SELECT COUNT(*) AS n FROM person_centroid_faces WHERE person_id=?",
+                (person_id,),
+            )
+        ).fetchone()
+
+    return {
+        "status": "recalculated",
+        "person_id": person_id,
+        "person_name": person["name"],
+        "selected_faces": int(selected_row["n"] or 0) if selected_row else 0,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Co-occurrence: "frequently appears with" + connection graph
 # ---------------------------------------------------------------------------
@@ -2332,7 +2360,8 @@ async def get_merge_suggestions(person_id: int, limit: int = 1):
             centroid = centroid_by_cluster.get(cid)
             if centroid is None:
                 continue
-            sim = float(cand["similarity"])
+            # Second-stage exact rerank against the full person centroid.
+            sim = float(np.dot(person_centroid, centroid))
             if sim < _SUGGEST_THRESHOLD:
                 continue
             competing_id, competing_sim = _best_competing_person(centroid, competitor_centroids)

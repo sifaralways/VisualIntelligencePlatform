@@ -14,7 +14,50 @@ import logging
 
 import numpy as np
 
+from backend.database import settings_store
+from backend.face_quality import face_quality_score_from_row, select_top_face_rows, weighted_centroid_from_rows
+
 logger = logging.getLogger(__name__)
+
+
+async def rebuild_person_centroid_faces(db, person_id: int) -> int:
+    max_faces = max(1, int(settings_store.get("person_centroid_max_faces") or 100))
+    rows = await db.execute_fetchall("""
+        SELECT e.face_id,
+               e.vector,
+               f.detection_conf,
+               f.bbox_w,
+               f.bbox_h,
+               f.face_attributes,
+               f.face_sharpness,
+               f.pose_yaw,
+               f.pose_pitch,
+               f.pose_roll
+        FROM embeddings e
+        JOIN faces f ON f.id = e.face_id
+        JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+        JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+        JOIN persons p ON p.person_guid = cpc.person_guid
+        WHERE p.id = ?
+    """, (person_id,))
+
+    await db.execute("DELETE FROM person_centroid_faces WHERE person_id=?", (person_id,))
+
+    if not rows:
+        return 0
+
+    selected_rows = select_top_face_rows(rows, max_faces=max_faces)
+    await db.executemany(
+        """
+        INSERT INTO person_centroid_faces (person_id, face_id, quality_score)
+        VALUES (?, ?, ?)
+        """,
+        [
+            (person_id, int(row["face_id"]), float(face_quality_score_from_row(row)))
+            for row in selected_rows
+        ],
+    )
+    return len(selected_rows)
 
 
 async def update_person_centroid(db, person_id: int) -> None:
@@ -33,14 +76,23 @@ async def update_person_centroid(db, person_id: int) -> None:
     If the person has no remaining embeddings (all photos deleted), the centroid
     is set to NULL so the person is skipped in matching until new photos arrive.
     """
+    selected_count = await rebuild_person_centroid_faces(db, person_id)
+
     rows = await db.execute_fetchall("""
-        SELECT e.vector
-        FROM embeddings e
-        JOIN faces f ON f.id = e.face_id
-        JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
-        JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
-        JOIN persons p ON p.person_guid = cpc.person_guid
-        WHERE p.id = ?
+        SELECT e.vector,
+               f.detection_conf,
+               f.bbox_w,
+               f.bbox_h,
+               f.face_attributes,
+               f.face_sharpness,
+               f.pose_yaw,
+               f.pose_pitch,
+               f.pose_roll
+        FROM person_centroid_faces pcf
+        JOIN embeddings e ON e.face_id = pcf.face_id
+        JOIN faces f ON f.id = pcf.face_id
+        WHERE pcf.person_id = ?
+        ORDER BY pcf.quality_score DESC, pcf.face_id DESC
     """, (person_id,))
 
     if not rows:
@@ -52,24 +104,31 @@ async def update_person_centroid(db, person_id: int) -> None:
             "UPDATE persons SET centroid_n=0 WHERE id=?",
             (person_id,),
         )
+        await db.execute("DELETE FROM person_centroid_faces WHERE person_id=?", (person_id,))
         logger.debug(
             "No embeddings for person_id=%d — preserving last centroid for future matching",
             person_id,
         )
         return
 
-    vecs = np.stack([np.frombuffer(r["vector"], dtype=np.float32) for r in rows])
-    centroid = vecs.mean(axis=0)
-    norm = np.linalg.norm(centroid)
-    if norm > 0:
-        centroid /= norm
+    centroid = weighted_centroid_from_rows(rows)
+    if centroid is None:
+        await db.execute(
+            "UPDATE persons SET centroid_n=0 WHERE id=?",
+            (person_id,),
+        )
+        logger.debug(
+            "No usable weighted embeddings for person_id=%d — preserving last centroid",
+            person_id,
+        )
+        return
 
     await db.execute(
         "UPDATE persons SET centroid=?, centroid_n=? WHERE id=?",
-        (centroid.tobytes(), len(rows), person_id),
+        (centroid.tobytes(), selected_count, person_id),
     )
     logger.debug(
-        "Updated centroid for person_id=%d from %d embeddings", person_id, len(rows)
+        "Updated centroid for person_id=%d from %d exemplar faces", person_id, selected_count
     )
 
 

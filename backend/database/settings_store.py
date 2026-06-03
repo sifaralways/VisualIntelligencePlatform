@@ -110,6 +110,12 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "description": "Clusters above this intra-similarity score show a green tick in the People tab.",
         "group": "Clustering",
     },
+    "person_centroid_max_faces": {
+        "value": 100, "type": "int", "min": 10, "max": 500, "step": 10,
+        "label": "Centroid exemplar faces",
+        "description": "Maximum number of best-quality faces retained per person to build their centroid.",
+        "group": "Clustering",
+    },
     "auto_name_threshold": {
         "value": 0.98, "type": "float", "min": 0.70, "max": 0.99, "step": 0.01,
         "label": "Auto-merge threshold",
@@ -199,6 +205,16 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "value": 0.02, "type": "float", "min": 0.00, "max": 0.30, "step": 0.01,
         "label": "Background min competitor margin",
         "description": "Minimum margin versus nearest competing person in quality-first mode.",
+        "group": "Background Suggestions",
+    },
+    "suggestion_faiss_stale_ratio": {
+        "value": 0.08, "type": "float", "min": 0.00, "max": 0.50, "step": 0.01,
+        "label": "Suggestion FAISS stale ratio",
+        "description": (
+            "If |faiss_vectors - embedding_rows| / embedding_rows exceeds this ratio, "
+            "suggestion retrieval skips FAISS shortlist and falls back to DB candidate scan "
+            "to avoid missing valid matches from stale indices."
+        ),
         "group": "Background Suggestions",
     },
     "yolo_conf_threshold": {

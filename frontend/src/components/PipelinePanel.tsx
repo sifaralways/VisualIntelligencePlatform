@@ -35,6 +35,7 @@ export default function PipelinePanel({ profileId, collapsed, onToggle, onPipeli
   const [stopBusy, setStopBusy] = useState(false)
   const [resumePendingBusy, setResumePendingBusy] = useState(false)
   const [resumeFlorenceBusy, setResumeFlorenceBusy] = useState(false)
+  const [rebuildFaceIndexBusy, setRebuildFaceIndexBusy] = useState(false)
   const wsRef  = useRef<WebSocket | null>(null)
   const logRef = useRef<HTMLDivElement>(null)
 
@@ -63,7 +64,9 @@ export default function PipelinePanel({ profileId, collapsed, onToggle, onPipeli
             onPipelineComplete?.()
           }
           if (ev.event === 'pipeline_start') setStatus('running')
-        } catch {}
+        } catch {
+          return
+        }
       }
 
       ws.onclose = () => {
@@ -148,6 +151,25 @@ export default function PipelinePanel({ profileId, collapsed, onToggle, onPipeli
       const err = e as { message?: string }
       setStatus('error')
       setEvents([{ event: 'error', message: err?.message ?? 'Model migration failed' }])
+    }
+  }
+
+  async function rebuildFaceIndex() {
+    if (!window.confirm(
+      'This will rebuild the face similarity index from current embeddings without re-clustering.\n\n' +
+      'Use this when Find Similar is slow because the FAISS face index has gone stale.\n\nContinue?'
+    )) return
+    setRebuildFaceIndexBusy(true)
+    setEvents([])
+    setStatus('running')
+    try {
+      await api.pipeline.rebuildFaceIndex()
+    } catch (e: unknown) {
+      const err = e as { message?: string }
+      setStatus('error')
+      setEvents([{ event: 'error', message: err?.message ?? 'Face index rebuild failed' }])
+    } finally {
+      setRebuildFaceIndexBusy(false)
     }
   }
 
@@ -342,11 +364,20 @@ export default function PipelinePanel({ profileId, collapsed, onToggle, onPipeli
 
         <button
           onClick={migrateModel}
-          disabled={isBusy}
+          disabled={isBusy || rebuildFaceIndexBusy}
           className="w-full bg-orange-800 hover:bg-orange-700 disabled:opacity-40 text-white text-xs font-medium rounded-lg px-2 py-1.5 transition-colors"
           title="Re-embed all named faces with the current model and re-cluster unnamed faces"
         >
           Migrate AI Model
+        </button>
+
+        <button
+          onClick={rebuildFaceIndex}
+          disabled={isBusy || rebuildFaceIndexBusy}
+          className="w-full bg-sky-800 hover:bg-sky-700 disabled:opacity-40 text-white text-xs font-medium rounded-lg px-2 py-1.5 transition-colors"
+          title="Rebuild the face FAISS index from current embeddings without re-clustering"
+        >
+          {rebuildFaceIndexBusy ? 'Starting Face Index…' : 'Rebuild Face Index'}
         </button>
 
         {/* Force retag option */}

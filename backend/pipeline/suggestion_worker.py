@@ -9,6 +9,7 @@ import numpy as np
 from backend.api.websocket import broadcast
 from backend.database import settings_store
 from backend.database.db import get_db
+from backend.face_quality import face_sample_weight as _shared_face_sample_weight, weighted_centroid_from_rows as _shared_weighted_centroid_from_rows
 from backend.pipeline.centroid import load_centroid
 from backend.runtime.activity import seconds_since_user_activity
 
@@ -43,33 +44,11 @@ def _normalise_vector(vec: np.ndarray) -> np.ndarray:
 
 
 def _face_sample_weight(detection_conf: float | None, bbox_w: float | None, bbox_h: float | None) -> float:
-    conf = float(detection_conf) if detection_conf is not None else 0.5
-    conf = max(0.05, min(1.0, conf))
-    area = 0.0
-    if bbox_w is not None and bbox_h is not None:
-        area = max(0.0, float(bbox_w) * float(bbox_h))
-    size_weight = max(0.4, min(1.6, area / 0.02 if area > 0 else 0.7))
-    return max(0.05, conf * size_weight)
+    return _shared_face_sample_weight(detection_conf, bbox_w, bbox_h)
 
 
 def _weighted_centroid_from_rows(rows: list) -> np.ndarray | None:
-    if not rows:
-        return None
-
-    vecs: list[np.ndarray] = []
-    weights: list[float] = []
-    for r in rows:
-        vec = np.frombuffer(r["vector"], dtype=np.float32)
-        vecs.append(vec)
-        weights.append(_face_sample_weight(r["detection_conf"], r["bbox_w"], r["bbox_h"]))
-
-    arr = np.stack(vecs)
-    w = np.asarray(weights, dtype=np.float32)
-    if np.all(w <= 0):
-        centroid = arr.mean(axis=0)
-    else:
-        centroid = np.average(arr, axis=0, weights=w)
-    return _normalise_vector(centroid)
+    return _shared_weighted_centroid_from_rows(rows)
 
 
 def _best_competing_person(cluster_centroid: np.ndarray, competitor_centroids: list[tuple[int, np.ndarray]]) -> tuple[int | None, float | None]:
@@ -119,7 +98,8 @@ async def _refresh_person_queue_quality(person_id: int, *, max_per_person: int, 
 
         emb_rows = await db.execute_fetchall(
             """
-            SELECT e.vector, f.detection_conf, f.bbox_w, f.bbox_h
+            SELECT e.vector, f.detection_conf, f.bbox_w, f.bbox_h,
+                   f.face_attributes, f.face_sharpness, f.pose_yaw, f.pose_pitch, f.pose_roll
             FROM embeddings e
             JOIN faces f ON f.id = e.face_id
             JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
