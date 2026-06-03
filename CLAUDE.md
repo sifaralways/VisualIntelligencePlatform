@@ -1,6 +1,8 @@
 # Project Overview
 Visual Intelligence Platform (VIP) is a local-first photo intelligence system for large personal media libraries. It ingests image/RAW folders, detects and clusters faces, generates tags/captions/OCR signals, supports assistant-driven retrieval, and writes curated metadata back to files. Primary users are individual photo-library owners (and operators managing profile-scoped libraries) who want offline organization, search, and review workflows.
 
+File repomix-output.xml contains all the files in the repository combined into one.
+
 # Tech Stack
 - Backend language/runtime: Python 3.11 (setup default via `PYTHON=python3.11` in `setup.sh`).
 - Backend framework: FastAPI (un-pinned), uvicorn[standard] (un-pinned).
@@ -167,6 +169,42 @@ Required variables:
 - Hard-coding thresholds outside settings store/config.
 - Trusting shell permission checks alone for remote write probes (remote route uses real I/O probes due to macOS TCC behavior).
 - In scanner EXIF path, long-lived ExifTool stay_open was previously avoided for stability; writeback engine still uses persistent writer where flow differs.
+
+## Code Quality & Reusability
+Full audit in HANDOVER_AUDIT.md. Read it before any frontend session.
+
+### What IS shared (use these, don't rebuild)
+- PhotoGrid.tsx — media grid + selection. Use this for any photo browsing UI.
+- PhotoDetail.tsx — photo detail modal. Reused across 4+ pages.
+- ConnectionsGraph.tsx — people/cluster graph. Already shared.
+- PipelinePanel.tsx — pipeline sidebar. Use this, not PipelinePage.tsx 
+  (PipelinePage is unused/stale — do not add new work there).
+
+### What IS NOT shared but should be (known debt)
+- Modal/dialog: hand-rolled overlay markup in App.tsx, PeoplePage, 
+  QualityPage, AdminPage. No shared component exists yet.
+- Button: no shared primitive. Tailwind class strings repeated everywhere.
+- Loading/empty/error states: each page does its own.
+- WebSocket hook: duplicated connection lifecycle in App.tsx, 
+  PipelinePanel.tsx, PipelinePage.tsx.
+
+### Known duplication hotspots (don't add more)
+- Face/cluster mutation logic duplicated across persons.py + faces.py
+- Result tile cards duplicated: SearchPage.tsx:159 ≈ AssistantPage.tsx:483
+- Tag discovery duplicated: DiscoverPage.tsx ≈ TagsPage.tsx
+
+### Anti-patterns to never introduce
+- Direct fetch/axios calls outside frontend/src/api/client.ts
+- Browser confirm() or alert() — use in-app modals
+- Hardcoded thresholds outside settings store
+- New SQL inline in route handlers without a helper for multi-step 
+  person/cluster mutations
+
+### Open technical debt (known, not blocking)
+- pipeline.py:714 backend endpoint has no client.ts wrapper
+- PipelinePage.tsx is unrouted/stale — do not extend it
+- No backend unit tests exist
+
 
 # Testing Approach
 - Frameworks present: `pytest`, `pytest-asyncio`, `httpx` in requirements.
