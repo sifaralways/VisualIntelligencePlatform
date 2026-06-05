@@ -32,12 +32,29 @@ export function buildProfileWebSocketUrl(profileId?: string): string {
   return url.toString()
 }
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
+function isUnknownProfileResponse(status: number, body: string): boolean {
+  if (status !== 404) return false
+  try {
+    const parsed = JSON.parse(body) as { detail?: unknown }
+    return typeof parsed.detail === 'string' && parsed.detail.startsWith('Unknown profile:')
+  } catch {
+    return body.includes('Unknown profile:')
+  }
+}
+
+async function request<T>(path: string, options?: RequestInit, allowProfileRecovery = true): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     headers: buildHeaders(options?.headers),
     ...options,
   })
-  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`)
+  if (!res.ok) {
+    const body = await res.text()
+    if (allowProfileRecovery && getCurrentProfileId() && isUnknownProfileResponse(res.status, body)) {
+      setCurrentProfileId(null)
+      return request<T>(path, options, false)
+    }
+    throw new Error(`${res.status} ${body}`)
+  }
   return res.json()
 }
 
@@ -80,16 +97,56 @@ export const api = {
   },
 
   pipeline: {
-    scan: (folder: string, forceReprocess = false) =>
+    scan: (folder: string, forceReprocess = false, useExistingVipData = false) =>
       request('/pipeline/scan', {
         method: 'POST',
-        body: JSON.stringify({ folder, force_reprocess: forceReprocess }),
+        body: JSON.stringify({
+          folder,
+          force_reprocess: forceReprocess,
+          use_existing_vip_data: useExistingVipData,
+        }),
       }),
     rescan: (forceRetag = false) =>
       request<{ status: string; folder: string }>('/pipeline/rescan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ force_retag: forceRetag }),
+      }),
+    pause: () =>
+      request<{ status: string }>('/pipeline/pause', {
+        method: 'POST',
+      }),
+    resume: () =>
+      request<{ status: string }>('/pipeline/resume', {
+        method: 'POST',
+      }),
+    stop: () =>
+      request<{ status: string }>('/pipeline/stop', {
+        method: 'POST',
+      }),
+    resumePending: () =>
+      request<{ status: string }>('/pipeline/resume_pending', {
+        method: 'POST',
+      }),
+    resumeFlorencePending: () =>
+      request<{ status: string; pending_florence: number }>('/pipeline/resume_florence_pending', {
+        method: 'POST',
+      }),
+    manualPilotSummary: () =>
+      request<ManualPilotSummary>('/pipeline/manual_pilot_summary'),
+    manualPilotRun: (models: ManualPilotModel[], scope: ManualPilotScope) =>
+      request<{ status: string; scope: ManualPilotScope; models: ManualPilotModel[] }>('/pipeline/manual_pilot', {
+        method: 'POST',
+        body: JSON.stringify({ models, scope }),
+      }),
+    rebuildFaceIndex: () =>
+      request<{ status: string }>('/pipeline/rebuild_face_index', {
+        method: 'POST',
+      }),
+    rescanFolder: (folderId: number, pathPrefix?: string) =>
+      request<{ status: string; folder: string }>('/pipeline/rescan_folder', {
+        method: 'POST',
+        body: JSON.stringify({ folder_id: folderId, path_prefix: pathPrefix ?? null }),
       }),
     migrateModel: () =>
       request<{ status: string }>('/pipeline/migrate_model', { method: 'POST' }),
@@ -100,7 +157,16 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ media_ids: mediaIds }),
       }),
-    status: () => request<{ status: string; folder: string | null; error: string | null }>('/pipeline/status'),
+    status: () =>
+      request<{
+        status: string
+        folder: string | null
+        error: string | null
+        resumable?: boolean
+        pending_florence?: number
+        last_phase?: string | null
+        run_kind?: string | null
+      }>('/pipeline/status'),
   },
 
   // ─── Media ────────────────────────────────────────────────────────────────
@@ -150,7 +216,16 @@ export const api = {
   // ─── Folders ──────────────────────────────────────────────────────────────
   folders: {
     list: () => request<FolderItem[]>('/folders'),    subfolders: (folderId: number) =>
-      request<SubfolderItem[]>(`/folders/${folderId}/subfolders`),    removeFromApp: (folderId: number, force = false) =>
+      request<SubfolderItem[]>(`/folders/${folderId}/subfolders`),
+    writeback: (folderId: number, pathPrefix?: string) =>
+      request<{ status: string; scope: string; pending: number; written: number; failed: number }>(
+        `/folders/${folderId}/writeback`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ path_prefix: pathPrefix ?? null }),
+        },
+      ),
+    removeFromApp: (folderId: number, force = false) =>
       request<RemoveResult>(`/folders/${folderId}/remove-from-app?force=${force}`, {
         method: 'POST',
       }),
@@ -158,7 +233,17 @@ export const api = {
 
   // ─── Clusters ─────────────────────────────────────────────────────────────
   clusters: {
-    unnamed: () => request<Cluster[]>('/persons/unnamed'),    delete: (clusterId: number) =>
+    unnamed: (params: { limit?: number; offset?: number; sortBy?: 'member_count' | 'created_at'; sortDir?: 'asc' | 'desc'; folder_id?: number; path_prefix?: string } = {}) => {
+      const search = new URLSearchParams()
+      if (params.limit != null) search.set('limit', String(params.limit))
+      if (params.offset != null) search.set('offset', String(params.offset))
+      if (params.sortBy) search.set('sort_by', params.sortBy)
+      if (params.sortDir) search.set('sort_dir', params.sortDir)
+      if (params.folder_id != null) search.set('folder_id', String(params.folder_id))
+      if (params.path_prefix) search.set('path_prefix', params.path_prefix)
+      const qs = search.toString()
+      return request<UnnamedClustersPage>(`/persons/unnamed${qs ? `?${qs}` : ''}`)
+    },    delete: (clusterId: number) =>
       request(`/persons/clusters/${clusterId}`, { method: 'DELETE' }),
     similar: (clusterId: number) =>
       request<SimilarCluster[]>(`/persons/clusters/${clusterId}/similar`),
@@ -175,7 +260,13 @@ export const api = {
 
   // ─── Persons ──────────────────────────────────────────────────────────────
   persons: {
-    list: () => request<Person[]>('/persons'),
+    list: (params: { folder_id?: number; path_prefix?: string } = {}) => {
+      const search = new URLSearchParams()
+      if (params.folder_id != null) search.set('folder_id', String(params.folder_id))
+      if (params.path_prefix) search.set('path_prefix', params.path_prefix)
+      const qs = search.toString()
+      return request<Person[]>(`/persons${qs ? `?${qs}` : ''}`)
+    },
     namePerson: (id: number, name: string) =>
       request(`/persons/${id}/name`, { method: 'PATCH', body: JSON.stringify({ name }) }),
     merge: (sourceId: number, intoId: number) =>
@@ -193,15 +284,40 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ name }),
       }),
-    addCluster: (personId: number, clusterId: number) =>
-      request(`/persons/${personId}/add-cluster/${clusterId}`, { method: 'POST' }),
+    addCluster: (personId: number, clusterId: number, opts?: { forceSamePhotoOverride?: boolean }) => {
+      const params = new URLSearchParams()
+      if (opts?.forceSamePhotoOverride) params.set('force_same_photo_override', '1')
+      const qs = params.toString()
+      return request(`/persons/${personId}/add-cluster/${clusterId}${qs ? `?${qs}` : ''}`, { method: 'POST' })
+    },
     addIgnoredCluster: (personId: number, clusterId: number) =>
       request(`/persons/ignored/${personId}/add-cluster/${clusterId}`, { method: 'POST' }),
     mergeSuggestions: (personId: number) =>
       request<MergeSuggestion[]>(`/persons/${personId}/merge-suggestions?limit=1`),
+    pendingSuggestions: (params: { limit?: number; offset?: number; personId?: number } = {}) => {
+      const q = new URLSearchParams()
+      if (params.limit != null) q.set('limit', String(params.limit))
+      if (params.offset != null) q.set('offset', String(params.offset))
+      if (params.personId != null) q.set('person_id', String(params.personId))
+      const qs = q.toString()
+      return request<PendingSuggestionsPage>(`/persons/suggestions/pending${qs ? `?${qs}` : ''}`)
+    },
+    pendingSuggestionsSummary: (params: { limit?: number; offset?: number } = {}) => {
+      const q = new URLSearchParams()
+      if (params.limit != null) q.set('limit', String(params.limit))
+      if (params.offset != null) q.set('offset', String(params.offset))
+      const qs = q.toString()
+      return request<PendingSuggestionSummaryPage>(`/persons/suggestions/summary${qs ? `?${qs}` : ''}`)
+    },
     rejectSuggestion: (personId: number, clusterId: number) =>
       request(`/persons/${personId}/reject-suggestion/${clusterId}`, { method: 'POST' }),
-    listIgnored: () => request<IgnoredPerson[]>('/persons/ignored'),
+    listIgnored: (params: { sortBy?: 'photo_count' | 'created_at'; sortDir?: 'asc' | 'desc' } = {}) => {
+      const search = new URLSearchParams()
+      if (params.sortBy) search.set('sort_by', params.sortBy)
+      if (params.sortDir) search.set('sort_dir', params.sortDir)
+      const qs = search.toString()
+      return request<IgnoredPerson[]>(`/persons/ignored${qs ? `?${qs}` : ''}`)
+    },
     unignore: (personId: number) =>
       request<{ status: string; person_id: number }>(`/persons/${personId}/unignore`, { method: 'POST' }),
     ignoredSuggestions: (personId: number, threshold: number, limit = 8) =>
@@ -218,9 +334,20 @@ export const api = {
       request<FrequentlyWithEntry[]>(`/persons/${personId}/frequently-with?limit=${limit}`),
     connectionsGraph: (personId: number, depth = 2) =>
       request<ConnectionGraph>(`/persons/${personId}/connections-graph?depth=${depth}`),
+    sharedMedia: (nodeAType: 'person' | 'cluster', nodeAId: number, nodeBType: 'person' | 'cluster', nodeBId: number, limit = 200) => {
+      const q = new URLSearchParams({ node_a_type: nodeAType, node_a_id: String(nodeAId), node_b_type: nodeBType, node_b_id: String(nodeBId), limit: String(limit) })
+      return request<MediaFile[]>(`/persons/shared-media?${q}`)
+    },
     setPortrait: (personId: number, faceId: number) =>
       request<{ status: string; person_id: number; portrait_face_id: number }>(
         `/persons/${personId}/set-portrait/${faceId}`, { method: 'POST' }
+      ),
+    recalculateCentroid: (personId: number, preferRecentPhotos = false) =>
+      request<{ status: string; person_id: number; person_name: string | null; selected_faces: number; prefer_recent_photos: boolean }>(
+        `/persons/${personId}/recalculate-centroid`, {
+          method: 'POST',
+          body: JSON.stringify({ prefer_recent_photos: preferRecentPhotos }),
+        }
       ),
     assignFace: (faceId: number, name: string) =>
       request<{ status: string; face_id: number; person_id: number }>(
@@ -235,7 +362,21 @@ export const api = {
   // ─── Faces ────────────────────────────────────────────────────────────────
   faces: {
     byCluster: (clusterId: number) => request<FaceRow[]>(`/faces/cluster/${clusterId}`),
-    byPerson: (personId: number) => request<FaceRow[]>(`/persons/${personId}/faces`),
+    byPerson: (
+      personId: number,
+      limit?: number,
+      offset?: number,
+      sortBy: 'detection_conf' | 'date_taken' | 'id' = 'detection_conf',
+      sortDir: 'asc' | 'desc' = 'desc',
+    ) => {
+      const q = new URLSearchParams()
+      if (limit != null) q.set('limit', String(limit))
+      if (offset != null) q.set('offset', String(offset))
+      q.set('sort_by', sortBy)
+      q.set('sort_dir', sortDir)
+      const qs = q.toString()
+      return request<FaceRow[]>(`/persons/${personId}/faces${qs ? `?${qs}` : ''}`)
+    },
     byMedia: (mediaId: number, includeIgnored = false) =>
       request<FaceRow[]>(`/faces/media/${mediaId}${includeIgnored ? '?include_ignored=true' : ''}`),
     removeFromCluster: (faceId: number) =>
@@ -344,7 +485,7 @@ export const api = {
   // ─── Settings ────────────────────────────────────────────────────────────
   settings: {
     getAll: () => request<AppSetting[]>('/settings'),
-    update: (updates: Record<string, number | string>) =>
+    update: (updates: Record<string, number | string | boolean>) =>
       request<{ status: string; updated: string[] }>('/settings', {
         method: 'PATCH',
         body: JSON.stringify({ updates }),
@@ -432,6 +573,7 @@ export interface SubfolderItem {
   path: string
   name: string
   photo_count: number
+  pending_writeback_count: number
 }
 
 export interface RemoveResult {
@@ -501,14 +643,28 @@ export interface WsEvent {
   merged?: number
   message?: string
   folder?: string
+  reason?: string
+  generated?: number
+  elapsed_ms?: number
+  persons?: number
 }
 
 export interface Cluster {
   id: number
+  created_at?: string | null
   member_count: number
   intra_similarity: number | null
   is_high_conf: number
   representative_thumbnail: string | null
+}
+
+export interface UnnamedClustersPage {
+  items: Cluster[]
+  total: number
+  limit: number
+  offset: number
+  sort_by: 'member_count' | 'created_at'
+  sort_dir: 'asc' | 'desc'
 }
 
 export interface Person {
@@ -539,6 +695,43 @@ export interface MergeSuggestion {
   is_high_conf: number
   representative_thumbnail: string | null
   similarity: number   // cosine similarity to the named person's centroid
+}
+
+export interface PendingSuggestion {
+  id: number
+  person_id: number
+  person_name: string | null
+  person_thumbnail: string | null
+  cluster_id: number
+  member_count: number
+  representative_thumbnail: string | null
+  similarity: number
+  competing_person_id: number | null
+  competing_similarity: number | null
+  margin: number | null
+  generated_at: string
+}
+
+export interface PendingSuggestionsPage {
+  items: PendingSuggestion[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface PendingSuggestionSummary {
+  person_id: number
+  person_name: string | null
+  person_thumbnail: string | null
+  suggestion_count: number
+  latest_generated_at: string | null
+}
+
+export interface PendingSuggestionSummaryPage {
+  items: PendingSuggestionSummary[]
+  total: number
+  limit: number
+  offset: number
 }
 
 export interface FindSimilarSuggestion extends MergeSuggestion {
@@ -598,7 +791,7 @@ export interface SimilarCluster {
   similarity: number
 }
 
-export interface IgnoreSuggestion extends SimilarCluster {}
+export type IgnoreSuggestion = SimilarCluster
 
 export interface IgnoreSuggestionScanResult {
   status: string
@@ -642,6 +835,7 @@ export interface MediaResult {
   date_taken: string | null
   camera_model: string | null
   persons: string | null
+  tags?: string | null
 }
 
 export interface NaturalSearchRequest {
@@ -759,13 +953,16 @@ export interface WritebackItem {
   fields: Record<string, string | number | string[]>
 }
 
-export type TagCategory = 'object' | 'animal' | 'geography' | 'place'
+export type TagCategory = 'object' | 'animal' | 'geography' | 'place' | 'caption' | 'ocr' | 'region'
 
 export interface TagsByCategory {
   object?: string[]
   animal?: string[]
   geography?: string[]
   place?: string[]
+  caption?: string[]
+  ocr?: string[]
+  region?: string[]
   explicit?: string[]
 }
 
@@ -939,4 +1136,14 @@ export interface ContactsMatchStats {
 export interface ContactsMatchResult {
   matches: ContactsMatchSuggestion[]
   stats: ContactsMatchStats
+}
+
+export type ManualPilotModel = 'tag' | 'florence' | 'clip_index' | 'analyse'
+export type ManualPilotScope = 'whole' | 'unindexed'
+
+export interface ManualPilotSummary {
+  tag: Record<ManualPilotScope, number>
+  florence: Record<ManualPilotScope, number>
+  clip_index: Record<ManualPilotScope, number>
+  analyse: Record<ManualPilotScope, number>
 }

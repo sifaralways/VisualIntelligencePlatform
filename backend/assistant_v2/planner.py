@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 import httpx
+from pydantic import BaseModel, Field, ValidationError
 
 from backend.assistant.types import AssistantState
 from backend.assistant_v2.tools import ToolRegistry
@@ -20,6 +21,23 @@ class ToolSelection:
     params: dict[str, Any]
     reason: str
     source: str
+    decomposition: dict[str, Any] = field(default_factory=dict)
+
+
+RetrievalBranch = Literal["natural_search", "metadata_text", "face_lookup", "ocr_lookup"]
+
+
+class PlannerDecomposition(BaseModel):
+    intent: str = "general"
+    entities: dict[str, Any] = Field(default_factory=dict)
+    retrieval_branches: list[RetrievalBranch] = Field(default_factory=list)
+
+
+class PlannerOutput(BaseModel):
+    tool_name: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    reason: str = ""
+    decomposition: PlannerDecomposition = Field(default_factory=PlannerDecomposition)
 
 
 class AssistantV2ToolPlanner:
@@ -32,7 +50,12 @@ Output schema:
 {
   "tool_name": string,
   "params": object,
-  "reason": string
+    "reason": string,
+    "decomposition": {
+        "intent": string,
+        "entities": object,
+        "retrieval_branches": string[]
+    }
 }
 
 Rules:
@@ -40,11 +63,15 @@ Rules:
 - params must match the tool's input schema as closely as possible.
 - If required params are missing from user query, still pick the best tool and leave missing fields empty.
 - Prefer deterministic tools over legacy fallback when a deterministic tool clearly matches.
-- Use natural_search for open-ended visual queries.
+- Prefer retrieval_broker for open-ended multimodal retrieval where captions, OCR, face matches, metadata text, and CLIP similarity may all help.
+- Prefer retrieval_broker for open-ended multimodal retrieval where captions, OCR, dense region text, face matches, metadata text, and CLIP similarity may all help.
+- Use natural_search for open-ended visual queries only when retrieval_broker is unnecessary.
 - Use sql_agent for open-ended analytical/database questions (top/most/least/breakdown/compare/trend/count by group) that are not explicit direct photo-opening commands.
+- For text-centric analytical prompts (for example OCR phrase frequency, caption keyword counts, region-text filters by person/place), prefer sql_agent.
 - For prompts like "top people by photo count" or "top locations where X appears", prefer sql_agent unless a dedicated deterministic tool exactly fits.
 - For prompts like "who was with <person/pronoun> in <location> [in <year>]", prefer list_people_with_person_in_location.
 - For prompts like "where is <person> typically found" or "where has <person> been", prefer list_locations.
+- When tool_name is retrieval_broker, choose retrieval_branches from: natural_search, metadata_text, face_lookup, ocr_lookup.
 - Use legacy_assistant only when none of the deterministic tools fit.
 """.strip()
 
@@ -64,7 +91,7 @@ Rules:
         ]
 
         payload = {
-            "model": settings.ollama_model,
+            "model": settings.assistant_planner_model or settings.ollama_model,
             "stream": False,
             "messages": [
                 {"role": "system", "content": self._SYSTEM_PROMPT},
@@ -96,22 +123,30 @@ Rules:
         if not parsed:
             return None
 
-        tool_name = str(parsed.get("tool_name") or "").strip()
+        try:
+            planned = PlannerOutput.model_validate(parsed)
+        except ValidationError:
+            logger.warning("AssistantV2ToolPlanner produced invalid schema")
+            return None
+
+        tool_name = str(planned.tool_name or "").strip()
         if not tool_name:
             return None
         if registry.get(tool_name) is None:
             return None
 
-        params = parsed.get("params")
-        if not isinstance(params, dict):
-            params = {}
+        params = dict(planned.params)
+        if tool_name == "retrieval_broker":
+            params.setdefault("message", message)
+            params.setdefault("retrieval_branches", planned.decomposition.retrieval_branches)
 
-        reason = str(parsed.get("reason") or "planned by llm").strip()
+        reason = str(planned.reason or "planned by llm").strip()
         return ToolSelection(
             tool_name=tool_name,
             params=params,
             reason=reason,
             source="llm",
+            decomposition=planned.decomposition.model_dump(),
         )
 
     def _parse_json(self, content: str) -> dict[str, Any]:

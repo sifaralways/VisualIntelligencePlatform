@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from backend.database.settings_store import get as get_setting
 from backend.ml.object_detector import ObjectDetector
 from backend.ml.scene_classifier import SceneClassifier
 from backend.ml.landmark_recogniser import LandmarkRecogniser
@@ -64,19 +65,29 @@ class Tagger:
         self._explicit          = ExplicitDetector()
         self._loaded            = False
 
+    @staticmethod
+    def _module_enabled(setting_key: str) -> bool:
+        return bool(int(get_setting(setting_key) or 0))
+
+    def _iter_enabled_models(self):
+        if self._module_enabled("object_detector_enabled"):
+            yield self._object_detector
+        if self._module_enabled("scene_classifier_enabled"):
+            yield self._scene_classifier
+        if self._module_enabled("landmark_recogniser_enabled"):
+            yield self._landmark
+        if self._module_enabled("species_classifier_enabled"):
+            yield self._species
+        if self._module_enabled("geo_resolver_enabled"):
+            yield self._geo
+        if self._module_enabled("explicit_detector_enabled"):
+            yield self._explicit
+
     def load(self) -> None:
         """Load all models. Failures are logged but don't abort."""
-        if self._loaded:
-            return
-        logger.info("Loading tagging models …")
-        for model in (
-            self._object_detector,
-            self._scene_classifier,
-            self._landmark,
-            self._species,
-            self._geo,
-            self._explicit,
-        ):
+        if not self._loaded:
+            logger.info("Loading tagging models …")
+        for model in self._iter_enabled_models():
             try:
                 model.load()
             except Exception as e:
@@ -108,50 +119,53 @@ class Tagger:
             return result
 
         # ── Objects + Animals (YOLO) ────────────────────────────────────────
-        try:
-            detections = self._object_detector.detect(image_path)
-            has_animal = False
-            for det in detections:
-                if det.is_animal:
-                    result.animals.append(det.label)
-                    has_animal = True
-                else:
-                    result.objects.append(det.label)
+        if self._module_enabled("object_detector_enabled"):
+            try:
+                detections = self._object_detector.detect(image_path)
+                has_animal = False
+                for det in detections:
+                    if det.is_animal:
+                        result.animals.append(det.label)
+                        has_animal = True
+                    else:
+                        result.objects.append(det.label)
 
-            # ── Species (BioCLIP) — only when YOLO found an animal ──────────
-            if has_animal:
-                from backend.database.settings_store import get as _gs
-                species = self._species.classify(image_path, threshold=float(_gs('species_threshold')))
-                if species and species.label not in result.animals:
-                    result.animals.insert(0, species.label)
+                # ── Species (BioCLIP) — only when YOLO found an animal ──────────
+                if has_animal and self._module_enabled("species_classifier_enabled"):
+                    from backend.database.settings_store import get as _gs
+                    species = self._species.classify(image_path, threshold=float(_gs('species_threshold')))
+                    if species and species.label not in result.animals:
+                        result.animals.insert(0, species.label)
 
-        except Exception as e:
-            logger.warning("Object/animal tagging failed for %s: %s", image_path.name, e)
+            except Exception as e:
+                logger.warning("Object/animal tagging failed for %s: %s", image_path.name, e)
 
         # ── Scene / Geography (Places365) ───────────────────────────────────
-        try:
-            from backend.database.settings_store import get as _gs
-            scenes = self._scene_classifier.classify(image_path, top_k=int(_gs('places365_top_k')))
-            for s in scenes:
-                if s.category == "geography" and s.label not in result.geography:
-                    result.geography.append(s.label)
-                elif s.category == "place" and s.label not in result.places:
-                    result.places.append(s.label)
-        except Exception as e:
-            logger.warning("Scene classification failed for %s: %s", image_path.name, e)
+        if self._module_enabled("scene_classifier_enabled"):
+            try:
+                from backend.database.settings_store import get as _gs
+                scenes = self._scene_classifier.classify(image_path, top_k=int(_gs('places365_top_k')))
+                for s in scenes:
+                    if s.category == "geography" and s.label not in result.geography:
+                        result.geography.append(s.label)
+                    elif s.category == "place" and s.label not in result.places:
+                        result.places.append(s.label)
+            except Exception as e:
+                logger.warning("Scene classification failed for %s: %s", image_path.name, e)
 
         # ── Landmarks (CLIP) ────────────────────────────────────────────────
-        try:
-            from backend.database.settings_store import get as _gs
-            landmarks = self._landmark.recognise(image_path, threshold=float(_gs('landmark_threshold')))
-            for lm in landmarks:
-                if lm.label not in result.places:
-                    result.places.append(lm.label)
-        except Exception as e:
-            logger.warning("Landmark recognition failed for %s: %s", image_path.name, e)
+        if self._module_enabled("landmark_recogniser_enabled"):
+            try:
+                from backend.database.settings_store import get as _gs
+                landmarks = self._landmark.recognise(image_path, threshold=float(_gs('landmark_threshold')))
+                for lm in landmarks:
+                    if lm.label not in result.places:
+                        result.places.append(lm.label)
+            except Exception as e:
+                logger.warning("Landmark recognition failed for %s: %s", image_path.name, e)
 
         # ── GPS → Place name (GeoResolver) ───────────────────────────────
-        if gps_lat is not None and gps_lon is not None:
+        if self._module_enabled("geo_resolver_enabled") and gps_lat is not None and gps_lon is not None:
             try:
                 geo = self._geo.resolve(gps_lat, gps_lon)
                 if geo:
@@ -163,7 +177,7 @@ class Tagger:
                 logger.warning("Geo resolution failed: %s", e)
 
         # ── Explicit content detection (NudeNet) ───────────────────────────────────────
-        if self._explicit.available:
+        if self._module_enabled("explicit_detector_enabled") and self._explicit.available:
             try:
                 explicit = self._explicit.detect(image_path)
                 result.explicit_labels = explicit.labels
@@ -201,34 +215,35 @@ class Tagger:
             return results
 
         # ── Batch YOLO: one GPU forward pass for all valid images ───────────
-        try:
-            from backend.database.settings_store import get as _gs
-            batch_detections = self._object_detector.detect_batch(valid_paths)
-            vi = 0
-            for i, ok in enumerate(valid_mask):
-                if not ok:
-                    continue
-                detections = batch_detections[vi]; vi += 1
-                has_animal = False
-                for det in detections:
-                    if det.is_animal:
-                        results[i].animals.append(det.label)
-                        has_animal = True
-                    else:
-                        results[i].objects.append(det.label)
+        if self._module_enabled("object_detector_enabled"):
+            try:
+                from backend.database.settings_store import get as _gs
+                batch_detections = self._object_detector.detect_batch(valid_paths)
+                vi = 0
+                for i, ok in enumerate(valid_mask):
+                    if not ok:
+                        continue
+                    detections = batch_detections[vi]; vi += 1
+                    has_animal = False
+                    for det in detections:
+                        if det.is_animal:
+                            results[i].animals.append(det.label)
+                            has_animal = True
+                        else:
+                            results[i].objects.append(det.label)
 
-                # Species (BioCLIP) — only when YOLO found an animal
-                if has_animal:
-                    try:
-                        species = self._species.classify(
-                            paths[i], threshold=float(_gs("species_threshold"))
-                        )
-                        if species and species.label not in results[i].animals:
-                            results[i].animals.insert(0, species.label)
-                    except Exception as e:
-                        logger.warning("Species classification failed for %s: %s", paths[i].name, e)
-        except Exception as e:
-            logger.warning("Batch YOLO tagging failed: %s", e)
+                    # Species (BioCLIP) — only when YOLO found an animal
+                    if has_animal and self._module_enabled("species_classifier_enabled"):
+                        try:
+                            species = self._species.classify(
+                                paths[i], threshold=float(_gs("species_threshold"))
+                            )
+                            if species and species.label not in results[i].animals:
+                                results[i].animals.insert(0, species.label)
+                        except Exception as e:
+                            logger.warning("Species classification failed for %s: %s", paths[i].name, e)
+            except Exception as e:
+                logger.warning("Batch YOLO tagging failed: %s", e)
 
         # ── Per-image scene / landmark / geo ────────────────────────────────
         for i, (image_path, gps_lat, gps_lon) in enumerate(items):
@@ -237,31 +252,33 @@ class Tagger:
                 continue
             result = results[i]
 
-            try:
-                from backend.database.settings_store import get as _gs
-                scenes = self._scene_classifier.classify(
-                    image_path, top_k=int(_gs("places365_top_k"))
-                )
-                for s in scenes:
-                    if s.category == "geography" and s.label not in result.geography:
-                        result.geography.append(s.label)
-                    elif s.category == "place" and s.label not in result.places:
-                        result.places.append(s.label)
-            except Exception as e:
-                logger.warning("Scene classification failed for %s: %s", image_path.name, e)
+            if self._module_enabled("scene_classifier_enabled"):
+                try:
+                    from backend.database.settings_store import get as _gs
+                    scenes = self._scene_classifier.classify(
+                        image_path, top_k=int(_gs("places365_top_k"))
+                    )
+                    for s in scenes:
+                        if s.category == "geography" and s.label not in result.geography:
+                            result.geography.append(s.label)
+                        elif s.category == "place" and s.label not in result.places:
+                            result.places.append(s.label)
+                except Exception as e:
+                    logger.warning("Scene classification failed for %s: %s", image_path.name, e)
 
-            try:
-                from backend.database.settings_store import get as _gs
-                landmarks = self._landmark.recognise(
-                    image_path, threshold=float(_gs("landmark_threshold"))
-                )
-                for lm in landmarks:
-                    if lm.label not in result.places:
-                        result.places.append(lm.label)
-            except Exception as e:
-                logger.warning("Landmark recognition failed for %s: %s", image_path.name, e)
+            if self._module_enabled("landmark_recogniser_enabled"):
+                try:
+                    from backend.database.settings_store import get as _gs
+                    landmarks = self._landmark.recognise(
+                        image_path, threshold=float(_gs("landmark_threshold"))
+                    )
+                    for lm in landmarks:
+                        if lm.label not in result.places:
+                            result.places.append(lm.label)
+                except Exception as e:
+                    logger.warning("Landmark recognition failed for %s: %s", image_path.name, e)
 
-            if gps_lat is not None and gps_lon is not None:
+            if self._module_enabled("geo_resolver_enabled") and gps_lat is not None and gps_lon is not None:
                 try:
                     geo = self._geo.resolve(gps_lat, gps_lon)
                     if geo and geo.label and geo.label not in result.places:
@@ -271,7 +288,7 @@ class Tagger:
                     logger.warning("Geo resolution failed: %s", e)
 
             # ── Explicit content detection (NudeNet) ────────────────────────────────
-            if self._explicit.available:
+            if self._module_enabled("explicit_detector_enabled") and self._explicit.available:
                 try:
                     explicit = self._explicit.detect(image_path)
                     result.explicit_labels = explicit.labels

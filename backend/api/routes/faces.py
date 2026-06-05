@@ -1,11 +1,16 @@
 """VIP API — Faces routes (thumbnail serving + face management)."""
 
-from fastapi import APIRouter, HTTPException, Query
+import json
+import math
+import uuid
+
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from fastapi.responses import Response
 from pathlib import Path
 
 from backend.config import settings
 from backend.database.db import get_db
+from backend.database.identity import append_identity_event, link_cluster_to_person, relink_face_to_cluster
 from backend.pipeline.centroid import update_person_centroid
 
 router = APIRouter()
@@ -36,6 +41,231 @@ async def _requeue_as_singleton(db, face_id: int) -> None:
         await db.execute(
             "UPDATE faces SET cluster_id=? WHERE id=?", (new_cluster_id, face_id)
         )
+        await relink_face_to_cluster(
+            db,
+            face_id=face_id,
+            cluster_id=int(new_cluster_id),
+            reason="singleton_requeue",
+            actor="api.faces",
+        )
+
+
+def _min_center_distance_with_orientation_variants(
+    face_cx: float,
+    face_cy: float,
+    region_cx: float,
+    region_cy: float,
+) -> float:
+    """
+    Return the minimum centre distance over common orientation transforms.
+
+    VIP detects faces on orientation-corrected previews, while historic XMP
+    regions may be stored in a different orientation basis for some RAW files.
+    """
+    variants = (
+        (region_cx, region_cy),
+        (1.0 - region_cx, region_cy),
+        (region_cx, 1.0 - region_cy),
+        (1.0 - region_cx, 1.0 - region_cy),
+        (region_cy, 1.0 - region_cx),
+        (1.0 - region_cy, region_cx),
+    )
+    return min(math.hypot(face_cx - x, face_cy - y) for x, y in variants)
+
+
+def _extract_named_regions_from_history(ext: dict) -> list[dict[str, float | str | None]]:
+    named_regions: list[dict[str, float | str | None]] = []
+    region_info = ext.get("region_info")
+    if isinstance(region_info, dict):
+        for r in region_info.get("RegionList", []):
+            name = str(r.get("Name") or "").strip()
+            area = r.get("Area", {})
+            if not name or not isinstance(area, dict) or area.get("Unit") != "normalized":
+                continue
+            try:
+                named_regions.append(
+                    {
+                        "name": name,
+                        "cx": float(area.get("X", 0)),
+                        "cy": float(area.get("Y", 0)),
+                    }
+                )
+            except Exception:
+                continue
+
+    persons_list = [str(p).strip() for p in (ext.get("persons") or []) if str(p).strip()]
+    if not named_regions and len(persons_list) == 1:
+        return [{"name": persons_list[0], "cx": None, "cy": None}]
+    return named_regions
+
+
+def _find_best_face_for_region(region: dict[str, float | str | None], unmatched_faces: list[dict]) -> tuple[dict | None, float]:
+    if region["cx"] is None or region["cy"] is None:
+        return None, float("inf")
+
+    rcx = float(region["cx"])
+    rcy = float(region["cy"])
+    best_face: dict | None = None
+    best_dist = float("inf")
+    for f in unmatched_faces:
+        if f["bbox_x"] is None:
+            continue
+        fcx = float(f["bbox_x"]) + float(f["bbox_w"] or 0) / 2.0
+        fcy = float(f["bbox_y"]) + float(f["bbox_h"] or 0) / 2.0
+        dist = _min_center_distance_with_orientation_variants(fcx, fcy, rcx, rcy)
+        if dist < best_dist:
+            best_dist = dist
+            best_face = f
+    return best_face, best_dist
+
+
+def _single_face_fallback_match(
+    named_regions: list[dict[str, float | str | None]],
+    unmatched_faces: list[dict],
+) -> list[tuple[str, int, int | None]]:
+    if len(unmatched_faces) != 1:
+        return []
+
+    unique_names = sorted(
+        {
+            str(r.get("name") or "").strip()
+            for r in named_regions
+            if str(r.get("name") or "").strip()
+        }
+    )
+    if len(unique_names) != 1:
+        return []
+
+    f = unmatched_faces[0]
+    return [(unique_names[0], int(f["face_id"]), f["cluster_id"])]
+
+
+def _match_history_regions_to_faces(
+    named_regions: list[dict[str, float | str | None]],
+    unmatched_faces: list[dict],
+) -> list[tuple[str, int, int | None]]:
+    matched: list[tuple[str, int, int | None]] = []
+    for region in named_regions:
+        if not unmatched_faces:
+            break
+        if region["cx"] is None or region["cy"] is None:
+            if len(unmatched_faces) == 1:
+                f = unmatched_faces.pop(0)
+                matched.append((str(region["name"]), int(f["face_id"]), f["cluster_id"]))
+            continue
+
+        best_face, best_dist = _find_best_face_for_region(region, unmatched_faces)
+
+        if best_face is not None and best_dist <= 0.18:
+            matched.append((str(region["name"]), int(best_face["face_id"]), best_face["cluster_id"]))
+            unmatched_faces = [f for f in unmatched_faces if f["face_id"] != best_face["face_id"]]
+
+    if matched:
+        return matched
+    return _single_face_fallback_match(named_regions, unmatched_faces)
+
+
+async def _get_or_create_person_id(db, person_name: str) -> int:
+    existing_person = await (
+        await db.execute(
+            "SELECT id FROM persons WHERE name=? AND is_merged=0 AND COALESCE(is_ignored, 0)=0 LIMIT 1",
+            (person_name,),
+        )
+    ).fetchone()
+    if existing_person:
+        return int(existing_person["id"])
+
+    cursor = await db.execute(
+        """
+        INSERT INTO persons (uuid, name, named_at)
+        VALUES (?, ?, datetime('now'))
+        """,
+        (str(uuid.uuid4()), person_name),
+    )
+    return int(cursor.lastrowid)
+
+
+async def _apply_history_matches(
+    db,
+    media_id: int,
+    matched: list[tuple[str, int, int | None]],
+) -> None:
+    touched_person_ids: set[int] = set()
+    for person_name, face_id, cluster_id in matched:
+        person_id = await _get_or_create_person_id(db, person_name)
+        await db.execute("UPDATE faces SET person_id=? WHERE id=?", (person_id, face_id))
+        touched_person_ids.add(person_id)
+
+        if cluster_id is not None:
+            await db.execute("UPDATE clusters SET person_id=? WHERE id=?", (person_id, cluster_id))
+            await db.execute(
+                "UPDATE faces SET person_id=? WHERE cluster_id=? AND person_id IS NULL",
+                (person_id, cluster_id),
+            )
+            await link_cluster_to_person(
+                db,
+                cluster_id=cluster_id,
+                person_id=person_id,
+                source="history_restore",
+                actor="api.restore_vip_history",
+            )
+
+        await db.execute(
+            "INSERT OR REPLACE INTO writeback_queue (media_file_id) VALUES (?)",
+            (media_id,),
+        )
+
+    for pid in touched_person_ids:
+        await update_person_centroid(db, pid)
+
+
+async def _restore_vip_history_names_for_media(db, media_id: int) -> None:
+    """Reconcile unnamed faces for one photo using stored VIP history."""
+    media_row = await (
+        await db.execute(
+            "SELECT external_exif FROM media_files WHERE id=?", (media_id,)
+        )
+    ).fetchone()
+    if not media_row or not media_row["external_exif"]:
+        return
+
+    try:
+        ext = json.loads(media_row["external_exif"])
+    except Exception:
+        return
+
+    if not ext.get("identifier"):
+        return
+
+    named_regions = _extract_named_regions_from_history(ext)
+    if not named_regions:
+        return
+
+    face_rows = await db.execute_fetchall(
+        """
+         SELECT f.id AS face_id,
+             COALESCE(c_current.id, f.cluster_id) AS cluster_id,
+               f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h,
+             current_person.id AS person_id
+        FROM faces f
+         LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+         LEFT JOIN clusters c_current ON c_current.cluster_guid = fcc.cluster_guid
+         LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+         LEFT JOIN persons current_person ON current_person.person_guid = cpc.person_guid
+             AND current_person.is_merged = 0
+        WHERE f.media_file_id = ?
+        """,
+        (media_id,),
+    )
+    unmatched_faces = [dict(r) for r in face_rows if r["person_id"] is None]
+    if not unmatched_faces:
+        return
+
+    matched = _match_history_regions_to_faces(named_regions, unmatched_faces)
+    if not matched:
+        return
+
+    await _apply_history_matches(db, media_id, matched)
 
 
 @router.get("/{face_id}/thumbnail")
@@ -67,11 +297,16 @@ async def get_cluster_faces(cluster_id: int, limit: int = 20):
     """Return representative face thumbnails for a cluster."""
     async with get_db() as db:
         rows = await db.execute_fetchall("""
-            SELECT f.id, f.thumbnail_path, f.detection_conf, f.person_id,
+            SELECT f.id, f.thumbnail_path, f.detection_conf,
+                   current_person.id AS person_id,
                    mf.file_path, mf.date_taken
             FROM faces f
             JOIN media_files mf ON mf.id = f.media_file_id
-            WHERE f.cluster_id = ?
+            LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+            LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+            LEFT JOIN persons current_person ON current_person.person_guid = cpc.person_guid
+                AND current_person.is_merged = 0
+            WHERE COALESCE((SELECT c_current.id FROM clusters c_current WHERE c_current.cluster_guid = fcc.cluster_guid), f.cluster_id) = ?
             ORDER BY f.detection_conf DESC
             LIMIT ?
         """, (cluster_id, limit))
@@ -87,30 +322,43 @@ async def get_faces_for_media(
     """Return all faces detected in a specific media file, with person names."""
     import json as _json
     async with get_db() as db:
+        await _restore_vip_history_names_for_media(db, media_id)
+
         if include_ignored:
             # Return all faces including those assigned to ignored persons.
             # is_ignored=1 faces are returned with person_name=NULL (they have no real name).
             rows = await db.execute_fetchall("""
                 SELECT f.id, f.thumbnail_path, f.detection_conf,
-                       f.cluster_id, f.person_id,
-                       CASE WHEN p.is_ignored = 0 THEN p.name ELSE NULL END AS person_name,
+                       COALESCE(c_current.id, f.cluster_id) AS cluster_id,
+                       current_person.id AS person_id,
+                       CASE WHEN current_person.is_ignored = 0 THEN current_person.name ELSE NULL END AS person_name,
                        f.face_attributes,
-                       COALESCE(p.is_ignored, 0) AS is_ignored
+                       COALESCE(current_person.is_ignored, 0) AS is_ignored
                 FROM faces f
-                LEFT JOIN persons p ON p.id = f.person_id AND p.is_merged = 0
+                LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                LEFT JOIN clusters c_current ON c_current.cluster_guid = fcc.cluster_guid
+                LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                LEFT JOIN persons current_person ON current_person.person_guid = cpc.person_guid
+                    AND current_person.is_merged = 0
                 WHERE f.media_file_id = ?
                 ORDER BY f.detection_conf DESC
             """, (media_id,))
         else:
             rows = await db.execute_fetchall("""
                 SELECT f.id, f.thumbnail_path, f.detection_conf,
-                       f.cluster_id, f.person_id, p.name AS person_name,
+                       COALESCE(c_current.id, f.cluster_id) AS cluster_id,
+                       current_person.id AS person_id,
+                       current_person.name AS person_name,
                        f.face_attributes,
                        0 AS is_ignored
                 FROM faces f
-                LEFT JOIN persons p ON p.id = f.person_id AND p.is_merged = 0 AND p.is_ignored = 0
+                LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                LEFT JOIN clusters c_current ON c_current.cluster_guid = fcc.cluster_guid
+                LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                LEFT JOIN persons current_person ON current_person.person_guid = cpc.person_guid
+                    AND current_person.is_merged = 0 AND current_person.is_ignored = 0
                 WHERE f.media_file_id = ?
-                  AND (f.person_id IS NULL OR p.id IS NOT NULL)
+                  AND (cpc.person_guid IS NULL OR current_person.id IS NOT NULL)
                 ORDER BY f.detection_conf DESC
             """, (media_id,))
     result = []
@@ -140,21 +388,36 @@ async def remove_face_from_cluster(face_id: int):
     in the unnamed faces list rather than disappearing until the next pipeline.
     """
     async with get_db() as db:
+        await relink_face_to_cluster(
+            db,
+            face_id=face_id,
+            cluster_id=None,
+            reason="manual_remove_from_cluster",
+            actor="api.remove_face_from_cluster",
+        )
         await db.execute(
             "UPDATE faces SET cluster_id=NULL, person_id=NULL WHERE id=?",
             (face_id,),
+        )
+        await append_identity_event(
+            db,
+            "face_unassigned",
+            actor="api.remove_face_from_cluster",
+            payload={"face_id": face_id},
         )
         await _requeue_as_singleton(db, face_id)
     return {"status": "removed", "face_id": face_id}
 
 
 @router.delete("/{face_id}/from-person")
-async def remove_face_from_person(face_id: int):
+async def remove_face_from_person(face_id: int, background_tasks: BackgroundTasks):
     """
     Remove a face from its person assignment (false positive correction).
     The face is detached from person + cluster so it re-enters the unassigned pool.
     The media file is re-queued for writeback so the person is removed from EXIF.
     """
+    person_id_for_refresh = None
+
     async with get_db() as db:
         # Find what person this face belongs to (for writeback re-queue)
         row = await (
@@ -167,8 +430,21 @@ async def remove_face_from_person(face_id: int):
             from fastapi import HTTPException
             raise HTTPException(status_code=404, detail="Face not found")
 
+        await relink_face_to_cluster(
+            db,
+            face_id=face_id,
+            cluster_id=None,
+            reason="manual_remove_from_person",
+            actor="api.remove_face_from_person",
+        )
         await db.execute(
             "UPDATE faces SET cluster_id=NULL, person_id=NULL WHERE id=?", (face_id,)
+        )
+        await append_identity_event(
+            db,
+            "face_person_removed",
+            actor="api.remove_face_from_person",
+            payload={"face_id": face_id, "person_id": row["person_id"]},
         )
 
         # Re-queue the media file so writeback rewrites EXIF without this person
@@ -182,10 +458,20 @@ async def remove_face_from_person(face_id: int):
         # Without this the stored centroid stays stale and future similarity
         # comparisons remain biased toward the ejected face.
         if row["person_id"]:
+            person_id_for_refresh = int(row["person_id"])
             await update_person_centroid(db, row["person_id"])
 
         # Place the face in a new 1-member cluster so it immediately reappears
         # in the unnamed-faces list rather than being lost until re-clustering.
         await _requeue_as_singleton(db, face_id)
+
+    if person_id_for_refresh is not None:
+        # Re-score/sync in background so correction effects are visible quickly.
+        from backend.api.routes.persons import _rescore_after_person_update, _update_cooccurrence_for_person
+        from backend.profiles import get_current_profile_id, run_in_profile
+
+        profile_id = get_current_profile_id()
+        background_tasks.add_task(run_in_profile, profile_id, _rescore_after_person_update, person_id_for_refresh)
+        background_tasks.add_task(run_in_profile, profile_id, _update_cooccurrence_for_person, person_id_for_refresh)
 
     return {"status": "removed", "face_id": face_id}

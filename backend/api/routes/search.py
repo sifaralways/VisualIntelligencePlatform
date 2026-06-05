@@ -91,6 +91,46 @@ class NaturalSearchRequest(BaseModel):
     limit: int = 50
 
 
+def _wildcard_token_to_like(token: str) -> str:
+    """Convert old-school wildcard token to SQL LIKE pattern.
+
+    Supported wildcards:
+    - * => %
+    - ? => _
+    """
+    escaped = token.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return escaped.replace("*", "%").replace("?", "_")
+
+
+def _parse_search_tokens(raw: str) -> list[tuple[str, bool]]:
+    """Parse query into tokens and mark quoted tokens.
+
+    Returns list of (token, is_quoted).
+    """
+    tokens: list[tuple[str, bool]] = []
+    for match in re.finditer(r'"([^"\\]*(?:\\.[^"\\]*)*)"|(\S+)', raw or ""):
+        quoted = match.group(1)
+        plain = match.group(2)
+        if quoted is not None:
+            token = quoted.replace('\\"', '"').strip()
+            if token:
+                tokens.append((token, True))
+        elif plain is not None:
+            token = plain.strip()
+            if token:
+                tokens.append((token, False))
+    return tokens
+
+
+def _quoted_whole_word_like(token: str) -> str:
+    # Normalize punctuation to spaces so "Audi" does not match "Auditorium".
+    normalized = re.sub(r"[^A-Za-z0-9]+", " ", token).strip().lower()
+    if not normalized:
+        normalized = token.strip().lower()
+    escaped = normalized.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"% {escaped} %"
+
+
 @router.post("")
 async def search(req: SearchRequest):
     """
@@ -98,50 +138,93 @@ async def search(req: SearchRequest):
     Operates entirely on the local SQLite DB — works even when files
     are offloaded to iCloud.
     """
-    conditions = []
+    conditions: list[str] = []
     params: list = []
 
     if req.query:
-        # Simple keyword search across path, camera model, date
-        like = f"%{req.query}%"
-        conditions.append("""
-            (mf.file_path LIKE ?
-             OR mf.camera_model LIKE ?
-             OR mf.date_taken LIKE ?
-             OR p.name LIKE ?)
-        """)
-        params.extend([like, like, like, like])
+        # Classic tokenized wildcard search across path/person/tags/florence text.
+        tokens = _parse_search_tokens(req.query.strip())
+        for token, is_quoted in tokens:
+            if is_quoted:
+                like = _quoted_whole_word_like(token)
+                conditions.append(
+                    """
+                    (
+                        (' ' || lower(replace(replace(replace(COALESCE(pfc.file_path, ''), '_', ' '), '-', ' '), '.', ' ')) || ' ') LIKE ? ESCAPE '\\'
+                        OR (' ' || lower(replace(replace(replace(COALESCE(pfc.persons, ''), '_', ' '), '-', ' '), '.', ' ')) || ' ') LIKE ? ESCAPE '\\'
+                        OR (' ' || lower(replace(replace(replace(COALESCE(tags.all_tags, ''), '_', ' '), '-', ' '), '.', ' ')) || ' ') LIKE ? ESCAPE '\\'
+                        OR (' ' || lower(replace(replace(replace(COALESCE(text.all_text, ''), '_', ' '), '-', ' '), '.', ' ')) || ' ') LIKE ? ESCAPE '\\'
+                    )
+                    """
+                )
+                params.extend([like, like, like, like])
+            else:
+                has_user_wildcard = ("*" in token) or ("?" in token)
+                like = _wildcard_token_to_like(token)
+                # If no wildcard is supplied, default to contains-match.
+                if not has_user_wildcard:
+                    like = f"%{like}%"
+                conditions.append(
+                    """
+                    (
+                        lower(pfc.file_path) LIKE lower(?) ESCAPE '\\'
+                        OR lower(COALESCE(pfc.persons, '')) LIKE lower(?) ESCAPE '\\'
+                        OR lower(COALESCE(tags.all_tags, '')) LIKE lower(?) ESCAPE '\\'
+                        OR lower(COALESCE(text.all_text, '')) LIKE lower(?) ESCAPE '\\'
+                    )
+                    """
+                )
+                params.extend([like, like, like, like])
 
     if req.person_ids:
         placeholders = ",".join("?" * len(req.person_ids))
-        conditions.append(f"p.id IN ({placeholders})")
+        conditions.append(
+            f"""
+            EXISTS (
+                SELECT 1
+                FROM faces f
+                JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                JOIN persons p ON p.person_guid = cpc.person_guid
+                WHERE f.media_file_id = pfc.media_id
+                  AND p.is_merged = 0
+                  AND p.id IN ({placeholders})
+            )
+            """
+        )
         params.extend(req.person_ids)
 
     if req.date_from:
-        conditions.append("mf.date_taken >= ?")
+        conditions.append("pfc.date_taken >= ?")
         params.append(req.date_from)
 
     if req.date_to:
-        conditions.append("mf.date_taken <= ?")
+        conditions.append("pfc.date_taken <= ?")
         params.append(req.date_to)
 
     if req.camera_make:
-        conditions.append("mf.camera_make LIKE ?")
+        conditions.append("pfc.camera_make LIKE ?")
         params.append(f"%{req.camera_make}%")
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     params.extend([req.limit, req.offset])
 
     query_sql = f"""
-        SELECT DISTINCT mf.id, mf.file_path, mf.date_taken, mf.camera_model,
-               mf.width, mf.height, mf.ingest_state,
-               GROUP_CONCAT(DISTINCT p.name) as persons
-        FROM media_files mf
-        LEFT JOIN faces f ON f.media_file_id = mf.id
-        LEFT JOIN persons p ON p.id = f.person_id AND p.is_merged = 0
+        SELECT pfc.media_id AS id,
+               pfc.file_path,
+               pfc.date_taken,
+               pfc.camera_model,
+               pfc.persons,
+               tags.all_tags AS tags
+        FROM v_photo_full_context pfc
+        LEFT JOIN (
+            SELECT mt.media_file_id, GROUP_CONCAT(DISTINCT mt.label) AS all_tags
+            FROM media_tags mt
+            GROUP BY mt.media_file_id
+        ) AS tags ON tags.media_file_id = pfc.media_id
+        LEFT JOIN v_photo_text_agg text ON text.media_id = pfc.media_id
         {where}
-        GROUP BY mf.id
-        ORDER BY mf.date_taken DESC
+        ORDER BY pfc.date_taken DESC, pfc.media_id DESC
         LIMIT ? OFFSET ?
     """
 
@@ -503,7 +586,9 @@ async def _hydrate_media_rows(
                 GROUP_CONCAT(DISTINCT mt.label) AS tags
             FROM media_files mf
             LEFT JOIN faces f ON f.media_file_id = mf.id
-            LEFT JOIN persons p ON p.id = f.person_id AND p.is_merged = 0
+                        LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                        LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                        LEFT JOIN persons p ON p.person_guid = cpc.person_guid AND p.is_merged = 0
             LEFT JOIN media_tags mt ON mt.media_file_id = mf.id
             WHERE mf.id IN ({placeholders})
               AND mf.removed_from_app = 0

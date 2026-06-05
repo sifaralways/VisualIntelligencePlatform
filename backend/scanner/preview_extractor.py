@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -61,6 +62,23 @@ _EXIF_ORIENT_TO_PIL_TRANSPOSE = {
     7: "TRANSVERSE",        # 90°CCW + mirror
     8: "ROTATE_90",         # 90°CCW / 270°CW (camera held left-side-right)
 }
+
+
+def _preview_is_valid(path: Path) -> bool:
+    """Return True when *path* is a readable image file."""
+    try:
+        from PIL import Image
+
+        with Image.open(path) as img:
+            img.verify()
+        return True
+    except Exception:
+        return False
+
+
+def _temp_output_path(dst: Path) -> Path:
+    """Create a unique temp path in the destination directory for atomic replace."""
+    return dst.parent / f".{dst.name}.{uuid.uuid4().hex}.tmp"
 
 
 def _read_raw_orientation(raw_path: Path) -> int:
@@ -133,8 +151,11 @@ async def extract_preview(raw_path: Path) -> Optional[Path]:
     out_path = settings.preview_dir / f"{raw_path.stem}_{_hash_path(raw_path)}.jpg"
 
     if out_path.exists():
-        logger.debug("Preview already exists: %s", out_path)
-        return out_path
+        if _preview_is_valid(out_path):
+            logger.debug("Preview already exists: %s", out_path)
+            return out_path
+        logger.warning("Preview exists but is unreadable; regenerating: %s", out_path)
+        out_path.unlink(missing_ok=True)
 
     loop = asyncio.get_event_loop()
     success = await loop.run_in_executor(
@@ -153,8 +174,11 @@ async def _preview_from_direct_image(image_path: Path) -> Optional[Path]:
     """
     out_path = settings.preview_dir / f"{image_path.stem}_{_hash_path(image_path)}.jpg"
     if out_path.exists():
-        logger.debug("Preview already exists: %s", out_path)
-        return out_path
+        if _preview_is_valid(out_path):
+            logger.debug("Preview already exists: %s", out_path)
+            return out_path
+        logger.warning("Preview exists but is unreadable; regenerating: %s", out_path)
+        out_path.unlink(missing_ok=True)
 
     loop = asyncio.get_event_loop()
     success = await loop.run_in_executor(
@@ -194,6 +218,7 @@ def _direct_image_to_jpeg(src: Path, dst: Path) -> bool:
     downstream models receive geometrically upright pixels.
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = _temp_output_path(dst)
 
     # Guard: ensure the file is readable (triggers iCloud materialisation on
     # evicted stubs, and catches transient network-volume unavailability).
@@ -207,7 +232,12 @@ def _direct_image_to_jpeg(src: Path, dst: Path) -> bool:
     # Photos and iCloud exports — their `ftyp` box reveals the true format).
     _SIPS_SUFFIXES = frozenset({".avif", ".heic", ".heif", ".psd"})
     if src.suffix.lower() in _SIPS_SUFFIXES or _is_ftyp_container(src):
-        return _sips_to_jpeg(src, dst)
+        ok = _sips_to_jpeg(src, tmp_path)
+        if ok:
+            tmp_path.replace(dst)
+        else:
+            tmp_path.unlink(missing_ok=True)
+        return ok
 
     # PNG, WebP, TIFF, JPEG — Pillow handles all of these natively.
     try:
@@ -216,10 +246,12 @@ def _direct_image_to_jpeg(src: Path, dst: Path) -> bool:
             img = ImageOps.exif_transpose(img)
             if img.mode != "RGB":
                 img = img.convert("RGB")
-            img.save(dst, "JPEG", quality=92, optimize=True)
+            img.save(tmp_path, "JPEG", quality=92, optimize=True)
+        tmp_path.replace(dst)
         logger.debug("Direct image preview saved: %s → %s", src.name, dst.name)
         return True
     except Exception as e:
+        tmp_path.unlink(missing_ok=True)
         logger.error("Failed to convert %s to JPEG preview: %s", src.name, e)
         return False
 
@@ -270,6 +302,8 @@ def _extract_sync(raw_path: Path, out_path: Path) -> bool:
     """
     try:
         _timeout = 60
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = _temp_output_path(out_path)
         if not materialise_file(raw_path):
             return False
 
@@ -315,25 +349,30 @@ def _extract_sync(raw_path: Path, out_path: Path) -> bool:
                 "No embedded JPEG found in %s — falling back to sips RAW decode",
                 raw_path.name,
             )
-            sips_ok = _sips_to_jpeg(raw_path, out_path)
+            sips_ok = _sips_to_jpeg(raw_path, tmp_path)
             if not sips_ok:
+                tmp_path.unlink(missing_ok=True)
                 logger.warning("sips fallback also failed for: %s", raw_path)
                 return False
             # sips does not preserve RAW orientation — apply it now.
-            _correct_preview_orientation(out_path, orientation)
+            _correct_preview_orientation(tmp_path, orientation)
+            tmp_path.replace(out_path)
             return True
 
-        out_path.write_bytes(result.stdout)
+        tmp_path.write_bytes(result.stdout)
 
         # Bake the RAW's orientation into the preview pixel data.
-        _correct_preview_orientation(out_path, orientation)
+        _correct_preview_orientation(tmp_path, orientation)
+        tmp_path.replace(out_path)
 
         return True
 
     except subprocess.TimeoutExpired:
+        tmp_path.unlink(missing_ok=True)
         logger.error("ExifTool timed out extracting preview: %s", raw_path)
         return False
     except Exception as e:
+        tmp_path.unlink(missing_ok=True)
         logger.error("Preview extraction error for %s: %s", raw_path, e)
         return False
 

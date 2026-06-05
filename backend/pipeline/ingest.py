@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import unicodedata
 import uuid
 from pathlib import Path
@@ -25,6 +26,7 @@ import numpy as np
 
 from backend.config import settings
 from backend.database.db import get_db
+from backend.database.identity import link_cluster_to_person
 from backend.scanner.walker import walk_folder
 from backend.scanner.hasher import compute_hash, check_idempotency
 from backend.scanner.exif_reader import ExifToolReader
@@ -34,9 +36,13 @@ from backend.ml.embedder import FaceEmbedder, save_face_thumbnail
 from backend.ml.clusterer import cluster_embeddings
 from backend.ml.index import FaissIndex
 from backend.ml.clip_index import ClipFaissIndex
+from backend.ml.florence_analyzer import FlorenceAnalyzer
 from backend.ml.tagger import Tagger
 from backend.api.websocket import broadcast
 from backend.database import settings_store
+from backend.pipeline.control import wait_if_paused
+from backend.pipeline.runtime_state import set_phase
+from backend.profiles import get_current_profile_id
 
 try:
     from PIL import Image as _PILImage
@@ -52,7 +58,13 @@ _embedder = FaceEmbedder()
 _faiss = FaissIndex()
 _clip_index = ClipFaissIndex()
 _tagger = Tagger()
+_florence = FlorenceAnalyzer()
 _models_loaded = False
+
+
+async def _pause_point() -> None:
+    """Cooperative pause checkpoint for long-running pipeline phases."""
+    await wait_if_paused(get_current_profile_id())
 
 
 def _ensure_models() -> None:
@@ -120,7 +132,9 @@ async def run_reprocess(force_retag: bool = False) -> None:
             WHERE m.is_stub = 0
               AND m.id NOT IN (
                   SELECT DISTINCT f.media_file_id FROM faces f
-                  JOIN persons p ON p.id = f.person_id
+                  JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                  JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                  JOIN persons p ON p.person_guid = cpc.person_guid
                   WHERE p.name IS NOT NULL AND p.is_ignored = 0
               )
         """)).fetchone()
@@ -131,10 +145,15 @@ async def run_reprocess(force_retag: bool = False) -> None:
             DELETE FROM embeddings
             WHERE face_id IN (
                 SELECT f.id FROM faces f
-                WHERE f.person_id IS NULL
+                LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                LEFT JOIN persons pcur ON pcur.person_guid = cpc.person_guid
+                WHERE pcur.id IS NULL
                   AND f.media_file_id NOT IN (
                       SELECT DISTINCT f2.media_file_id FROM faces f2
-                      JOIN persons p ON p.id = f2.person_id
+                      JOIN v_face_cluster_current fcc2 ON fcc2.face_guid = f2.face_guid
+                      JOIN v_cluster_person_current cpc2 ON cpc2.cluster_guid = fcc2.cluster_guid
+                      JOIN persons p ON p.person_guid = cpc2.person_guid
                       WHERE p.name IS NOT NULL AND p.is_ignored = 0
                   )
             )
@@ -143,10 +162,18 @@ async def run_reprocess(force_retag: bool = False) -> None:
         # 1b. Drop the unowned face rows themselves
         await db.execute("""
             DELETE FROM faces
-            WHERE person_id IS NULL
+            WHERE id IN (
+                SELECT f.id FROM faces f
+                LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                LEFT JOIN persons pcur ON pcur.person_guid = cpc.person_guid
+                WHERE pcur.id IS NULL
+            )
               AND media_file_id NOT IN (
                   SELECT DISTINCT f2.media_file_id FROM faces f2
-                  JOIN persons p ON p.id = f2.person_id
+                  JOIN v_face_cluster_current fcc2 ON fcc2.face_guid = f2.face_guid
+                  JOIN v_cluster_person_current cpc2 ON cpc2.cluster_guid = fcc2.cluster_guid
+                  JOIN persons p ON p.person_guid = cpc2.person_guid
                   WHERE p.name IS NOT NULL AND p.is_ignored = 0
               )
         """)
@@ -157,7 +184,9 @@ async def run_reprocess(force_retag: bool = False) -> None:
             WHERE is_stub = 0
               AND id NOT IN (
                   SELECT DISTINCT f.media_file_id FROM faces f
-                  JOIN persons p ON p.id = f.person_id
+                  JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                  JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                  JOIN persons p ON p.person_guid = cpc.person_guid
                   WHERE p.name IS NOT NULL AND p.is_ignored = 0
               )
         """)
@@ -200,7 +229,8 @@ async def run_reprocess(force_retag: bool = False) -> None:
     # Step 5b: If the user requested a full re-tag, run Phase 4 now.
     # (tags_done was already reset to 0 at the top of this function.)
     if force_retag:
-        await _phase_tag()
+        tagged_ids = await _phase_tag()
+        await _phase_florence(tagged_ids)
 
     # Keep CLIP embeddings current for natural-language visual search.
     await _phase_clip_index()
@@ -281,7 +311,9 @@ async def run_reprocess(force_retag: bool = False) -> None:
             SET photo_count = (
                 SELECT COUNT(DISTINCT f.media_file_id)
                 FROM faces f
-                WHERE f.person_id = persons.id
+                JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                WHERE cpc.person_guid = persons.person_guid
             )
             WHERE is_merged = 0
         """)
@@ -295,14 +327,16 @@ async def run_reprocess(force_retag: bool = False) -> None:
 # ---------------------------------------------------------------------------
 async def run_single_reprocess(media_id: int) -> None:
     """
-    Re-detect faces in a single photo without scanning the full library.
+    Re-run all available models for a single photo without scanning the full library.
 
     Steps:
       1. Delete unowned face embeddings and face rows for this photo.
          Named-person assignments are preserved.
       2. Reset this photo's ingest_state to 'scanned'.
-      3. Re-run _phase_embed (with force bypass of the idempotency guard),
-         _phase_cluster, _phase_auto_merge, and _phase_restore_vip_names.
+        3. Re-run _phase_embed, _phase_cluster, _phase_auto_merge, and
+            _phase_restore_vip_names for face/person updates.
+        4. Re-run tagging models (objects/scene/place/explicit/Florence)
+            and rebuild analysis output for this photo.
 
     Useful when a face covering ≥30% of the frame was missed on the initial
     scan — triggering this avoids a full-library reprocess.
@@ -360,13 +394,26 @@ async def run_single_reprocess(media_id: int) -> None:
 
     # No force_ids needed — all face rows were deleted so the idempotency
     # guard in _phase_embed sees no existing embeddings and processes normally.
-    await _phase_embed()
-    await _phase_cluster()
-    await _phase_build_cooccurrence()
-    await _phase_recover_singletons()
-    await _phase_auto_merge()
-    await _phase_build_cooccurrence()
-    await _phase_restore_vip_names()
+    scoped_ids = {media_id}
+    await _phase_embed(force_ids=scoped_ids, media_ids=scoped_ids)
+    await _phase_cluster(media_ids=scoped_ids)
+    await _phase_auto_merge(media_ids=scoped_ids)
+    await _phase_restore_vip_names(media_ids=scoped_ids)
+
+    # Force this photo through Phase 4 tagging and Phase 5 analysis refresh.
+    async with get_db() as db:
+        await db.execute(
+            "UPDATE media_files SET tags_done = 0 WHERE id = ?",
+            (media_id,),
+        )
+        await db.execute(
+            "DELETE FROM photo_analysis WHERE media_file_id = ?",
+            (media_id,),
+        )
+
+    tagged_ids = await _phase_tag(scoped_ids)
+    await _phase_florence(tagged_ids)
+    await _phase_analyse(media_ids=scoped_ids)
 
     await broadcast("pipeline_complete", folder=f"[reprocess photo {media_id}]")
     logger.info("=== Single-photo reprocess complete: media_id=%d ===", media_id)
@@ -378,12 +425,12 @@ async def run_single_reprocess(media_id: int) -> None:
 
 async def run_batch_reprocess(media_ids: list[int]) -> None:
     """
-    Re-detect faces in a batch of photos without scanning the full library.
+    Re-run all available models in a batch of photos without scanning the full library.
 
-    Runs the same steps as run_single_reprocess but batches the DB cleanup
-    and runs embed → cluster → auto-merge → name-restore once across all
-    selected photos, which is far more efficient than calling
-    run_single_reprocess sequentially.
+    Runs the same face refresh as run_single_reprocess but batches the DB
+    cleanup and runs embed → cluster → auto-merge → name-restore once
+    across all selected photos, then re-runs Phase 4 tagging and Phase 5
+    analysis for those photos.
 
     Named-person assignments are restored via _phase_auto_merge, which
     compares new unnamed clusters against persisted person centroids.
@@ -455,13 +502,27 @@ async def run_batch_reprocess(media_ids: list[int]) -> None:
 
     # No force_ids needed — all face rows were deleted so the idempotency
     # guard in _phase_embed sees no existing embeddings and processes normally.
-    await _phase_embed()
-    await _phase_cluster()
-    await _phase_build_cooccurrence()
-    await _phase_recover_singletons()
-    await _phase_auto_merge()
-    await _phase_build_cooccurrence()
-    await _phase_restore_vip_names()
+    scoped_ids = set(valid_ids)
+    await _phase_embed(force_ids=scoped_ids, media_ids=scoped_ids)
+    await _phase_cluster(media_ids=scoped_ids)
+    await _phase_auto_merge(media_ids=scoped_ids)
+    await _phase_restore_vip_names(media_ids=scoped_ids)
+
+    # Force selected photos through Phase 4 tagging and Phase 5 analysis refresh.
+    async with get_db() as db:
+        placeholders = ",".join("?" * len(valid_ids))
+        await db.execute(
+            f"UPDATE media_files SET tags_done = 0 WHERE id IN ({placeholders})",
+            valid_ids,
+        )
+        await db.execute(
+            f"DELETE FROM photo_analysis WHERE media_file_id IN ({placeholders})",
+            valid_ids,
+        )
+
+    tagged_ids = await _phase_tag(scoped_ids)
+    await _phase_florence(tagged_ids)
+    await _phase_analyse(media_ids=scoped_ids)
 
     await broadcast("pipeline_complete", folder=label)
     logger.info("=== Batch reprocess complete: %d photos ===", len(valid_ids))
@@ -514,7 +575,9 @@ async def run_model_migration() -> None:
         named_face_rows = await db.execute_fetchall("""
             SELECT f.id AS face_id, f.thumbnail_path
             FROM faces f
-            JOIN persons p ON p.id = f.person_id
+                        JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                        JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                        JOIN persons p ON p.person_guid = cpc.person_guid
             WHERE p.name IS NOT NULL AND p.is_ignored = 0
               AND EXISTS (SELECT 1 FROM embeddings e WHERE e.face_id = f.id)
         """)
@@ -615,12 +678,27 @@ async def run_model_migration() -> None:
         await db.execute("""
             DELETE FROM embeddings
             WHERE face_id IN (
-                SELECT f.id FROM faces f WHERE f.person_id IS NULL
+                SELECT f.id FROM faces f
+                LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                LEFT JOIN persons pcur ON pcur.person_guid = cpc.person_guid
+                WHERE pcur.id IS NULL
             )
         """)
 
         # 3b. Drop the face rows themselves
-        await db.execute("DELETE FROM faces WHERE person_id IS NULL")
+        await db.execute(
+            """
+            DELETE FROM faces
+            WHERE id IN (
+                SELECT f.id FROM faces f
+                LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                LEFT JOIN persons pcur ON pcur.person_guid = cpc.person_guid
+                WHERE pcur.id IS NULL
+            )
+            """
+        )
 
         # 3c. Reset files that have no named faces → 'scanned' for re-detection
         await db.execute("""
@@ -628,7 +706,9 @@ async def run_model_migration() -> None:
             WHERE is_stub = 0
               AND id NOT IN (
                   SELECT DISTINCT f.media_file_id FROM faces f
-                  JOIN persons p ON p.id = f.person_id
+                  JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                  JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                  JOIN persons p ON p.person_guid = cpc.person_guid
                   WHERE p.name IS NOT NULL AND p.is_ignored = 0
               )
         """)
@@ -653,7 +733,9 @@ async def run_model_migration() -> None:
             SET photo_count = (
                 SELECT COUNT(DISTINCT f.media_file_id)
                 FROM faces f
-                WHERE f.person_id = persons.id
+                JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                WHERE cpc.person_guid = persons.person_guid
             )
             WHERE is_merged = 0
         """)
@@ -675,30 +757,84 @@ async def run_clip_index_rebuild() -> None:
     logger.info("=== CLIP index rebuild complete ===")
 
 
+async def run_face_index_rebuild() -> None:
+    """Rebuild the face FAISS index from all embedding rows currently in the DB."""
+    logger.info("=== Face index rebuild start ===")
+    await broadcast("pipeline_start", folder="[face index rebuild]")
+    await settings_store.load_cache()
+    _ensure_models()
+
+    await set_phase("face_index_rebuild")
+    await broadcast("progress", phase="face_index_rebuild", message="Loading face embeddings")
+
+    async with get_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT face_id, vector FROM embeddings ORDER BY face_id"
+        )
+
+    face_ids: list[int] = []
+    vectors: list[np.ndarray] = []
+    for row in rows:
+        raw = row["vector"]
+        if raw is None:
+            continue
+        vec = np.frombuffer(raw, dtype=np.float32)
+        if vec.size == 0:
+            continue
+        face_ids.append(int(row["face_id"]))
+        vectors.append(vec)
+
+    if vectors:
+        _faiss.build(face_ids, vectors)
+        _faiss.save()
+    else:
+        logger.warning("No face embeddings available for FAISS rebuild")
+
+    await broadcast(
+        "progress",
+        phase="face_index_rebuild",
+        done=len(vectors),
+        total=len(vectors),
+        message=f"Indexed {len(vectors)} face embeddings",
+    )
+    await broadcast("pipeline_complete", folder="[face index rebuild]")
+    logger.info("=== Face index rebuild complete (%d vectors) ===", len(vectors))
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline entry point
 # ---------------------------------------------------------------------------
-async def run_ingest(folder: str) -> None:
+async def run_ingest(folder: str, use_existing_vip_data: bool = True) -> None:
     """
     Full ingest pipeline for a given folder path.
     Called by the API route /api/pipeline/scan
     """
     folder_path = Path(folder).resolve()
-    logger.info("=== Pipeline start: %s ===", folder_path)
+    logger.info(
+        "=== Pipeline start: %s (use_existing_vip_data=%s) ===",
+        folder_path,
+        use_existing_vip_data,
+    )
 
     await broadcast("pipeline_start", folder=str(folder_path))
 
     # Refresh the in-process settings cache from DB so any tweaks made in
     # the Admin UI take effect on the next pipeline run without a restart.
     await settings_store.load_cache()
+    await _pause_point()
 
     _ensure_models()
+    await _pause_point()
 
     # -- Phase 1: Scan, hash, EXIF -----------------------------------------
-    await _phase_scan(folder_path)
+    await set_phase("scan")
+    await _phase_scan(folder_path, use_existing_vip_data=use_existing_vip_data)
+    await _pause_point()
 
     # -- Phase 2: Extract previews + detect + embed -------------------------
+    await set_phase("embed")
     await _phase_embed()
+    await _pause_point()
 
     # Notify the frontend if quality issues were found during embed
     async with get_db() as db:
@@ -711,19 +847,29 @@ async def run_ingest(folder: str) -> None:
         await broadcast("quality_issues_found", count=_quality_count)
 
     # -- Phase 3: Cluster ---------------------------------------------------
+    await set_phase("cluster")
     await _phase_cluster()
+    await _pause_point()
 
     # -- Phase 3a-i: Refresh co-occurrence so singleton recovery can use it --
+    await set_phase("cooccurrence")
     await _phase_build_cooccurrence()
+    await _pause_point()
 
     # -- Phase 3a-ii: Singleton recovery — FAISS nearest-neighbour pass ------
+    await set_phase("singleton_recovery")
     await _phase_recover_singletons()
+    await _pause_point()
 
     # -- Phase 3b: Auto-merge high-conf + surface borderline suggestions ----
+    await set_phase("auto_merge")
     await _phase_auto_merge()
+    await _pause_point()
 
     # -- Phase 3b-ii: Rebuild co-occurrence to capture this run's assignments -
+    await set_phase("cooccurrence")
     await _phase_build_cooccurrence()
+    await _pause_point()
 
     # -- Phase 3c: Restore person names from VIP History -------------------
     # When ExifTool has previously written named face regions to a photo,
@@ -732,16 +878,32 @@ async def run_ingest(folder: str) -> None:
     # the external_exif snapshot (captured at first INSERT) and matches
     # the stored MWG face regions back to the freshly-detected face clusters
     # by bounding-box centre proximity, then re-assigns person names.
-    await _phase_restore_vip_names()
+    if use_existing_vip_data:
+        await set_phase("restore_vip_names")
+        await _phase_restore_vip_names()
+        await _pause_point()
+    else:
+        logger.info("Phase 3c skipped: treating imports as new photos (VIP history disabled)")
 
-    # -- Phase 4: Tag (objects, animals, geography, places) -----------------
-    await _phase_tag()
+    # -- Phase 4: Core tagging (objects/animals/geography/places/explicit) --
+    await set_phase("tag")
+    tagged_ids = await _phase_tag()
+    await _pause_point()
+
+    # -- Phase 5: Florence enrichment (caption/OCR/region) ------------------
+    await set_phase("florence")
+    await _phase_florence(tagged_ids)
+    await _pause_point()
 
     # -- Phase 4b: Build per-photo CLIP vector index -------------------------
+    await set_phase("clip_index")
     await _phase_clip_index()
+    await _pause_point()
 
-    # -- Phase 5: Build analysis documents (Rekognition-format JSON) --------
+    # -- Phase 6: Build analysis documents (Rekognition-format JSON) --------
+    await set_phase("analyse")
     await _phase_analyse()
+    await _pause_point()
 
     # Sync denormalised photo_count on all active persons
     async with get_db() as db:
@@ -750,7 +912,9 @@ async def run_ingest(folder: str) -> None:
             SET photo_count = (
                 SELECT COUNT(DISTINCT f.media_file_id)
                 FROM faces f
-                WHERE f.person_id = persons.id
+                JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                WHERE cpc.person_guid = persons.person_guid
             )
             WHERE is_merged = 0
         """)
@@ -758,6 +922,240 @@ async def run_ingest(folder: str) -> None:
 
     await broadcast("pipeline_complete", folder=str(folder_path))
     logger.info("=== Pipeline complete: %s ===", folder_path)
+
+
+async def run_resume_pending() -> None:
+    """Resume pending post-cluster work (tag/florence/clip/analyse) after interruption."""
+    logger.info("=== Resume pending pipeline start ===")
+    await broadcast("pipeline_start", folder="[resume pending]")
+    await settings_store.load_cache()
+    _ensure_models()
+
+    await set_phase("tag")
+    await _pause_point()
+    tagged_now = await _phase_tag()
+
+    async with get_db() as db:
+        pending_rows = await db.execute_fetchall(
+            """
+            SELECT id
+            FROM media_files
+            WHERE is_stub = 0
+              AND removed_from_app = 0
+              AND ingest_state = 'tagged'
+              AND tags_done = 1
+              AND florence_done = 0
+            """
+        )
+    florence_ids = {int(r["id"]) for r in pending_rows}
+    if tagged_now:
+        florence_ids.update(tagged_now)
+
+    await set_phase("florence")
+    await _pause_point()
+    await _phase_florence(florence_ids)
+
+    await set_phase("clip_index")
+    await _pause_point()
+    await _phase_clip_index()
+
+    await set_phase("analyse")
+    await _pause_point()
+    await _phase_analyse()
+
+    await broadcast("pipeline_complete", folder="[resume pending]")
+    logger.info("=== Resume pending pipeline complete ===")
+
+
+async def run_resume_florence_pending() -> int:
+    """Resume only pending Florence enrichment work after interruption."""
+    logger.info("=== Resume Florence pending start ===")
+    await broadcast("pipeline_start", folder="[resume florence pending]")
+    await settings_store.load_cache()
+    _ensure_models()
+
+    async with get_db() as db:
+        pending_rows = await db.execute_fetchall(
+            """
+            SELECT id
+            FROM media_files
+            WHERE is_stub = 0
+              AND removed_from_app = 0
+              AND ingest_state = 'tagged'
+              AND tags_done = 1
+              AND florence_done = 0
+            """
+        )
+    florence_ids = {int(r["id"]) for r in pending_rows}
+    if not florence_ids:
+        await broadcast("pipeline_complete", folder="[resume florence pending]")
+        logger.info("=== Resume Florence pending complete: 0 files ===")
+        return 0
+
+    await set_phase("florence")
+    await _pause_point()
+    await _phase_florence(florence_ids)
+
+    await broadcast("pipeline_complete", folder="[resume florence pending]")
+    logger.info("=== Resume Florence pending complete: %d files ===", len(florence_ids))
+    return len(florence_ids)
+
+
+async def run_manual_pilot(models: list[str], scope: str = "unindexed") -> dict[str, int]:
+    """Run selected model phases manually across whole or unindexed scope."""
+    selected = {m.strip().lower() for m in models if m and m.strip()}
+    ordered = [m for m in ("tag", "florence", "clip_index", "analyse") if m in selected]
+    if not ordered:
+        return {}
+
+    logger.info("=== Manual pilot start (scope=%s, models=%s) ===", scope, ",".join(ordered))
+    await broadcast("pipeline_start", folder=f"[manual pilot:{scope}]")
+    await settings_store.load_cache()
+    _ensure_models()
+
+    counts: dict[str, int] = {}
+    is_whole = scope == "whole"
+
+    if "tag" in ordered:
+        await set_phase("tag")
+        await _pause_point()
+        if is_whole:
+            async with get_db() as db:
+                await db.execute(
+                    """
+                    UPDATE media_files
+                    SET tags_done = 0
+                    WHERE is_stub = 0
+                      AND removed_from_app = 0
+                      AND ingest_state IN ('embedded', 'clustered', 'tagged')
+                    """
+                )
+            tagged_ids = await _phase_tag()
+        else:
+            async with get_db() as db:
+                rows = await db.execute_fetchall(
+                    """
+                    SELECT id
+                    FROM media_files
+                    WHERE tags_done = 0
+                      AND is_stub = 0
+                      AND removed_from_app = 0
+                      AND ingest_state IN ('embedded', 'clustered', 'tagged')
+                    """
+                )
+            tagged_ids = await _phase_tag({int(r["id"]) for r in rows})
+        counts["tag"] = len(tagged_ids)
+
+    if "florence" in ordered:
+        await set_phase("florence")
+        await _pause_point()
+        async with get_db() as db:
+            if is_whole:
+                rows = await db.execute_fetchall(
+                    """
+                    SELECT id
+                    FROM media_files
+                    WHERE is_stub = 0
+                      AND removed_from_app = 0
+                      AND ingest_state = 'tagged'
+                      AND tags_done = 1
+                    """
+                )
+            else:
+                rows = await db.execute_fetchall(
+                    """
+                    SELECT id
+                    FROM media_files
+                    WHERE is_stub = 0
+                      AND removed_from_app = 0
+                      AND ingest_state = 'tagged'
+                      AND tags_done = 1
+                      AND florence_done = 0
+                    """
+                )
+        florence_ids = {int(r["id"]) for r in rows}
+        processed_florence = await _phase_florence(florence_ids)
+        counts["florence"] = len(processed_florence)
+
+    if "clip_index" in ordered:
+        await set_phase("clip_index")
+        await _pause_point()
+        pending_before = 0
+        async with get_db() as db:
+            if is_whole:
+                row = await (await db.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM media_files
+                    WHERE is_stub = 0
+                      AND removed_from_app = 0
+                    """
+                )).fetchone()
+            else:
+                row = await (await db.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM media_files mf
+                    LEFT JOIN clip_embeddings ce ON ce.media_file_id = mf.id
+                    WHERE mf.is_stub = 0
+                      AND mf.removed_from_app = 0
+                      AND mf.tags_done = 1
+                      AND ce.media_file_id IS NULL
+                    """
+                )).fetchone()
+        pending_before = int(row["cnt"]) if row else 0
+        await _phase_clip_index(rebuild_all=is_whole)
+        counts["clip_index"] = pending_before
+
+    if "analyse" in ordered:
+        from backend.ml.analysis_builder import MODEL_VERSION
+
+        await set_phase("analyse")
+        await _pause_point()
+        async with get_db() as db:
+            if is_whole:
+                await db.execute(
+                    """
+                    DELETE FROM photo_analysis
+                    WHERE media_file_id IN (
+                        SELECT id FROM media_files
+                        WHERE ingest_state = 'tagged'
+                          AND is_stub = 0
+                          AND removed_from_app = 0
+                    )
+                    """
+                )
+                row = await (await db.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM media_files
+                    WHERE ingest_state = 'tagged'
+                      AND is_stub = 0
+                      AND removed_from_app = 0
+                    """
+                )).fetchone()
+                analyse_ids: set[int] | None = None
+            else:
+                rows = await db.execute_fetchall(
+                    """
+                    SELECT mf.id
+                    FROM media_files mf
+                    LEFT JOIN photo_analysis pa ON pa.media_file_id = mf.id
+                    WHERE mf.ingest_state = 'tagged'
+                      AND mf.is_stub = 0
+                      AND mf.removed_from_app = 0
+                      AND (pa.id IS NULL OR pa.model_version != ?)
+                    """,
+                    (MODEL_VERSION,),
+                )
+                row = {"cnt": len(rows)}
+                analyse_ids = {int(r["id"]) for r in rows}
+        counts["analyse"] = int(row["cnt"]) if row else 0
+        await _phase_analyse(analyse_ids)
+
+    await broadcast("pipeline_complete", folder=f"[manual pilot:{scope}]")
+    logger.info("=== Manual pilot complete: %s ===", counts)
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -770,7 +1168,7 @@ _HASH_CONCURRENCY = 8     # simultaneous SHA-256 read streams
 _TAG_BATCH_SIZE   = 16    # images per YOLO GPU forward pass in Phase 4
 
 
-async def _phase_scan(folder: Path) -> None:
+async def _phase_scan(folder: Path, use_existing_vip_data: bool = True) -> None:
     logger.info("Phase 1: Scanning %s", folder)
     await broadcast("phase_start", phase="scan")
 
@@ -801,6 +1199,7 @@ async def _phase_scan(folder: Path) -> None:
     exif_reader = ExifToolReader()
 
     for batch_start in range(0, total_files, scan_batch_size):
+        await _pause_point()
         batch = all_paths[batch_start : batch_start + scan_batch_size]
 
         # ── 1a + 1b: ExifTool (one subprocess for the whole batch) and ────────
@@ -830,7 +1229,13 @@ async def _phase_scan(folder: Path) -> None:
                 file_hash = path_to_hash[str(file_path)]
                 meta = exif_map.get(str(file_path)) or {}
 
-                skip, existing_id = await check_idempotency(db, file_hash, file_path_str)
+                stable_identifier = meta.get("xmp_identifier") if use_existing_vip_data else None
+                skip, existing_id = await check_idempotency(
+                    db,
+                    file_hash,
+                    file_path_str,
+                    stable_identifier=stable_identifier,
+                )
                 if skip:
                     skipped += 1
                     continue
@@ -843,14 +1248,14 @@ async def _phase_scan(folder: Path) -> None:
                     # Re-evaluation: update existing record (also clears removed_from_app)
                     await db.execute("""
                         UPDATE media_files SET
-                            file_path=?, file_size=?, file_format=?, camera_make=?, camera_model=?,
+                            file_path=?, file_hash=?, file_size=?, file_format=?, camera_make=?, camera_model=?,
                             date_taken=?, gps_lat=?, gps_lon=?, width=?, height=?,
                             is_stub=?, exposure_time_s=?,
                             ingest_state='scanned', needs_reprocess=0, removed_from_app=0,
                             last_seen_at=datetime('now')
                         WHERE id=?
                     """, (
-                        file_path_str, stat.st_size, meta.get("file_format"),
+                        file_path_str, file_hash, stat.st_size, meta.get("file_format"),
                         meta.get("camera_make"), meta.get("camera_model"),
                         meta.get("date_taken"), meta.get("gps_lat"), meta.get("gps_lon"),
                         meta.get("width"), meta.get("height"), int(is_stub),
@@ -862,39 +1267,43 @@ async def _phase_scan(folder: Path) -> None:
                     # (RAW+JPEG pairs, camera firmware duplication, or files
                     # shared across folders can all carry the same identifier).
                     # In those cases fall back to a fresh UUID.
-                    _candidate_id = meta.get("xmp_identifier")
+                    _candidate_id = meta.get("xmp_identifier") if use_existing_vip_data else None
                     if _candidate_id:
                         _taken = await (await db.execute(
-                            "SELECT 1 FROM media_files WHERE vip_id=?", (_candidate_id,)
+                            "SELECT 1 FROM media_files WHERE vip_id=? OR asset_id=?",
+                            (_candidate_id, _candidate_id),
                         )).fetchone()
-                        new_vip_id = _candidate_id if _taken is None else str(uuid.uuid4())
+                        new_asset_id = _candidate_id if _taken is None else str(uuid.uuid4())
                     else:
-                        new_vip_id = str(uuid.uuid4())
+                        new_asset_id = str(uuid.uuid4())
+                    # Keep vip_id in sync for compatibility with existing features.
+                    new_vip_id = new_asset_id
 
                     # Build a one-time snapshot of whatever rich XMP/IPTC data
                     # existed in the file *before* VIP touches it.  This snapshot
                     # drives the "VIP History" / "External History" display.
                     _ext: dict = {}
-                    if meta.get("xmp_identifier"):
+                    if use_existing_vip_data and meta.get("xmp_identifier"):
                         _ext["identifier"] = meta["xmp_identifier"]
-                    if meta.get("xmp_persons"):
+                    if use_existing_vip_data and meta.get("xmp_persons"):
                         _ext["persons"] = meta["xmp_persons"]
                     if meta.get("xmp_keywords"):
                         _ext["keywords"] = meta["xmp_keywords"]
                     if meta.get("xmp_location"):
                         _ext["location"] = meta["xmp_location"]
-                    if meta.get("xmp_region_info"):
+                    if use_existing_vip_data and meta.get("xmp_region_info"):
                         _ext["region_info"] = meta["xmp_region_info"]
                     external_exif_json = json.dumps(_ext) if _ext else None
 
                     await db.execute("""
                         INSERT INTO media_files
-                            (vip_id, file_path, file_hash, file_size, file_format, camera_make, camera_model,
+                            (vip_id, asset_id, file_path, file_hash, file_size, file_format, camera_make, camera_model,
                              date_taken, gps_lat, gps_lon, width, height, is_stub, exposure_time_s,
                              ingest_state, external_exif)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'scanned',?)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'scanned',?)
                     """, (
                         new_vip_id,
+                        new_asset_id,
                         file_path_str, file_hash, stat.st_size, meta.get("file_format"),
                         meta.get("camera_make"), meta.get("camera_model"),
                         meta.get("date_taken"), meta.get("gps_lat"), meta.get("gps_lon"),
@@ -943,7 +1352,7 @@ def _make_photo_thumb(src: Path, media_id: int) -> Path | None:
         return None
 
 
-async def _phase_embed(force_ids: set[int] | None = None) -> None:
+async def _phase_embed(force_ids: set[int] | None = None, media_ids: set[int] | None = None) -> None:
     """
     Detect and embed faces in all 'scanned' files.
 
@@ -951,13 +1360,20 @@ async def _phase_embed(force_ids: set[int] | None = None) -> None:
     specific media IDs.  Used by run_single_reprocess so that a file whose
     named-person embeddings were deliberately kept can be fully re-detected.
     """
-    logger.info("Phase 2: Embedding faces (force_ids=%s)", force_ids)
+    logger.info("Phase 2: Embedding faces (force_ids=%s, media_ids=%s)", force_ids, media_ids)
     await broadcast("phase_start", phase="embed")
 
     async with get_db() as db:
-        rows = await db.execute_fetchall(
-            "SELECT id, file_path FROM media_files WHERE ingest_state='scanned' AND is_stub=0"
-        )
+        if media_ids:
+            placeholders = ",".join("?" * len(media_ids))
+            rows = await db.execute_fetchall(
+                f"SELECT id, file_path FROM media_files WHERE ingest_state='scanned' AND is_stub=0 AND id IN ({placeholders})",
+                tuple(sorted(media_ids)),
+            )
+        else:
+            rows = await db.execute_fetchall(
+                "SELECT id, file_path FROM media_files WHERE ingest_state='scanned' AND is_stub=0"
+            )
 
     total = len(rows)
     logger.info("%d files to embed", total)
@@ -973,6 +1389,7 @@ async def _phase_embed(force_ids: set[int] | None = None) -> None:
     _counter = [0]  # [processed]
 
     async def _process_one(row: aiosqlite.Row) -> None:
+        await _pause_point()
         async with sem:
             media_id = row["id"]
             file_path = row["file_path"]
@@ -1096,10 +1513,12 @@ async def _phase_embed(force_ids: set[int] | None = None) -> None:
                     # Insert face record
                     cursor = await db.execute("""
                         INSERT INTO faces (media_file_id, bbox_x, bbox_y, bbox_w, bbox_h,
-                                           detection_conf, face_attributes)
-                        VALUES (?,?,?,?,?,?,?)
+                                     detection_conf, face_attributes,
+                                     face_sharpness, pose_yaw, pose_pitch, pose_roll)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?)
                     """, (media_id, face.bbox_x, face.bbox_y, face.bbox_w, face.bbox_h,
-                          face.detection_conf, json.dumps(face_attrs) if face_attrs else None))
+                          face.detection_conf, json.dumps(face_attrs) if face_attrs else None,
+                          face.quality_sharpness, face.pose_yaw, face.pose_pitch, face.pose_roll))
                     face_id = cursor.lastrowid
 
                     # Save thumbnail
@@ -1175,43 +1594,54 @@ async def _phase_embed(force_ids: set[int] | None = None) -> None:
 # ---------------------------------------------------------------------------
 # Phase 3: Cluster all embeddings
 # ---------------------------------------------------------------------------
-async def _phase_cluster() -> None:
-    logger.info("Phase 3: Clustering")
+async def _phase_cluster(media_ids: set[int] | None = None) -> None:
+    logger.info("Phase 3: Clustering (media_ids=%s)", media_ids)
     await broadcast("phase_start", phase="cluster")
 
-    # Step 1: Clear any clusters that no longer have a named person.
-    # Named-person clusters (person_id IS NOT NULL) are kept so assignments survive.
-    async with get_db() as db:
-        unnamed = await db.execute_fetchall("""
-            SELECT c.id FROM clusters c
-            WHERE NOT EXISTS (
-                SELECT 1 FROM faces f
-                JOIN persons p ON p.id = f.person_id
-                WHERE f.cluster_id = c.id AND p.name IS NOT NULL AND p.is_ignored = 0
-            )
-        """)
-        unnamed_ids = [r["id"] for r in unnamed]
-        if unnamed_ids:
-            ph = ",".join("?" * len(unnamed_ids))
-            # Release face → cluster assignments for unnamed clusters
-            await db.execute(
-                f"UPDATE faces SET cluster_id=NULL WHERE cluster_id IN ({ph})",
-                unnamed_ids,
-            )
-            await db.execute(
-                f"DELETE FROM clusters WHERE id IN ({ph})",
-                unnamed_ids,
-            )
-            logger.info("Cleared %d unnamed clusters; faces returned to pool", len(unnamed_ids))
+    # Step 1: Clear unnamed clusters only during full-library clustering.
+    if not media_ids:
+        async with get_db() as db:
+            unnamed = await db.execute_fetchall("""
+                SELECT c.id FROM clusters c
+                LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
+                LEFT JOIN persons p ON p.person_guid = cpc.person_guid AND p.is_merged = 0 AND p.is_ignored = 0
+                WHERE p.id IS NULL
+            """)
+            unnamed_ids = [r["id"] for r in unnamed]
+            if unnamed_ids:
+                ph = ",".join("?" * len(unnamed_ids))
+                # Release face → cluster assignments for unnamed clusters
+                await db.execute(
+                    f"UPDATE faces SET cluster_id=NULL WHERE cluster_id IN ({ph})",
+                    unnamed_ids,
+                )
+                await db.execute(
+                    f"DELETE FROM clusters WHERE id IN ({ph})",
+                    unnamed_ids,
+                )
+                logger.info("Cleared %d unnamed clusters; faces returned to pool", len(unnamed_ids))
 
     # Step 2: Gather ALL faces not yet owned by a named person
     async with get_db() as db:
-        rows = await db.execute_fetchall("""
-            SELECT f.id as face_id, e.vector
-            FROM faces f
-            JOIN embeddings e ON e.face_id = f.id
-            WHERE f.cluster_id IS NULL
-        """)
+        if media_ids:
+            placeholders = ",".join("?" * len(media_ids))
+            rows = await db.execute_fetchall(
+                f"""
+                SELECT f.id as face_id, e.vector
+                FROM faces f
+                JOIN embeddings e ON e.face_id = f.id
+                WHERE f.cluster_id IS NULL
+                  AND f.media_file_id IN ({placeholders})
+                """,
+                tuple(sorted(media_ids)),
+            )
+        else:
+            rows = await db.execute_fetchall("""
+                SELECT f.id as face_id, e.vector
+                FROM faces f
+                JOIN embeddings e ON e.face_id = f.id
+                WHERE f.cluster_id IS NULL
+            """)
 
     if not rows:
         logger.info("No unclustered embeddings")
@@ -1260,9 +1690,10 @@ async def _phase_cluster() -> None:
                   AND ingest_state NOT IN ('tagged')
             """, all_cluster_ids)
 
-    # Rebuild FAISS index
-    _faiss.build(face_ids, vectors)
-    _faiss.save()
+    # Rebuild FAISS index only for full-library clustering runs.
+    if not media_ids:
+        _faiss.build(face_ids, vectors)
+        _faiss.save()
 
     await broadcast("phase_complete", phase="cluster", clusters=len(results))
     logger.info("Phase 3 complete: %d clusters", len(results))
@@ -1304,6 +1735,10 @@ async def _phase_recover_singletons() -> None:
 
     auto_th    = float(get_setting("auto_name_threshold"))   # default 0.98
     suggest_th = float(get_setting("merge_suggest_threshold"))  # default 0.63
+    unnamed_auto_th = max(
+        suggest_th,
+        float(get_setting("unnamed_auto_merge_threshold") or 0.91),
+    )
 
     # Singleton recovery uses a slightly lower auto-threshold than person
     # auto-naming.  Two near-identical embeddings that both ended up as
@@ -1311,8 +1746,8 @@ async def _phase_recover_singletons() -> None:
     singleton_auto_th = max(suggest_th, min(auto_th, 0.88))
 
     logger.info(
-        "Phase 3a: Singleton recovery (auto≥%.2f, suggest≥%.2f)",
-        singleton_auto_th, suggest_th,
+        "Phase 3a: Singleton recovery (named_auto≥%.2f, unnamed_auto≥%.2f, suggest≥%.2f)",
+        singleton_auto_th, unnamed_auto_th, suggest_th,
     )
     await broadcast("phase_start", phase="singleton_recovery")
 
@@ -1320,22 +1755,26 @@ async def _phase_recover_singletons() -> None:
     async with get_db() as db:
         singleton_rows = await db.execute_fetchall("""
             SELECT c.id AS cluster_id, c.centroid,
-                   MIN(f.id) AS face_id
+                 MIN(f.id) AS face_id,
+                 MIN(f.media_file_id) AS media_file_id
             FROM clusters c
             JOIN faces f ON f.cluster_id = c.id
-            WHERE c.member_count = 1
-              AND c.person_id IS NULL
+                        LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
+                        LEFT JOIN persons p ON p.person_guid = cpc.person_guid AND p.is_merged = 0 AND p.is_ignored = 0
+                        WHERE c.member_count = 1
+                            AND p.id IS NULL
             GROUP BY c.id
         """)
 
         # Build face_id → cluster_id map for all non-singleton unnamed clusters
         # (needed to find which cluster a FAISS hit belongs to)
         face_to_cluster_rows = await db.execute_fetchall("""
-            SELECT f.id AS face_id, f.cluster_id, c.member_count,
-                   f.person_id,
-                   c.person_id AS cluster_person_id
+            SELECT f.id AS face_id, f.cluster_id, c.member_count, f.media_file_id,
+                   owner.id AS cluster_person_id
             FROM faces f
             JOIN clusters c ON c.id = f.cluster_id
+            LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
+            LEFT JOIN persons owner ON owner.person_guid = cpc.person_guid AND owner.is_merged = 0
             WHERE f.cluster_id IS NOT NULL
         """)
 
@@ -1347,6 +1786,11 @@ async def _phase_recover_singletons() -> None:
         }
         for r in face_to_cluster_rows
     }
+    cluster_media_ids: dict[int, set[int]] = {}
+    for r in face_to_cluster_rows:
+        cid = int(r["cluster_id"])
+        mid = int(r["media_file_id"])
+        cluster_media_ids.setdefault(cid, set()).add(mid)
 
     if not singleton_rows:
         logger.info("Phase 3a: No singleton clusters to recover")
@@ -1367,6 +1811,7 @@ async def _phase_recover_singletons() -> None:
         if not row["centroid"]:
             continue
         centroid = load_centroid(row["centroid"])
+        singleton_media_id = int(row["media_file_id"])
 
         # Query FAISS — exclude the singleton's own face from hits (it's in
         # the index too; subtract 1 from k so we always get real neighbours)
@@ -1378,20 +1823,34 @@ async def _phase_recover_singletons() -> None:
         if not hits:
             continue
 
-        best_face_id, best_sim = hits[0]
-        target = face_to_cluster.get(best_face_id)
-        if target is None:
+        selected_hit: tuple[int, float, dict] | None = None
+        for cand_face_id, cand_sim in hits:
+            cand_target = face_to_cluster.get(cand_face_id)
+            if cand_target is None:
+                continue
+
+            cand_cluster_id = cand_target["cluster_id"]
+            if cand_cluster_id == singleton_cluster_id:
+                continue
+            if cand_cluster_id in deleted_clusters:
+                continue
+
+            # Apply same-photo exclusion for unnamed↔unnamed merges: two
+            # different faces from one photo must not collapse into one identity.
+            if cand_target["person_id"] is None:
+                target_media = cluster_media_ids.get(int(cand_cluster_id), set())
+                if singleton_media_id in target_media:
+                    continue
+
+            selected_hit = (cand_face_id, cand_sim, cand_target)
+            break
+
+        if selected_hit is None:
             continue
 
+        _, best_sim, target = selected_hit
         target_cluster_id = target["cluster_id"]
         target_person_id  = target["person_id"]
-
-        if target_cluster_id == singleton_cluster_id:
-            continue   # hit itself somehow
-
-        # Skip if the target cluster was deleted earlier in this same pass
-        if target_cluster_id in deleted_clusters:
-            continue
 
         # ── Social-context boost ───────────────────────────────────────────
         # If the singleton's photo also contains companions who have
@@ -1422,8 +1881,9 @@ async def _phase_recover_singletons() -> None:
             boost = min(0.10, colocated * 0.05)
 
         effective_sim = min(1.0, best_sim + boost)
+        target_auto_th = singleton_auto_th if target_person_id is not None else unnamed_auto_th
 
-        if effective_sim >= singleton_auto_th:
+        if effective_sim >= target_auto_th:
             # ── Silent auto-merge: move singleton faces into target cluster ─
             if target_cluster_id in already_targeted:
                 continue
@@ -1482,8 +1942,8 @@ async def _phase_recover_singletons() -> None:
                     info["person_id"]  = target_person_id
             auto_merged += 1
             logger.debug(
-                "Singleton %d absorbed into cluster %d (sim=%.3f boost=%.2f eff=%.3f)",
-                singleton_cluster_id, target_cluster_id, best_sim, boost, effective_sim,
+                "Singleton %d absorbed into cluster %d (sim=%.3f boost=%.2f eff=%.3f auto_th=%.2f)",
+                singleton_cluster_id, target_cluster_id, best_sim, boost, effective_sim, target_auto_th,
             )
 
         else:
@@ -1533,7 +1993,7 @@ async def _phase_recover_singletons() -> None:
 # Phase 3b: Auto-merge (high confidence) + notify borderline suggestions
 # ---------------------------------------------------------------------------
 
-async def _phase_auto_merge() -> None:
+async def _phase_auto_merge(media_ids: set[int] | None = None) -> None:
     """Compare named-person centroids to unnamed clusters.
 
     Thresholds (all configurable in settings):
@@ -1566,14 +2026,35 @@ async def _phase_auto_merge() -> None:
         if not persons:
             return
 
-        clusters = await db.execute_fetchall("""
-            SELECT c.id AS cluster_id, c.member_count,
-                   MIN(f.id) AS representative_face_id
-            FROM clusters c
-            JOIN faces f ON f.cluster_id = c.id AND f.thumbnail_path IS NOT NULL
-            WHERE c.person_id IS NULL
-            GROUP BY c.id
-        """)
+        if media_ids:
+            placeholders = ",".join("?" * len(media_ids))
+            clusters = await db.execute_fetchall(
+                f"""
+                SELECT c.id AS cluster_id, c.member_count,
+                       MIN(f.id) AS representative_face_id
+                FROM clusters c
+                JOIN faces f ON f.cluster_id = c.id AND f.thumbnail_path IS NOT NULL
+                LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
+                LEFT JOIN persons owner ON owner.person_guid = cpc.person_guid
+                    AND owner.is_merged = 0 AND owner.is_ignored = 0
+                WHERE owner.id IS NULL
+                  AND f.media_file_id IN ({placeholders})
+                GROUP BY c.id
+                """,
+                tuple(sorted(media_ids)),
+            )
+        else:
+            clusters = await db.execute_fetchall("""
+                SELECT c.id AS cluster_id, c.member_count,
+                       MIN(f.id) AS representative_face_id
+                FROM clusters c
+                JOIN faces f ON f.cluster_id = c.id AND f.thumbnail_path IS NOT NULL
+                LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
+                LEFT JOIN persons owner ON owner.person_guid = cpc.person_guid
+                    AND owner.is_merged = 0 AND owner.is_ignored = 0
+                WHERE owner.id IS NULL
+                GROUP BY c.id
+            """)
         if not clusters:
             return
 
@@ -1597,7 +2078,10 @@ async def _phase_auto_merge() -> None:
                 emb_rows = await db.execute_fetchall("""
                     SELECT e.vector FROM embeddings e
                     JOIN faces f ON f.id = e.face_id
-                    WHERE f.person_id = ?
+                    JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                    JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                    JOIN persons p ON p.person_guid = cpc.person_guid
+                    WHERE p.id = ?
                 """, (pid,))
                 if not emb_rows:
                     continue
@@ -1614,7 +2098,10 @@ async def _phase_auto_merge() -> None:
             # Representative face thumbnail for the suggestion card
             rep_row = await (await db.execute("""
                 SELECT f.id FROM faces f
-                WHERE f.person_id = ? AND f.thumbnail_path IS NOT NULL
+                JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                JOIN persons p ON p.person_guid = cpc.person_guid
+                WHERE p.id = ? AND f.thumbnail_path IS NOT NULL
                 LIMIT 1
             """, (pid,))).fetchone()
             rep_face_id = rep_row["id"] if rep_row else None
@@ -1673,10 +2160,22 @@ async def _phase_auto_merge() -> None:
                     await db.execute(
                         "UPDATE faces SET person_id=? WHERE cluster_id=?", (pid, cid)
                     )
+                    await link_cluster_to_person(
+                        db,
+                        cluster_id=cid,
+                        person_id=pid,
+                        source="auto_merge_similarity",
+                        actor="pipeline.auto_merge",
+                    )
                     await db.execute("""
                         UPDATE persons
                         SET photo_count = (
-                            SELECT COUNT(DISTINCT media_file_id) FROM faces WHERE person_id = ?
+                            SELECT COUNT(DISTINCT f.media_file_id)
+                            FROM faces f
+                            JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                            JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                            JOIN persons p ON p.person_guid = cpc.person_guid
+                            WHERE p.id = ?
                         ) WHERE id = ?
                     """, (pid, pid))
                     await db.execute("""
@@ -1739,6 +2238,13 @@ async def _phase_auto_merge() -> None:
                     await db.execute(
                         "UPDATE faces SET person_id=? WHERE cluster_id=?",
                         (ip["person_id"], cid),
+                    )
+                    await link_cluster_to_person(
+                        db,
+                        cluster_id=cid,
+                        person_id=ip["person_id"],
+                        source="auto_ignore_similarity",
+                        actor="pipeline.auto_merge",
                     )
                     await update_person_centroid(db, ip["person_id"])
                 named_cluster_ids.add(cid)
@@ -1822,7 +2328,7 @@ async def _phase_build_cooccurrence() -> None:
 # ---------------------------------------------------------------------------
 # Phase 3c: Restore VIP person names from pre-import history
 # ---------------------------------------------------------------------------
-async def _phase_restore_vip_names() -> None:
+async def _phase_restore_vip_names(media_ids: set[int] | None = None) -> None:
     """
     Re-assign person names that VIP previously wrote to photo files.
 
@@ -1849,13 +2355,27 @@ async def _phase_restore_vip_names() -> None:
 
     async with get_db() as db:
         # Files ingested this run that have a VIP History snapshot
-        rows = await db.execute_fetchall("""
-            SELECT mf.id AS media_id, mf.external_exif
-            FROM media_files mf
-            WHERE mf.external_exif IS NOT NULL
-              AND mf.external_exif LIKE '%"identifier"%'
-              AND mf.ingest_state IN ('embedded', 'clustered')
-        """)
+        if media_ids:
+            placeholders = ",".join("?" * len(media_ids))
+            rows = await db.execute_fetchall(
+                f"""
+                SELECT mf.id AS media_id, mf.external_exif
+                FROM media_files mf
+                WHERE mf.external_exif IS NOT NULL
+                  AND mf.external_exif LIKE '%"identifier"%'
+                  AND mf.ingest_state IN ('embedded', 'clustered')
+                  AND mf.id IN ({placeholders})
+                """,
+                tuple(sorted(media_ids)),
+            )
+        else:
+            rows = await db.execute_fetchall("""
+                SELECT mf.id AS media_id, mf.external_exif
+                FROM media_files mf
+                WHERE mf.external_exif IS NOT NULL
+                  AND mf.external_exif LIKE '%"identifier"%'
+                  AND mf.ingest_state IN ('embedded', 'clustered')
+            """)
 
     restored = 0
 
@@ -1992,6 +2512,13 @@ async def _phase_restore_vip_names() -> None:
                         "UPDATE clusters SET person_id=? WHERE id=?",
                         (person_id, cluster_id)
                     )
+                    await link_cluster_to_person(
+                        db,
+                        cluster_id=cluster_id,
+                        person_id=person_id,
+                        source="vip_history_restore",
+                        actor="pipeline.restore_vip_names",
+                    )
                     # Assign all other faces in the same cluster too
                     await db.execute(
                         "UPDATE faces SET person_id=? WHERE cluster_id=? AND person_id IS NULL",
@@ -2022,18 +2549,178 @@ async def _phase_restore_vip_names() -> None:
             for pid in touched_person_ids:
                 await update_person_centroid(db, pid)
 
+    # ------------------------------------------------------------------
+    # Fallback for legacy files with PersonInImage but no MWG face regions.
+    #
+    # Some historical writes include only a photo-level person list and omit
+    # per-face region boxes. In that case, we cannot do geometric matching.
+    # We infer cluster->name links conservatively from repeated co-occurrence
+    # patterns across VIP-history photos and only assign high-confidence pairs.
+    # ------------------------------------------------------------------
+    if media_ids:
+        placeholders = ",".join("?" * len(media_ids))
+        history_rows_query = f"""
+            SELECT mf.id AS media_id, mf.external_exif
+            FROM media_files mf
+            WHERE mf.external_exif IS NOT NULL
+              AND mf.external_exif LIKE '%"identifier"%'
+              AND mf.external_exif LIKE '%"persons"%'
+              AND mf.ingest_state IN ('embedded', 'clustered', 'tagged')
+              AND mf.id IN ({placeholders})
+        """
+        history_rows_params = tuple(sorted(media_ids))
+    else:
+        history_rows_query = """
+            SELECT mf.id AS media_id, mf.external_exif
+            FROM media_files mf
+            WHERE mf.external_exif IS NOT NULL
+              AND mf.external_exif LIKE '%"identifier"%'
+              AND mf.external_exif LIKE '%"persons"%'
+              AND mf.ingest_state IN ('embedded', 'clustered', 'tagged')
+        """
+        history_rows_params: tuple[Any, ...] = ()
+
+    async with get_db() as db:
+        history_rows = await db.execute_fetchall(history_rows_query, history_rows_params)
+
+    media_persons: dict[int, list[str]] = {}
+    candidate_media_ids: set[int] = set()
+    for row in history_rows:
+        try:
+            ext = json.loads(row["external_exif"])
+        except Exception:
+            continue
+        if ext.get("region_info"):
+            continue
+        persons_list = [str(p).strip() for p in (ext.get("persons") or []) if str(p).strip()]
+        if not persons_list:
+            continue
+        media_id = int(row["media_id"])
+        media_persons[media_id] = persons_list
+        candidate_media_ids.add(media_id)
+
+    if candidate_media_ids:
+        placeholders = ",".join("?" * len(candidate_media_ids))
+        async with get_db() as db:
+            face_rows = await db.execute_fetchall(
+                f"""
+                SELECT media_file_id, cluster_id
+                FROM faces
+                WHERE person_id IS NULL
+                  AND cluster_id IS NOT NULL
+                  AND media_file_id IN ({placeholders})
+                """,
+                tuple(sorted(candidate_media_ids)),
+            )
+
+        media_clusters: dict[int, set[int]] = {}
+        cluster_media_count: dict[int, int] = {}
+        cluster_name_votes: dict[tuple[int, str], int] = {}
+
+        for r in face_rows:
+            media_id = int(r["media_file_id"])
+            cid = int(r["cluster_id"])
+            media_clusters.setdefault(media_id, set()).add(cid)
+
+        for media_id, clusters in media_clusters.items():
+            names = media_persons.get(media_id) or []
+            if not names:
+                continue
+            for cid in clusters:
+                cluster_media_count[cid] = cluster_media_count.get(cid, 0) + 1
+                for name in names:
+                    key = (cid, name)
+                    cluster_name_votes[key] = cluster_name_votes.get(key, 0) + 1
+
+        inferred: list[tuple[int, str]] = []
+        for cid, seen_media in cluster_media_count.items():
+            scored: list[tuple[str, int]] = []
+            for (vote_cid, name), votes in cluster_name_votes.items():
+                if vote_cid == cid:
+                    scored.append((name, votes))
+            if not scored:
+                continue
+            scored.sort(key=lambda x: x[1], reverse=True)
+            best_name, best_votes = scored[0]
+            second_votes = scored[1][1] if len(scored) > 1 else 0
+
+            # Conservative acceptance: enough evidence, clear winner, and
+            # appears in most photos where this cluster is seen.
+            if best_votes < 2:
+                continue
+            if best_votes < (second_votes + 2):
+                continue
+            if (best_votes / max(seen_media, 1)) < 0.6:
+                continue
+
+            inferred.append((cid, best_name))
+
+        if inferred:
+            touched_person_ids: set[int] = set()
+            async with get_db() as db:
+                for cid, person_name in inferred:
+                    person_row = await (await db.execute(
+                        "SELECT id FROM persons WHERE name=? AND is_merged=0 LIMIT 1",
+                        (person_name,),
+                    )).fetchone()
+                    if person_row:
+                        person_id = int(person_row["id"])
+                    else:
+                        cursor = await db.execute(
+                            """
+                            INSERT INTO persons (uuid, name, named_at)
+                            VALUES (?, ?, datetime('now'))
+                            """,
+                            (str(uuid.uuid4()), person_name),
+                        )
+                        person_id = int(cursor.lastrowid)
+
+                    await db.execute("UPDATE clusters SET person_id=? WHERE id=?", (person_id, cid))
+                    await link_cluster_to_person(
+                        db,
+                        cluster_id=cid,
+                        person_id=person_id,
+                        source="vip_history_inference",
+                        actor="pipeline.restore_vip_names",
+                    )
+                    await db.execute(
+                        "UPDATE faces SET person_id=? WHERE cluster_id=? AND person_id IS NULL",
+                        (person_id, cid),
+                    )
+                    await db.execute(
+                        """
+                        INSERT OR REPLACE INTO writeback_queue (media_file_id)
+                        SELECT DISTINCT media_file_id FROM faces WHERE cluster_id=?
+                        """,
+                        (cid,),
+                    )
+                    touched_person_ids.add(person_id)
+                    restored += 1
+
+                for pid in touched_person_ids:
+                    await update_person_centroid(db, pid)
+
+            logger.info(
+                "Phase 3c fallback: inferred %d cluster-name assignment(s) from PersonInImage history",
+                len(inferred),
+            )
+
     logger.info("Phase 3c complete: %d face name(s) restored from VIP History", restored)
 
 
 # ---------------------------------------------------------------------------
-# Phase 4: Tag — objects, animals, geography, places
+# Phase 4: Core tagging — objects, animals, geography, places, explicit
 # ---------------------------------------------------------------------------
-async def _phase_tag() -> None:
+async def _phase_tag(media_ids: set[int] | None = None) -> set[int]:
+    phase_started = time.perf_counter()
     concurrency = int(settings_store.get("tag_concurrency"))
+    scope = "all pending files" if not media_ids else f"{len(media_ids)} selected file(s)"
     logger.info(
-        "Phase 4: Tagging (objects, animals, geography, places) "
-        "[concurrency=%d, yolo_batch=%d]",
-        concurrency, _TAG_BATCH_SIZE,
+        "Phase 4: Core tagging (objects, animals, geography, places) "
+        "[scope=%s, concurrency=%d, yolo_batch=%d]",
+        scope,
+        concurrency,
+        _TAG_BATCH_SIZE,
     )
     await broadcast("phase_start", phase="tag")
 
@@ -2047,25 +2734,44 @@ async def _phase_tag() -> None:
     # avoiding redundant YOLO/CLIP inference on large libraries.
     # Use force_retag (via Rescan All) to re-run on the full library.
     async with get_db() as db:
-        rows = await db.execute_fetchall("""
-            SELECT id, file_path, gps_lat, gps_lon
-            FROM media_files
-            WHERE tags_done = 0
-              AND ingest_state IN ('embedded', 'clustered', 'tagged')
-              AND is_stub = 0
-        """)
+        if media_ids:
+            placeholders = ",".join("?" * len(media_ids))
+            rows = await db.execute_fetchall(
+                f"""
+                SELECT id, file_path, gps_lat, gps_lon
+                FROM media_files
+                WHERE tags_done = 0
+                  AND ingest_state IN ('embedded', 'clustered', 'tagged')
+                  AND is_stub = 0
+                  AND id IN ({placeholders})
+                """,
+                tuple(sorted(media_ids)),
+            )
+        else:
+            rows = await db.execute_fetchall("""
+                SELECT id, file_path, gps_lat, gps_lon
+                FROM media_files
+                WHERE tags_done = 0
+                  AND ingest_state IN ('embedded', 'clustered', 'tagged')
+                  AND is_stub = 0
+            """)
 
     total = len(rows)
     logger.info("Phase 4: %d files to tag", total)
     if total == 0:
         await broadcast("phase_complete", phase="tag", tagged=0)
-        return
+        return set()
 
     sem = asyncio.Semaphore(concurrency)
     _counter = [0]
+    _tagger_seconds = [0.0]
+    _batches = [0]
+    _processed_ids: set[int] = set()
 
     async def _process_batch(batch: list) -> None:
+        await _pause_point()
         async with sem:
+            await _pause_point()
             # Ensure previews exist for every image in the batch.
             preview_paths: list[Path] = []
             for row in batch:
@@ -2081,36 +2787,26 @@ async def _phase_tag() -> None:
             # One YOLO GPU forward pass for up to _TAG_BATCH_SIZE images,
             # followed by per-image scene / landmark / geo models.
             items = [(pp, gps[0], gps[1]) for pp, gps in zip(preview_paths, gps_data)]
+            _tagger_started = time.perf_counter()
             tag_results = await loop.run_in_executor(None, _tagger.tag_batch, items)
+            _tagger_seconds[0] += time.perf_counter() - _tagger_started
 
             # Batch-persist all tags and state transitions in one DB write.
             async with get_db() as db:
-                # Clear stale place tags before re-inserting so that a
-                # force_retag run doesn't leave old Nominatim labels alongside
-                # new MapKit-resolved labels (UNIQUE is on (file, category,
-                # label) so differing strings would both survive INSERT OR IGNORE).
+                # Clear all model-generated tag categories for this batch so
+                # re-runs truly reflect the latest model outputs.
                 if media_ids:
                     placeholders = ",".join("?" * len(media_ids))
                     await db.execute(
-                        f"DELETE FROM media_tags WHERE category='place' "
-                        f"AND media_file_id IN ({placeholders})",
-                        media_ids,
-                    )
-
-                # Clear stale explicit tags before re-inserting (same reason as place tags).
-                if media_ids:
-                    placeholders = ",".join("?" * len(media_ids))
-                    await db.execute(
-                        f"DELETE FROM media_tags WHERE category='explicit' "
+                        f"DELETE FROM media_tags "
+                        f"WHERE category IN ('object', 'animal', 'geography', 'place', 'explicit') "
                         f"AND media_file_id IN ({placeholders})",
                         media_ids,
                     )
 
                 tag_rows: list[tuple] = []
                 gps_resolved_ids: list[int] = []   # files that got a GPS-resolved place label
-                for media_id, result, (gps_lat, gps_lon) in zip(
-                    media_ids, tag_results, gps_data
-                ):
+                for media_id, result, (gps_lat, gps_lon) in zip(media_ids, tag_results, gps_data):
                     for label in result.objects:
                         tag_rows.append((media_id, "object", label, None, "yolov11"))
                     for label in result.animals:
@@ -2148,7 +2844,7 @@ async def _phase_tag() -> None:
                 # tags_done = 1 causes this file to be skipped on future
                 # pipeline runs (unless force_retag resets it).
                 await db.executemany(
-                    "UPDATE media_files SET ingest_state='tagged', tags_done=1 WHERE id=?",
+                    "UPDATE media_files SET ingest_state='tagged', tags_done=1, florence_done=0 WHERE id=?",
                     [(mid,) for mid in media_ids],
                 )
 
@@ -2158,14 +2854,188 @@ async def _phase_tag() -> None:
                     await delete_preview(pp)
 
             _counter[0] += len(batch)
+            _batches[0] += 1
+            _processed_ids.update(media_ids)
             await broadcast("tag_progress", done=_counter[0], total=total)
 
     # Chunk rows into YOLO-batch-sized groups and fan them out concurrently.
     batches = [rows[i : i + _TAG_BATCH_SIZE] for i in range(0, len(rows), _TAG_BATCH_SIZE)]
     await asyncio.gather(*[_process_batch(b) for b in batches])
 
+    wall_seconds = max(time.perf_counter() - phase_started, 0.001)
+    processed = max(_counter[0], 1)
+    wall_s_per_photo = wall_seconds / processed
+    tagger_s_per_photo = _tagger_seconds[0] / processed
+    logger.info(
+        "Phase 4 timing: wall=%.2fs (%.3fs/photo), batches=%d, "
+        "tagger=%.2fs total (%.3fs/photo)",
+        wall_seconds,
+        wall_s_per_photo,
+        _batches[0],
+        _tagger_seconds[0],
+        tagger_s_per_photo,
+    )
+
     await broadcast("phase_complete", phase="tag", tagged=_counter[0])
     logger.info("Phase 4 complete: %d files tagged", _counter[0])
+    return _processed_ids
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Florence enrichment — caption, OCR, region
+# ---------------------------------------------------------------------------
+async def _phase_florence(media_ids: set[int] | None = None) -> set[int]:
+    if not media_ids:
+        return set()
+
+    if not bool(int(settings_store.get("florence_enabled") or 0)):
+        logger.info("Phase 5: Florence disabled — skipping enrichment")
+        await broadcast("phase_complete", phase="florence", tagged=0)
+        return set()
+
+    phase_started = time.perf_counter()
+    scope = f"{len(media_ids)} selected file(s)"
+    florence_concurrency = max(
+        1,
+        min(int(settings_store.get("tag_concurrency")), int(settings_store.get("florence_concurrency") or 1)),
+    )
+    logger.info(
+        "Phase 5: Florence enrichment (caption/OCR/region) "
+        "[scope=%s, florence_concurrency=%d, batch=%d]",
+        scope,
+        florence_concurrency,
+        _TAG_BATCH_SIZE,
+    )
+    await broadcast("phase_start", phase="florence")
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _florence.load)
+    if not _florence.available:
+        logger.warning("Phase 5: Florence model unavailable — skipping enrichment")
+        await broadcast("phase_complete", phase="florence", tagged=0)
+        return set()
+
+    placeholders = ",".join("?" * len(media_ids))
+    async with get_db() as db:
+        rows = await db.execute_fetchall(
+            f"""
+            SELECT id, file_path
+            FROM media_files
+            WHERE is_stub = 0
+              AND ingest_state IN ('tagged')
+              AND id IN ({placeholders})
+            """,
+            tuple(sorted(media_ids)),
+        )
+
+    total = len(rows)
+    logger.info("Phase 5: %d files to enrich", total)
+    if total == 0:
+        await broadcast("phase_complete", phase="florence", tagged=0)
+        return set()
+
+    sem = asyncio.Semaphore(florence_concurrency)
+    _counter = [0]
+    _compute_seconds = [0.0]
+    _wait_seconds = [0.0]
+    _batches = [0]
+    _processed_ids: set[int] = set()
+
+    async def _process_batch(batch: list) -> None:
+        await _pause_point()
+        wait_started = time.perf_counter()
+        async with sem:
+            await _pause_point()
+            _wait_seconds[0] += time.perf_counter() - wait_started
+
+            preview_paths: list[Path] = []
+            batch_media_ids = [row["id"] for row in batch]
+            for row in batch:
+                path = Path(row["file_path"])
+                pp = settings.preview_dir / f"{path.stem}_{_hash_path(path)}.jpg"
+                if not pp.exists():
+                    pp = await extract_preview(path) or pp
+                preview_paths.append(pp)
+
+            compute_started = time.perf_counter()
+            florence_results = await loop.run_in_executor(None, _florence.analyze_batch, preview_paths)
+            _compute_seconds[0] += time.perf_counter() - compute_started
+
+            async with get_db() as db:
+                if batch_media_ids:
+                    ph = ",".join("?" * len(batch_media_ids))
+                    await db.execute(
+                        f"DELETE FROM media_tags "
+                        f"WHERE category IN ('caption', 'ocr', 'region') "
+                        f"AND media_file_id IN ({ph})",
+                        batch_media_ids,
+                    )
+
+                tag_rows: list[tuple] = []
+                changed_ids: list[int] = []
+                for media_id, florence_result in zip(batch_media_ids, florence_results):
+                    before = len(tag_rows)
+                    if florence_result is not None:
+                        if florence_result.caption:
+                            tag_rows.append((media_id, "caption", florence_result.caption, None, "florence2"))
+                        for line in florence_result.ocr_lines:
+                            tag_rows.append((media_id, "ocr", line, None, "florence2"))
+                        for region in florence_result.region_descriptions:
+                            tag_rows.append((media_id, "region", region, None, "florence2"))
+                    if len(tag_rows) > before:
+                        changed_ids.append(media_id)
+
+                if tag_rows:
+                    await db.executemany(
+                        """
+                        INSERT OR IGNORE INTO media_tags
+                            (media_file_id, category, label, confidence, model)
+                        VALUES (?,?,?,?,?)
+                        """,
+                        tag_rows,
+                    )
+
+                if changed_ids:
+                    await db.executemany(
+                        "INSERT OR REPLACE INTO writeback_queue (media_file_id) VALUES (?)",
+                        [(mid,) for mid in changed_ids],
+                    )
+
+                await db.executemany(
+                    "UPDATE media_files SET florence_done=1 WHERE id=?",
+                    [(mid,) for mid in batch_media_ids],
+                )
+
+            for pp in preview_paths:
+                if pp.exists():
+                    await delete_preview(pp)
+
+            _counter[0] += len(batch)
+            _batches[0] += 1
+            _processed_ids.update(batch_media_ids)
+            await broadcast("florence_progress", done=_counter[0], total=total)
+
+    batches = [rows[i : i + _TAG_BATCH_SIZE] for i in range(0, len(rows), _TAG_BATCH_SIZE)]
+    await asyncio.gather(*[_process_batch(b) for b in batches])
+
+    wall_seconds = max(time.perf_counter() - phase_started, 0.001)
+    processed = max(_counter[0], 1)
+    logger.info(
+        "Phase 5 timing: wall=%.2fs (%.3fs/photo), batches=%d, "
+        "florence_compute=%.2fs total (%.3fs/photo), "
+        "florence_wait=%.2fs total (%.3fs/photo)",
+        wall_seconds,
+        wall_seconds / processed,
+        _batches[0],
+        _compute_seconds[0],
+        _compute_seconds[0] / processed,
+        _wait_seconds[0],
+        _wait_seconds[0] / processed,
+    )
+
+    await broadcast("phase_complete", phase="florence", tagged=_counter[0])
+    logger.info("Phase 5 complete: %d files enriched", _counter[0])
+    return _processed_ids
 
 
 def _encode_clip_photo_embedding(preview_path: Path, landmark) -> np.ndarray | None:
@@ -2292,7 +3162,7 @@ def _hash_path(path: Path) -> str:
 # ---------------------------------------------------------------------------
 # Phase 5: Build analysis documents (Rekognition-format JSON per photo)
 # ---------------------------------------------------------------------------
-async def _phase_analyse() -> None:
+async def _phase_analyse(media_ids: set[int] | None = None) -> None:
     logger.info("Phase 5: Building analysis documents")
     await broadcast("phase_start", phase="analyse")
 
@@ -2303,14 +3173,29 @@ async def _phase_analyse() -> None:
     # All tagged files that either have no analysis doc yet, or whose
     # model_version has changed (i.e. models were upgraded).
     async with get_db() as db:
-        rows = await db.execute_fetchall("""
-            SELECT mf.id
-            FROM media_files mf
-            LEFT JOIN photo_analysis pa ON pa.media_file_id = mf.id
-            WHERE mf.ingest_state = 'tagged'
-              AND mf.is_stub = 0
-              AND (pa.id IS NULL OR pa.model_version != ?)
-        """, (MODEL_VERSION,))
+        if media_ids:
+            placeholders = ",".join("?" * len(media_ids))
+            rows = await db.execute_fetchall(
+                f"""
+                SELECT mf.id
+                FROM media_files mf
+                LEFT JOIN photo_analysis pa ON pa.media_file_id = mf.id
+                WHERE mf.ingest_state = 'tagged'
+                  AND mf.is_stub = 0
+                  AND (pa.id IS NULL OR pa.model_version != ?)
+                  AND mf.id IN ({placeholders})
+                """,
+                                (MODEL_VERSION, *sorted(media_ids)),
+            )
+        else:
+            rows = await db.execute_fetchall("""
+                SELECT mf.id
+                FROM media_files mf
+                LEFT JOIN photo_analysis pa ON pa.media_file_id = mf.id
+                WHERE mf.ingest_state = 'tagged'
+                  AND mf.is_stub = 0
+                  AND (pa.id IS NULL OR pa.model_version != ?)
+            """, (MODEL_VERSION,))
 
     total = len(rows)
     logger.info("Phase 5: %d files need analysis docs", total)

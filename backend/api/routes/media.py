@@ -182,7 +182,7 @@ async def list_media(
 # ---------------------------------------------------------------------------
 
 @router.get("/quality")
-async def quality_issues(issue: str = Query("all", regex="^(blurry|closed_eyes|all)$")):
+async def quality_issues(issue: str = Query("all", pattern="^(blurry|closed_eyes|all)$")):
     """Return media files flagged with quality issues.
 
     issue: 'blurry' | 'closed_eyes' | 'all'
@@ -263,7 +263,15 @@ async def remove_from_app(body: RemoveFromAppRequest):
             f"UPDATE media_files SET removed_from_app=1 WHERE id IN ({placeholders})",
             body.media_ids,
         )
-    return {"status": "ok", "removed": result.rowcount}
+        queue_result = await db.execute(
+            f"DELETE FROM writeback_queue WHERE media_file_id IN ({placeholders})",
+            body.media_ids,
+        )
+    return {
+        "status": "ok",
+        "removed": result.rowcount,
+        "writeback_rows_deleted": queue_result.rowcount,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +295,14 @@ async def bulk_delete(body: BulkDeleteRequest):
         for media_id in body.media_ids:
             # Collect person_ids before deletion so we can refresh their centroids
             person_rows = await db.execute_fetchall(
-                "SELECT DISTINCT person_id FROM faces WHERE media_file_id=? AND person_id IS NOT NULL",
+                """
+                SELECT DISTINCT p.id AS person_id
+                FROM faces f
+                JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                JOIN persons p ON p.person_guid = cpc.person_guid
+                WHERE f.media_file_id=?
+                """,
                 (media_id,),
             )
             for pr in person_rows:
@@ -373,6 +388,8 @@ async def serve_photo_thumbnail(media_id: int):
     if not path.exists():
         raise HTTPException(status_code=404, detail="File not on disk — may be offloaded to iCloud.")
 
+    from PIL import UnidentifiedImageError
+
     from backend.scanner.preview_extractor import extract_preview, delete_preview
 
     preview = await extract_preview(path)
@@ -381,7 +398,15 @@ async def serve_photo_thumbnail(media_id: int):
 
     try:
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _make_thumbnail_sync, preview, thumb)
+        try:
+            await loop.run_in_executor(None, _make_thumbnail_sync, preview, thumb)
+        except UnidentifiedImageError:
+            # A stale/corrupt preview can linger from an interrupted pipeline run.
+            preview.unlink(missing_ok=True)
+            preview = await extract_preview(path)
+            if preview is None:
+                raise HTTPException(status_code=500, detail="Preview regeneration failed.")
+            await loop.run_in_executor(None, _make_thumbnail_sync, preview, thumb)
     finally:
         await delete_preview(preview)
 

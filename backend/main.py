@@ -2,11 +2,146 @@
 VIP — FastAPI application entry point.
 """
 
+import asyncio
+import importlib.metadata
 import logging
 import logging.handlers
+import os
+import re
+import subprocess
+import sys
+import time
 import warnings
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+try:
+    from packaging.requirements import Requirement
+    from packaging.version import Version
+except ModuleNotFoundError:  # pragma: no cover
+    Requirement = None  # type: ignore[assignment]
+    Version = None  # type: ignore[assignment]
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_REQUIREMENTS_PATH = _REPO_ROOT / "requirements.txt"
+_BOOTSTRAP_LOCK_PATH = _REPO_ROOT / ".vip-deps-bootstrap.lock"
+
+
+def _read_unsatisfied_requirements() -> list[str]:
+    if not _REQUIREMENTS_PATH.exists():
+        return []
+
+    # Fallback path for environments that don't yet have the "packaging" module.
+    # We still detect missing top-level packages so bootstrap can recover.
+    if Requirement is None or Version is None:
+        unsatisfied: list[str] = []
+        for raw_line in _REQUIREMENTS_PATH.read_text(encoding="utf-8").splitlines():
+            requirement = raw_line.split("#", 1)[0].strip()
+            if not requirement:
+                continue
+            name = re.split(r"[<>=!~;\[]", requirement, maxsplit=1)[0].strip()
+            if not name:
+                continue
+            try:
+                importlib.metadata.version(name)
+            except importlib.metadata.PackageNotFoundError:
+                unsatisfied.append(name)
+        return unsatisfied
+
+    unsatisfied: list[str] = []
+    for raw_line in _REQUIREMENTS_PATH.read_text(encoding="utf-8").splitlines():
+        requirement = raw_line.split("#", 1)[0].strip()
+        if not requirement:
+            continue
+
+        try:
+            req = Requirement(requirement)
+        except Exception:
+            continue
+
+        if req.marker is not None and not req.marker.evaluate():
+            continue
+
+        try:
+            installed_version = importlib.metadata.version(req.name)
+        except importlib.metadata.PackageNotFoundError:
+            unsatisfied.append(requirement)
+            continue
+
+        if req.specifier and Version(installed_version) not in req.specifier:
+            unsatisfied.append(requirement)
+
+    return unsatisfied
+
+
+def _wait_for_bootstrap_lock(timeout_sec: float = 300.0) -> bool:
+    deadline = time.monotonic() + timeout_sec
+    while _BOOTSTRAP_LOCK_PATH.exists():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
+    return True
+
+
+def _bootstrap_missing_python_dependencies() -> None:
+    if os.environ.get("VIP_AUTO_INSTALL_DEPS", "1").strip().lower() in {"0", "false", "no"}:
+        return
+
+    if not _wait_for_bootstrap_lock():
+        print("VIP dependency bootstrap lock timed out; continuing without auto-install.", flush=True)
+        return
+
+    unsatisfied = _read_unsatisfied_requirements()
+    if not unsatisfied:
+        return
+
+    lock_fd: int | None = None
+    try:
+        lock_fd = os.open(_BOOTSTRAP_LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        if _wait_for_bootstrap_lock():
+            return
+        print("VIP dependency bootstrap lock timed out; continuing without auto-install.", flush=True)
+        return
+
+    try:
+        print(
+            "VIP startup: installing/updating Python dependencies: " + ", ".join(unsatisfied),
+            flush=True,
+        )
+        env = dict(os.environ)
+        env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", *unsatisfied],
+            cwd=str(_REPO_ROOT),
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            print(result.stdout, end="", flush=True)
+            print(result.stderr, end="", flush=True)
+            raise RuntimeError("Automatic dependency install failed during startup")
+        if result.stdout.strip():
+            print(result.stdout, end="" if result.stdout.endswith("\n") else "\n", flush=True)
+        if result.stderr.strip():
+            print(result.stderr, end="" if result.stderr.endswith("\n") else "\n", flush=True)
+        print("VIP startup: dependency bootstrap complete.", flush=True)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        try:
+            _BOOTSTRAP_LOCK_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+_bootstrap_missing_python_dependencies()
+
+# Avoid HuggingFace tokenizers fork-parallelism warning/noise under dev reload
+# and child-process startup; this keeps behavior deterministic and safe.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,7 +151,9 @@ from backend.config import settings, ensure_dirs
 from backend.database.db import init_db
 from backend.api.routes import media, persons, faces, search, pipeline, writeback, admin, tags, analysis, settings as settings_route, folders, remote, chat, profiles
 from backend.api.websocket import router as ws_router
-from backend.profiles import bootstrap_profiles, get_active_profile, get_profile, reset_current_profile, set_current_profile
+from backend.pipeline.suggestion_worker import run_quality_suggestion_worker
+from backend.profiles import bootstrap_profiles, get_active_profile, get_profile, reset_current_profile, run_in_profile, set_current_profile
+from backend.runtime.activity import mark_user_activity
 
 
 def _patch_insightface_skimage() -> None:
@@ -155,11 +292,44 @@ _patch_insightface_skimage()
 _patch_pillow_limits()
 
 
+async def _warm_start_models(profile_id: str) -> None:
+    """Prefetch downloadable model assets in the background on app startup."""
+    from backend.profiles import run_in_profile
+
+    async def _run() -> None:
+        from backend.database.settings_store import get as get_setting, load_cache
+        from backend.pipeline.ingest import _detector, _florence, _tagger
+
+        await load_cache()
+        loop = asyncio.get_running_loop()
+
+        logger = logging.getLogger(__name__)
+        logger.info("Startup warm-up: checking local model availability")
+
+        # Face detection/embedding is a core path, so warm it regardless of tag toggles.
+        await loop.run_in_executor(None, _detector.load)
+
+        # Secondary tagging models honor the per-profile module toggles.
+        await loop.run_in_executor(None, _tagger.load)
+
+        if bool(int(get_setting("florence_enabled") or 0)):
+            await loop.run_in_executor(None, _florence.load)
+
+        logger.info("Startup warm-up complete")
+
+    try:
+        await run_in_profile(profile_id, _run)
+    except Exception:
+        logging.getLogger(__name__).exception("Startup model warm-up failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown logic."""
     active_profile = bootstrap_profiles()
     token = set_current_profile(active_profile.id)
+    warmup_task: asyncio.Task[None] | None = None
+    suggestion_worker_task: asyncio.Task[None] | None = None
     try:
         ensure_dirs()
         await init_db()
@@ -167,10 +337,18 @@ async def lifespan(app: FastAPI):
 
         await load_cache()
         apply_log_level(int(_get_setting('log_level')))
+        warmup_task = asyncio.create_task(_warm_start_models(active_profile.id))
+        suggestion_worker_task = asyncio.create_task(
+            run_in_profile(active_profile.id, run_quality_suggestion_worker)
+        )
     finally:
         reset_current_profile(token)
     yield
     # Cleanup on shutdown (none required currently)
+    if warmup_task is not None and not warmup_task.done():
+        warmup_task.cancel()
+    if suggestion_worker_task is not None and not suggestion_worker_task.done():
+        suggestion_worker_task.cancel()
 
 
 app = FastAPI(
@@ -202,6 +380,7 @@ app.add_middleware(
 
 @app.middleware("http")
 async def profile_context_middleware(request: Request, call_next):
+    mark_user_activity()
     requested_profile_id = request.headers.get("X-VIP-Profile")
     profile = get_profile(requested_profile_id) if requested_profile_id else get_active_profile()
     if requested_profile_id and profile is None:

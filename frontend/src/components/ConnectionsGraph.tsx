@@ -649,6 +649,12 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
   const [galleryLoading,  setGalleryLoading]  = useState(false)
   const [gallerySelected, setGallerySelected] = useState<MediaFile | null>(null)
 
+  // Edge shared-photo gallery
+  const [edgeGallery,         setEdgeGallery]         = useState<{ nodeA: SimNode; nodeB: SimNode; weight: number } | null>(null)
+  const [edgeGalleryPhotos,   setEdgeGalleryPhotos]   = useState<MediaFile[]>([])
+  const [edgeGalleryLoading,  setEdgeGalleryLoading]  = useState(false)
+  const [edgeGallerySelected, setEdgeGallerySelected] = useState<MediaFile | null>(null)
+
   async function openClusterGallery(clusterId: number, label: string) {
     setEditingNode(null)
     setClusterGallery({ id: clusterId, label })
@@ -658,6 +664,19 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
       setGalleryPhotos(photos)
     } finally {
       setGalleryLoading(false)
+    }
+  }
+
+  async function openEdgeGallery(nodeA: SimNode, nodeB: SimNode, weight: number) {
+    setEditingNode(null)
+    setEdgeGallery({ nodeA, nodeB, weight })
+    setEdgeGalleryLoading(true)
+    setEdgeGalleryPhotos([])
+    try {
+      const photos = await api.persons.sharedMedia(nodeA.type, nodeA.raw_id, nodeB.type, nodeB.raw_id, 200)
+      setEdgeGalleryPhotos(photos)
+    } finally {
+      setEdgeGalleryLoading(false)
     }
   }
 
@@ -859,13 +878,29 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
                 if (!a || !b) return null
                 const frac = edge.weight / maxWeight
                 return (
-                  <line key={`${edge.source}--${edge.target}`}
-                    x1={a.x} y1={a.y} x2={b.x} y2={b.y}
-                    stroke="#6366f1"
-                    strokeWidth={0.8 + frac * 3.5}
-                    strokeOpacity={0.12 + frac * 0.58}
-                    pointerEvents="none"
-                  />
+                  <g
+                    key={`${edge.source}--${edge.target}`}
+                    style={{ cursor: 'pointer' }}
+                    onClick={(e) => {
+                      if (dragRef.current.moved) return
+                      e.stopPropagation()
+                      openEdgeGallery(a, b, edge.weight)
+                    }}
+                  >
+                    {/* Wide transparent hit area */}
+                    <line
+                      x1={a.x} y1={a.y} x2={b.x} y2={b.y}
+                      stroke="transparent" strokeWidth={14}
+                    />
+                    {/* Visible edge */}
+                    <line
+                      x1={a.x} y1={a.y} x2={b.x} y2={b.y}
+                      stroke="#6366f1"
+                      strokeWidth={0.8 + frac * 3.5}
+                      strokeOpacity={0.12 + frac * 0.58}
+                      pointerEvents="none"
+                    />
+                  </g>
                 )
               })}
 
@@ -1122,6 +1157,74 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
           />
         )}
 
+        {/* Edge shared-photo gallery overlay */}
+        {edgeGallery && (
+          <div className="absolute inset-0 z-30 flex flex-col bg-gray-950/95 backdrop-blur-sm">
+            <div className="flex items-center justify-between px-5 py-3 border-b border-gray-800 shrink-0">
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => setEdgeGallery(null)}
+                  className="text-gray-500 hover:text-gray-200 transition-colors text-sm"
+                >
+                  ← Back
+                </button>
+                <span className="text-gray-500 text-xs">·</span>
+                <span className="text-white text-sm font-medium">
+                  {edgeGallery.nodeA.name ?? 'Unnamed face'} &amp; {edgeGallery.nodeB.name ?? 'Unnamed face'}
+                </span>
+                {!edgeGalleryLoading && (
+                  <span className="text-gray-500 text-xs">
+                    ({edgeGalleryPhotos.length} shared photo{edgeGalleryPhotos.length !== 1 ? 's' : ''})
+                  </span>
+                )}
+              </div>
+              <button
+                onClick={() => setEdgeGallery(null)}
+                className="text-gray-600 hover:text-white transition-colors text-xl leading-none"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-5">
+              {edgeGalleryLoading && (
+                <div className="flex items-center justify-center h-full">
+                  <div className="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin" />
+                </div>
+              )}
+              {!edgeGalleryLoading && edgeGalleryPhotos.length === 0 && (
+                <p className="text-gray-500 text-sm text-center mt-12">No shared photos found.</p>
+              )}
+              {!edgeGalleryLoading && edgeGalleryPhotos.length > 0 && (
+                <div className="grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-3">
+                  {edgeGalleryPhotos.map(photo => (
+                    <div
+                      key={photo.id}
+                      onClick={() => setEdgeGallerySelected(photo)}
+                      className="aspect-square rounded-xl overflow-hidden bg-gray-900 border border-gray-800 hover:border-indigo-500 transition-colors cursor-pointer"
+                    >
+                      <img
+                        src={api.media.thumbnailUrl(photo.id)}
+                        alt={photo.file_path.split('/').pop()}
+                        className="w-full h-full object-cover"
+                        loading="lazy"
+                      />
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* PhotoDetail for edge gallery selection */}
+        {edgeGallerySelected && (
+          <PhotoDetail
+            mediaId={edgeGallerySelected.id}
+            filePath={edgeGallerySelected.file_path}
+            onClose={() => setEdgeGallerySelected(null)}
+          />
+        )}
+
         {/* Stats panel — bottom-left */}
         {graph && graph.nodes.length > 1 && (
           <div className="absolute bottom-4 left-4 z-10 bg-gray-950/85 border border-gray-800 rounded-xl px-4 py-3 backdrop-blur-sm pointer-events-none">
@@ -1145,6 +1248,7 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
               Scroll · zoom &nbsp;|&nbsp; Drag canvas · pan<br />
               Drag node · reposition<br />
               Click named node · explore<br />
+              Click edge · shared photos<br />
               ✎ Hover · name/rename
             </p>
           </div>
@@ -1182,6 +1286,8 @@ export default function ConnectionsGraph({ personId, personName, onClose, onNavi
           </span>
           <span className="text-gray-800 text-xs">·</span>
           <span className="text-gray-700 text-xs">Edge thickness = shared photos</span>
+          <span className="text-gray-800 text-xs">·</span>
+          <span className="text-gray-700 text-xs">Click edge = shared photos</span>
         </div>
         <span className="text-gray-700 text-xs">
           Depth {depthLevel}/4 · {visibleSimNodes.length - 1} connection{visibleSimNodes.length !== 2 ? 's' : ''} visible

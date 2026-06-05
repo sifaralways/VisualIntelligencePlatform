@@ -20,6 +20,7 @@ class AssistantV2Orchestrator:
         "show_photos_of_people",
         "count_photos_of_people",
         "natural_search",
+        "retrieval_broker",
         "sql_agent",
         "legacy_assistant",
         "list_people_with_person_in_location",
@@ -124,6 +125,8 @@ class AssistantV2Orchestrator:
             return None
 
         wants_photos = bool(re.search(r"\b(show|open|load|find|search|photos?|images?)\b", lowered))
+        if wants_photos and "retrieval_broker" not in used_tools:
+            return "retrieval_broker", {"message": message}, "fallback:no_results_to_retrieval_broker"
         if wants_photos and "natural_search" not in used_tools:
             return "natural_search", {"query": message}, "fallback:no_results_to_natural_search"
 
@@ -209,7 +212,7 @@ class AssistantV2Orchestrator:
             return "sql_agent", {"message": message}
 
         if re.search(r"\b(find|search|show|open|photos?|images?)\b", lowered):
-            return "natural_search", {"query": message}
+            return "retrieval_broker", {"message": message}
 
         # Compatibility-first default while V2 tool coverage grows.
         return "legacy_assistant", {"message": message}

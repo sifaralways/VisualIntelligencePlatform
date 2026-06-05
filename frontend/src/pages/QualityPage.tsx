@@ -127,6 +127,7 @@ export default function QualityPage() {
                 <div
                   key={item.id}
                   onClick={() => toggleSelect(item.id)}
+                  title={item.file_path}
                   className={`relative rounded-xl overflow-hidden cursor-pointer border-2 transition-all ${
                     isSelected
                       ? 'border-indigo-500 ring-2 ring-indigo-500/40'

@@ -21,6 +21,9 @@ open-clip-torch        # OpenCLIP (landmark CLIP fallback) + BioCLIP (species)
 nudenet>=3.4           # Explicit content detection (ONNX, fully offline)
 timm>=0.9              # GLDv2 EfficientNet-B4 landmark recogniser (primary)
 huggingface_hub>=0.20  # Auto-download GLDv2 weights from HuggingFace Hub
+transformers==4.46.3   # Florence-2 compatible; newer 4.57.x breaks with _supports_sdpa on remote Florence code
+sentencepiece>=0.2     # Tokenizer/runtime support for Hugging Face multimodal processors
+einops>=0.8            # Florence-2 / transformers vision blocks require einops at runtime
 
 # Geo
 geopy                  # Reverse geocoding via Nominatim/OSM
@@ -34,6 +37,7 @@ fastapi
 uvicorn[standard]
 pydantic
 pydantic-settings
+packaging
 python-multipart
 httpx
 

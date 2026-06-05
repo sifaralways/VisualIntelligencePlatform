@@ -391,7 +391,10 @@ export default function PhotoDetail({
 
           {/* Header */}
           <div className="flex items-start justify-between gap-2 p-5 pb-3">
-            <p className="text-sm font-medium text-white truncate">{filename}</p>
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-white truncate">{filename}</p>
+              <p className="mt-1 text-[11px] text-gray-500 break-all leading-snug">{filePath}</p>
+            </div>
             <button
               onClick={onClose}
               className="shrink-0 text-gray-400 hover:text-white text-lg leading-none"
@@ -643,6 +646,39 @@ export default function PhotoDetail({
                             <TagChips labels={tags.place} colour="bg-pink-800/60 text-pink-200" />
                           </Section>
                         )}
+                        {tags.caption && tags.caption.length > 0 && (
+                          <Section title="Description" icon="📝">
+                            <div className="space-y-2">
+                              {tags.caption.map((text, idx) => (
+                                <p
+                                  key={`${text}-${idx}`}
+                                  className="text-xs leading-5 text-gray-200 bg-slate-800/70 border border-slate-700 rounded-lg px-3 py-2"
+                                >
+                                  {text}
+                                </p>
+                              ))}
+                            </div>
+                          </Section>
+                        )}
+                        {tags.ocr && tags.ocr.length > 0 && (
+                          <Section title="Text in Image" icon="🔤">
+                            <TagChips labels={tags.ocr} colour="bg-cyan-900/50 text-cyan-200" />
+                          </Section>
+                        )}
+                        {tags.region && tags.region.length > 0 && (
+                          <Section title="Other Observations" icon="🔎">
+                            <div className="space-y-2">
+                              {tags.region.map((text, idx) => (
+                                <p
+                                  key={`${text}-${idx}`}
+                                  className="text-xs leading-5 text-gray-200 bg-gray-800/70 border border-gray-700 rounded-lg px-3 py-2"
+                                >
+                                  {text}
+                                </p>
+                              ))}
+                            </div>
+                          </Section>
+                        )}
                         {tags.explicit && tags.explicit.length > 0 && (
                           <Section title="Explicit Content" icon="🔞">
                             <TagChips
@@ -669,11 +705,11 @@ export default function PhotoDetail({
                         disabled={reprocessing}
                         className="w-full text-xs px-3 py-2 rounded-lg border border-gray-700 bg-gray-800 text-gray-400 hover:text-white hover:border-indigo-500 hover:bg-indigo-900/20 transition-colors disabled:opacity-40"
                       >
-                        {reprocessing ? '⟳ Queued — re-detecting faces…' : reprocessDone ? '✓ Queued — check People page shortly' : '⟳ Reprocess this photo'}
+                        {reprocessing ? '⟳ Queued — re-running models…' : reprocessDone ? '✓ Queued — check progress in Pipeline' : '⟳ Reprocess this photo'}
                       </button>
                       {reprocessDone && (
                         <p className="text-xs text-gray-600 text-center mt-1">
-                          Face detection is running in the background.
+                          Full model reprocess is running in the background.
                         </p>
                       )}
                     </div>

@@ -63,6 +63,7 @@ class Settings(BaseSettings):
     api_port: int = 7474
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "qwen2.5-coder:14b"
+    assistant_planner_model: str = "qwen3:14b"
 
     # -------------------------------------------------------------------------
     # Supported formats (RAW + direct image formats)
@@ -196,6 +197,9 @@ class Settings(BaseSettings):
     landmark_threshold: float = 0.28     # CLIP cosine-sim / GLDv2 softmax probability
     species_threshold: float = 0.30      # BioCLIP minimum cosine similarity for species
     places365_top_k: int = 5             # Places365 top-k scenes to evaluate
+    florence_enabled: bool = False
+    florence_model: str = "microsoft/Florence-2-large"
+    hybrid_retrieval_candidate_limit: int = 120
 
     class Config:
         env_prefix = "VIP_"   # override any setting with VIP_API_PORT=8080 etc.

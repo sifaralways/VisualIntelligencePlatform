@@ -15,6 +15,9 @@ fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 
+# Suppress HuggingFace tokenizers fork warning under uvicorn --reload.
+export TOKENIZERS_PARALLELISM=false
+
 echo ""
 echo "╔══════════════════════════════════════════╗"
 echo "║   VIP — Starting                         ║"
@@ -35,15 +38,20 @@ BACKEND_PID=$!
 (cd frontend && npm run dev) &
 FRONTEND_PID=$!
 
-# Trap Ctrl+C — kill both
+# Trap Ctrl+C / termination — kill both
 cleanup() {
   echo ""
   echo "Stopping VIP..."
   kill "$BACKEND_PID" 2>/dev/null || true
   kill "$FRONTEND_PID" 2>/dev/null || true
+  wait "$BACKEND_PID" 2>/dev/null || true
+  wait "$FRONTEND_PID" 2>/dev/null || true
   echo "Stopped."
 }
 trap cleanup INT TERM
 
 # Wait for either process to exit
-wait "$BACKEND_PID" "$FRONTEND_PID"
+wait -n "$BACKEND_PID" "$FRONTEND_PID"
+EXIT_CODE=$?
+cleanup
+exit "$EXIT_CODE"

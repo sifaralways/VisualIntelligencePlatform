@@ -1,11 +1,11 @@
 """
-VIP Scanner — SHA-256 file hashing and idempotency checks.
+VIP Scanner — SHA-256 hashing and idempotency checks.
 
 Rules:
-  - SHA-256 of file content is the true identity of a file (not its path)
-  - If hash exists in DB → skip (already processed)
-  - If path changed but hash exists → update path, do not reprocess
-  - Large files: stream in 8MB chunks to avoid loading full CR3 into RAM
+    - Prefer stable in-file identifier (XMP:Identifier) when available.
+    - Fall back to SHA-256 content hash for non-identified files.
+    - If path changed, update path without creating a new DB row.
+    - Large files: stream in 8MB chunks to avoid loading full CR3 into RAM.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ async def check_idempotency(
     db: aiosqlite.Connection,
     file_hash: str,
     file_path: str,
+    stable_identifier: str | None = None,
 ) -> tuple[bool, int | None]:
     """
     Check whether this file has already been processed.
@@ -48,19 +49,54 @@ async def check_idempotency(
         skip=False → new file, needs ingest
         media_file_id → existing DB id if skip=True (for path update), else None
     """
-    row = await (
-        await db.execute(
-            "SELECT id, file_path, needs_reprocess, removed_from_app FROM media_files WHERE file_hash = ?",
-            (file_hash,),
-        )
-    ).fetchone()
+    row = None
+
+    # 1) Strongest match: stable identifier written by VIP into XMP:Identifier.
+    if stable_identifier:
+        row = await (
+            await db.execute(
+                """
+                SELECT id, file_path, file_hash, needs_reprocess, removed_from_app
+                FROM media_files
+                WHERE asset_id = ? OR vip_id = ?
+                ORDER BY CASE WHEN asset_id = ? THEN 0 ELSE 1 END
+                LIMIT 1
+                """,
+                (stable_identifier, stable_identifier, stable_identifier),
+            )
+        ).fetchone()
+
+    # 2) Fallback: content hash.
+    if row is None:
+        row = await (
+            await db.execute(
+                "SELECT id, file_path, file_hash, needs_reprocess, removed_from_app FROM media_files WHERE file_hash = ?",
+                (file_hash,),
+            )
+        ).fetchone()
+
+    # 3) Path fallback: protects against duplicate-row creation when metadata
+    # writes changed file bytes but the file has no XMP identifier yet.
+    if row is None:
+        row = await (
+            await db.execute(
+                """
+                SELECT id, file_path, file_hash, needs_reprocess, removed_from_app
+                FROM media_files
+                WHERE file_path = ?
+                ORDER BY removed_from_app ASC
+                LIMIT 1
+                """,
+                (file_path,),
+            )
+        ).fetchone()
 
     if row is None:
         # New file — not seen before
         return False, None
 
-    existing_id, existing_path, needs_reprocess, removed = (
-        row["id"], row["file_path"], row["needs_reprocess"], row["removed_from_app"]
+    existing_id, existing_path, existing_hash, needs_reprocess, removed = (
+        row["id"], row["file_path"], row["file_hash"], row["needs_reprocess"], row["removed_from_app"]
     )
 
     if needs_reprocess or removed:
@@ -72,14 +108,44 @@ async def check_idempotency(
             logger.debug("Reprocess requested: %s (id=%d)", file_path, existing_id)
         return False, existing_id
 
-    # Already processed — update path if it moved.
+    # Already processed — update path/hash if needed.
     # Normalise both sides to NFC so that a path written on HFS+ (NFD) is not
     # mistakenly reported as moved when the same file is re-scanned over SMB (NFC).
-    if unicodedata.normalize("NFC", existing_path) != unicodedata.normalize("NFC", file_path):
-        logger.info("File moved: %s → %s (id=%d)", existing_path, file_path, existing_id)
-        await db.execute(
-            "UPDATE media_files SET file_path = ?, last_seen_at = datetime('now') WHERE id = ?",
-            (file_path, existing_id),
-        )
+    path_changed = unicodedata.normalize("NFC", existing_path) != unicodedata.normalize("NFC", file_path)
+    hash_changed = existing_hash != file_hash
+
+    if path_changed or hash_changed:
+        if path_changed:
+            logger.info("File moved: %s → %s (id=%d)", existing_path, file_path, existing_id)
+        if hash_changed:
+            logger.info("File content hash changed for existing asset id=%d", existing_id)
+        try:
+            await db.execute(
+                "UPDATE media_files SET file_path = ?, file_hash = ?, last_seen_at = datetime('now') WHERE id = ?",
+                (file_path, file_hash, existing_id),
+            )
+        except aiosqlite.IntegrityError:
+            # Rare case: hash already claimed by another row (historical drift).
+            # Prefer the canonical row that already owns the hash.
+            clash = await (
+                await db.execute(
+                    "SELECT id, file_path FROM media_files WHERE file_hash = ? LIMIT 1",
+                    (file_hash,),
+                )
+            ).fetchone()
+            if clash and clash["id"] != existing_id:
+                logger.warning(
+                    "Hash collision while updating id=%d; using existing hash owner id=%d",
+                    existing_id,
+                    clash["id"],
+                )
+                clash_path = clash["file_path"]
+                if unicodedata.normalize("NFC", clash_path) != unicodedata.normalize("NFC", file_path):
+                    await db.execute(
+                        "UPDATE media_files SET file_path = ?, last_seen_at = datetime('now') WHERE id = ?",
+                        (file_path, clash["id"]),
+                    )
+                return True, int(clash["id"])
+            raise
 
     return True, existing_id

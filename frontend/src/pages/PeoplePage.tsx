@@ -8,8 +8,9 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api/client'
-import type { Cluster, Person, MergeSuggestion, FaceRow, SimilarCluster, MergePersonsResult, FindSimilarSuggestion, FindSimilarAllResult, IgnoredPerson, IgnoreSuggestion } from '../api/client'
+import type { Cluster, Person, MergeSuggestion, FaceRow, SimilarCluster, MergePersonsResult, FindSimilarSuggestion, FindSimilarAllResult, IgnoredPerson, IgnoreSuggestion, MediaFile, PendingSuggestion, PendingSuggestionSummary } from '../api/client'
 import ConnectionsGraph from '../components/ConnectionsGraph'
+import PhotoDetail from '../components/PhotoDetail'
 
 interface Props {
   /** Called when user clicks a named person tile to view their photos. */
@@ -19,19 +20,27 @@ interface Props {
 }
 
 export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
+  const REVIEW_PAGE_SIZE = 60
+  const UNNAMED_PAGE_SIZE = 100
+
   const [clusters, setClusters] = useState<Cluster[]>([])
+  const [unnamedTotal, setUnnamedTotal] = useState(0)
+  const [unnamedPage, setUnnamedPage] = useState(0)
+  const [unnamedSortBy, setUnnamedSortBy] = useState<'member_count' | 'created_at'>('member_count')
   const [persons, setPersons] = useState<Person[]>([])
   const [loading, setLoading] = useState(true)
-  const [activeTab, setActiveTab] = useState<'named' | 'unnamed' | 'ignored'>('named')
+  const [activeTab, setActiveTab] = useState<'named' | 'unnamed' | 'ai' | 'ignored'>('named')
 
   // ── Ignored faces tab ────────────────────────────────────────────────────
   const [ignoredPersons, setIgnoredPersons] = useState<IgnoredPerson[]>([])
   const [ignoredLoading, setIgnoredLoading] = useState(false)
   const [ignoredLoaded, setIgnoredLoaded] = useState(false)
+  const [ignoredSort, setIgnoredSort] = useState<'photos_desc' | 'photos_asc' | 'newest' | 'oldest'>('photos_desc')
   const [unignoringId, setUnignoringId] = useState<number | null>(null)
   const [namingId, setNamingId] = useState<number | null>(null)  // cluster id being named
   const [nameInput, setNameInput] = useState('')
   const [saving, setSaving] = useState(false)
+  const [namingError, setNamingError] = useState<string | null>(null)
 
   // ── Rename existing person ────────────────────────────────────────────────
   const [renamingPersonId, setRenamingPersonId] = useState<number | null>(null)
@@ -41,8 +50,20 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   const [reviewPerson, setReviewPerson] = useState<Person | null>(null)
   const [reviewFaces, setReviewFaces] = useState<FaceRow[]>([])
   const [reviewLoading, setReviewLoading] = useState(false)
+  const [reviewPage, setReviewPage] = useState(0)
+  const [reviewHasMore, setReviewHasMore] = useState(false)
+  const [reviewSortBy, setReviewSortBy] = useState<'detection_conf' | 'date_taken' | 'id'>('detection_conf')
+  const [reviewSortDir, setReviewSortDir] = useState<'asc' | 'desc'>('desc')
   const [reviewPortraitFaceId, setReviewPortraitFaceId] = useState<number | null>(null)
+  const [recalculatingCentroid, setRecalculatingCentroid] = useState(false)
+  const [recalculateCentroidResult, setRecalculateCentroidResult] = useState<string | null>(null)
+  const [preferRecentCentroidPhotos, setPreferRecentCentroidPhotos] = useState(false)
   const [settingPortrait, setSettingPortrait] = useState<number | null>(null)
+  const [reviewFocusFaceId, setReviewFocusFaceId] = useState<number | null>(null)
+  const [reviewFocusFaceClusterId, setReviewFocusFaceClusterId] = useState<number | null>(null)
+  const [reviewFocusPhotos, setReviewFocusPhotos] = useState<MediaFile[]>([])
+  const [reviewFocusPhotosLoading, setReviewFocusPhotosLoading] = useState(false)
+  const [reviewFocusPhotoIndex, setReviewFocusPhotoIndex] = useState<number | null>(null)
   const [confirmUnname, setConfirmUnname] = useState(false)
   const [unnaming, setUnnaming] = useState(false)
 
@@ -61,6 +82,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   // ── Named faces search ────────────────────────────────────────────────────
   const [nameSearch, setNameSearch] = useState('')
   const [namedMergeResult, setNamedMergeResult] = useState<MergePersonsResult | null>(null)
+  const unnamedTotalPages = Math.max(1, Math.ceil(unnamedTotal / UNNAMED_PAGE_SIZE))
 
   function toggleNamedSelect(id: number) {
     setNamedSelected(prev => {
@@ -103,19 +125,46 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   const [suggestionPersonId, setSuggestionPersonId] = useState<number | null>(null)
   const [suggestionPersonName, setSuggestionPersonName] = useState<string | null>(null)
   const [suggestionBusy, setSuggestionBusy] = useState(false)
+  const [aiSuggestionsByPerson, setAiSuggestionsByPerson] = useState<PendingSuggestionSummary[]>([])
+  const [aiSuggestionsPersonTotal, setAiSuggestionsPersonTotal] = useState(0)
+  const [aiSuggestionsLoading, setAiSuggestionsLoading] = useState(false)
+  const [aiReviewModalOpen, setAiReviewModalOpen] = useState(false)
+  const [aiReviewPersonIds, setAiReviewPersonIds] = useState<number[]>([])
+  const [aiReviewIndex, setAiReviewIndex] = useState(0)
+  const [aiReviewItems, setAiReviewItems] = useState<PendingSuggestion[]>([])
+  const [aiReviewBusy, setAiReviewBusy] = useState(false)
+  // Ref holds the auto-merge threshold active for the current per-person scan.
+  // Using a ref avoids stale-closure issues across async awaits.
+  const activeSuggestionThresholdRef = useRef(Infinity)
+  const [personSimilarDialogOpen, setPersonSimilarDialogOpen] = useState(false)
+  const [personSimilarDialogPerson, setPersonSimilarDialogPerson] = useState<{ id: number; name: string } | null>(null)
 
   // ── Find Similar (bulk scan across all named persons) ─────────────────────
   const [findSimilarOpen, setFindSimilarOpen] = useState(false)
   const [findSimilarThreshold, setFindSimilarThreshold] = useState(0.85)
   const [findSimilarWorking, setFindSimilarWorking] = useState(false)
   const [findSimilarResult, setFindSimilarResult] = useState<{ autoMerged: number; suggestionsFound: number } | null>(null)
+  const [findSimilarError, setFindSimilarError] = useState<string | null>(null)
   const [bulkSuggestionQueue, setBulkSuggestionQueue] = useState<FindSimilarSuggestion[]>([])
   const [bulkSuggestionWorking, setBulkSuggestionWorking] = useState(false)
+  const suggestionRunIdRef = useRef(0)
+
+  function logPeopleFlow(event: string, startedAt: number, extra?: Record<string, unknown>) {
+    const durationMs = Math.round(performance.now() - startedAt)
+    // Lightweight observability for user-perceived latency.
+    console.info('[VIP][PeopleFlow]', { event, duration_ms: durationMs, ...(extra || {}) })
+  }
+
+  function scheduleNextSuggestionFetch(personId: number, reason: string) {
+    const runId = ++suggestionRunIdRef.current
+    void fetchNextSuggestion(personId, runId, reason)
+  }
 
   async function handleFindSimilar() {
     setFindSimilarOpen(false)
     setFindSimilarWorking(true)
     setFindSimilarResult(null)
+    setFindSimilarError(null)
     try {
       const result: FindSimilarAllResult = await api.persons.findSimilarAll(findSimilarThreshold)
 
@@ -123,15 +172,46 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
       const highConf  = result.suggestions.filter(s => s.is_high_conf === 1)
       const needsReview = result.suggestions.filter(s => s.is_high_conf !== 1)
 
-      for (const s of highConf) {
-        await api.persons.addCluster(s.person_id, s.cluster_id)
+      // Deduplicate clusters across persons — a cluster can only go to the
+      // highest-scoring person. Track which cluster_ids are already claimed.
+      const claimedClusterIds = new Set<number>(
+        result.auto_merged.map(m => m.cluster_id)
+      )
+      const startedAt = performance.now()
+      let autoMergedCount = result.auto_merged.length
+      const pendingHighConf = highConf.filter(s => !claimedClusterIds.has(s.cluster_id))
+      const settled = await Promise.allSettled(
+        pendingHighConf.map(async s => {
+          await api.persons.addCluster(s.person_id, s.cluster_id)
+          return s
+        }),
+      )
+      for (const item of settled) {
+        if (item.status !== 'fulfilled') continue
+        const s = item.value
+        if (claimedClusterIds.has(s.cluster_id)) continue
+        claimedClusterIds.add(s.cluster_id)
+        autoMergedCount++
+        const merged = clusters.find(c => c.id === s.cluster_id)
+        applyAcceptedSuggestionLocally(s.person_id, {
+          id: s.cluster_id,
+          member_count: merged?.member_count ?? s.member_count,
+          representative_thumbnail: merged?.representative_thumbnail ?? s.representative_thumbnail,
+        })
       }
+      logPeopleFlow('find_similar_all_high_conf', startedAt, {
+        attempted: pendingHighConf.length,
+        merged: autoMergedCount,
+      })
 
-      const totalAutoMerged = result.auto_merged.length + highConf.length
-      if (totalAutoMerged > 0) await load()
+      // Filter manual queue: drop clusters already claimed this run
+      const dedupedReview = needsReview.filter(s => !claimedClusterIds.has(s.cluster_id))
 
-      setBulkSuggestionQueue(needsReview)
-      setFindSimilarResult({ autoMerged: totalAutoMerged, suggestionsFound: needsReview.length })
+      setBulkSuggestionQueue(dedupedReview)
+      setFindSimilarResult({ autoMerged: autoMergedCount, suggestionsFound: dedupedReview.length })
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'Find Similar failed'
+      setFindSimilarError(msg)
     } finally {
       setFindSimilarWorking(false)
     }
@@ -142,9 +222,24 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     if (!current) return
     setBulkSuggestionWorking(true)
     try {
+      const merged = clusters.find(c => c.id === current.cluster_id)
       await api.persons.addCluster(current.person_id, current.cluster_id)
-      setBulkSuggestionQueue(q => q.slice(1))
-      await load()
+      applyAcceptedSuggestionLocally(current.person_id, {
+        id: current.cluster_id,
+        member_count: merged?.member_count ?? current.member_count,
+        representative_thumbnail: merged?.representative_thumbnail ?? current.representative_thumbnail,
+      })
+      // Remove this cluster from the rest of the queue in case it appears again
+      // for a different person (backend returns cross-person suggestions).
+      setBulkSuggestionQueue(q => q.slice(1).filter(s => s.cluster_id !== current.cluster_id))
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : ''
+      if (msg.includes('409')) {
+        // Cluster was already claimed — skip it and continue
+        setBulkSuggestionQueue(q => q.slice(1).filter(s => s.cluster_id !== current.cluster_id))
+      } else {
+        throw e
+      }
     } finally { setBulkSuggestionWorking(false) }
   }
 
@@ -158,23 +253,52 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     } finally { setBulkSuggestionWorking(false) }
   }
 
-  async function fetchNextSuggestion(personId: number) {
+  function applyAcceptedSuggestionLocally(personId: number, mergedCluster: { id: number; member_count: number; representative_thumbnail: string | null } | null) {
+    if (!mergedCluster) return
+
+    setClusters(prev => prev.filter(c => c.id !== mergedCluster.id))
+    setUnnamedTotal(prev => Math.max(0, prev - 1))
+
+    setPersons(prev => prev.map(p => {
+      if (p.id !== personId) return p
+      return {
+        ...p,
+        photo_count: p.photo_count + Math.max(0, mergedCluster.member_count || 0),
+        representative_thumbnail: p.representative_thumbnail || mergedCluster.representative_thumbnail,
+      }
+    }))
+  }
+
+  async function fetchNextSuggestion(personId: number, runId: number, reason: string) {
+    const autoThreshold = activeSuggestionThresholdRef.current
+    const startedAt = performance.now()
     try {
       // eslint-disable-next-line no-constant-condition
       while (true) {
+        if (runId !== suggestionRunIdRef.current) return
         const list = await api.persons.mergeSuggestions(personId)
+        if (runId !== suggestionRunIdRef.current) return
         if (list.length === 0) { setSuggestion(null); break }
         const s = list[0]
-        if (s.is_high_conf === 1) {
-          // auto-merge silently — don't ask the user
-          await api.persons.addCluster(personId, s.cluster_id)
-          await load()
+        const shouldAutoMerge = s.is_high_conf === 1 || s.similarity >= autoThreshold
+        if (shouldAutoMerge) {
+          // auto-merge silently — high-conf or above user threshold
+          try {
+            await api.persons.addCluster(personId, s.cluster_id)
+            const merged = clusters.find(c => c.id === s.cluster_id)
+            applyAcceptedSuggestionLocally(personId, {
+              id: s.cluster_id,
+              member_count: merged?.member_count ?? s.member_count,
+              representative_thumbnail: merged?.representative_thumbnail ?? s.representative_thumbnail,
+            })
+          } catch { /* already claimed by another person — skip */ }
           // loop: fetch next suggestion (the merged cluster is now excluded)
         } else {
           setSuggestion(s)
           break
         }
       }
+      logPeopleFlow('fetch_next_suggestion', startedAt, { person_id: personId, reason })
     } catch {
       setSuggestion(null)
     }
@@ -183,32 +307,60 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   async function startSuggestions(personId: number, name: string) {
     setSuggestionPersonId(personId)
     setSuggestionPersonName(name)
-    await fetchNextSuggestion(personId)
+    scheduleNextSuggestionFetch(personId, 'start')
   }
 
   async function acceptSuggestion() {
     if (!suggestionPersonId || !suggestion) return
     setSuggestionBusy(true)
+    const startedAt = performance.now()
+    const current = suggestion
+    setSuggestion(null)
     try {
-      await api.persons.addCluster(suggestionPersonId, suggestion.cluster_id)
-      await load()
-      await fetchNextSuggestion(suggestionPersonId)
+      const merged = clusters.find(c => c.id === current.cluster_id)
+      await api.persons.addCluster(suggestionPersonId, current.cluster_id)
+      applyAcceptedSuggestionLocally(suggestionPersonId, {
+        id: current.cluster_id,
+        member_count: merged?.member_count ?? current.member_count,
+        representative_thumbnail: merged?.representative_thumbnail ?? current.representative_thumbnail,
+      })
+      scheduleNextSuggestionFetch(suggestionPersonId, 'accept')
+      logPeopleFlow('accept_suggestion', startedAt, { person_id: suggestionPersonId, cluster_id: current.cluster_id })
+    } catch {
+      setSuggestion(current)
     } finally { setSuggestionBusy(false) }
   }
 
   async function rejectSuggestion() {
     if (!suggestionPersonId || !suggestion) return
     setSuggestionBusy(true)
+    const startedAt = performance.now()
+    const current = suggestion
+    setSuggestion(null)
     try {
-      await api.persons.rejectSuggestion(suggestionPersonId, suggestion.cluster_id)
-      await fetchNextSuggestion(suggestionPersonId)
+      await api.persons.rejectSuggestion(suggestionPersonId, current.cluster_id)
+      scheduleNextSuggestionFetch(suggestionPersonId, 'reject')
+      logPeopleFlow('reject_suggestion', startedAt, { person_id: suggestionPersonId, cluster_id: current.cluster_id })
+    } catch {
+      setSuggestion(current)
     } finally { setSuggestionBusy(false) }
   }
 
+  async function handlePersonSimilarConfirm() {
+    if (!personSimilarDialogPerson) return
+    setPersonSimilarDialogOpen(false)
+    activeSuggestionThresholdRef.current = findSimilarThreshold
+    setSuggestionPersonId(personSimilarDialogPerson.id)
+    setSuggestionPersonName(personSimilarDialogPerson.name)
+    scheduleNextSuggestionFetch(personSimilarDialogPerson.id, 'person_similar_dialog')
+  }
+
   function dismissSuggestions() {
+    suggestionRunIdRef.current += 1
     setSuggestion(null)
     setSuggestionPersonId(null)
     setSuggestionPersonName(null)
+    activeSuggestionThresholdRef.current = Infinity
   }
   // ── Cluster dismiss (delete / always ignore) ──────────────────────────────
   const [dismissTarget, setDismissTarget] = useState<Cluster | null>(null)
@@ -294,6 +446,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     try {
       await Promise.all([...selected].map(id => api.clusters.delete(id)))
       setClusters(prev => prev.filter(c => !selected.has(c.id)))
+      setUnnamedTotal(prev => Math.max(0, prev - selected.size))
       exitSelectMode()
     } finally { setBulkWorking(false) }
   }
@@ -304,6 +457,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     try {
       await Promise.all([...selected].map(id => api.clusters.ignore(id)))
       setClusters(prev => prev.filter(c => !selected.has(c.id)))
+      setUnnamedTotal(prev => Math.max(0, prev - selected.size))
       exitSelectMode()
     } finally { setBulkWorking(false) }
   }
@@ -351,6 +505,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     try {
       await api.clusters.delete(clusterId)
       setClusters(prev => prev.filter(c => c.id !== clusterId))
+      setUnnamedTotal(prev => Math.max(0, prev - 1))
       setDismissTarget(null)
       setSimilarClusters([])
       if (ignoredLoaded) await loadIgnored()
@@ -362,6 +517,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     try {
       await api.clusters.ignore(clusterId)
       setClusters(prev => prev.filter(c => c.id !== clusterId))
+      setUnnamedTotal(prev => Math.max(0, prev - 1))
       setDismissTarget(null)
       setSimilarClusters([])
       if (ignoredLoaded) await loadIgnored()
@@ -464,8 +620,17 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   async function load() {
     setLoading(true)
     try {
-      const [c, p] = await Promise.all([api.clusters.unnamed(), api.persons.list()])
-      setClusters(c)
+      const [c, p] = await Promise.all([
+        api.clusters.unnamed({
+          limit: UNNAMED_PAGE_SIZE,
+          offset: unnamedPage * UNNAMED_PAGE_SIZE,
+          sortBy: unnamedSortBy,
+          sortDir: 'desc',
+        }),
+        api.persons.list(),
+      ])
+      setClusters(c.items)
+      setUnnamedTotal(c.total)
       setPersons(p)
     } finally {
       setLoading(false)
@@ -475,7 +640,9 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   async function loadIgnored() {
     setIgnoredLoading(true)
     try {
-      const items = await api.persons.listIgnored()
+      const sortBy = ignoredSort === 'newest' || ignoredSort === 'oldest' ? 'created_at' : 'photo_count'
+      const sortDir = ignoredSort === 'photos_asc' || ignoredSort === 'oldest' ? 'asc' : 'desc'
+      const items = await api.persons.listIgnored({ sortBy, sortDir })
       setIgnoredPersons(items)
       setIgnoredLoaded(true)
     } finally {
@@ -489,14 +656,152 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
       await api.persons.unignore(personId)
       setIgnoredPersons(prev => prev.filter(p => p.id !== personId))
       // Reload unnamed clusters so the restored faces appear immediately
-      const fresh = await api.clusters.unnamed()
-      setClusters(fresh)
+      const fresh = await api.clusters.unnamed({
+        limit: UNNAMED_PAGE_SIZE,
+        offset: unnamedPage * UNNAMED_PAGE_SIZE,
+        sortBy: unnamedSortBy,
+        sortDir: 'desc',
+      })
+      setClusters(fresh.items)
+      setUnnamedTotal(fresh.total)
     } finally {
       setUnignoringId(null)
     }
   }
 
-  useEffect(() => { load() }, [])
+  async function loadAiSuggestionSummary() {
+    setAiSuggestionsLoading(true)
+    try {
+      const page = await api.persons.pendingSuggestionsSummary({ limit: 300, offset: 0 })
+      setAiSuggestionsByPerson(page.items)
+      setAiSuggestionsPersonTotal(page.total)
+      return page.items
+    } catch {
+      setAiSuggestionsByPerson([])
+      setAiSuggestionsPersonTotal(0)
+      return []
+    } finally {
+      setAiSuggestionsLoading(false)
+    }
+  }
+
+  async function loadAiReviewItemsForPerson(personId: number) {
+    try {
+      const page = await api.persons.pendingSuggestions({ personId, limit: 200, offset: 0 })
+      setAiReviewItems(page.items)
+      return page.items
+    } catch {
+      setAiReviewItems([])
+      return []
+    }
+  }
+
+  async function refreshAiReviewAfterAction(currentPersonId: number) {
+    const updated = await loadAiReviewItemsForPerson(currentPersonId)
+    if (updated.length > 0) return
+
+    if (aiReviewPersonIds.length <= 1) {
+      setAiReviewModalOpen(false)
+      setAiReviewPersonIds([])
+      setAiReviewIndex(0)
+      return
+    }
+
+    const summary = await loadAiSuggestionSummary()
+    const nextIds = summary.map(s => s.person_id)
+    if (nextIds.length === 0) {
+      setAiReviewModalOpen(false)
+      setAiReviewPersonIds([])
+      setAiReviewIndex(0)
+      return
+    }
+    setAiReviewPersonIds(nextIds)
+    setAiReviewIndex(0)
+    await loadAiReviewItemsForPerson(nextIds[0])
+  }
+
+  async function openAiReviewForPerson(personId: number) {
+    setAiReviewPersonIds([personId])
+    setAiReviewIndex(0)
+    setAiReviewModalOpen(true)
+    await loadAiReviewItemsForPerson(personId)
+  }
+
+  async function openAiReviewAll() {
+    const summary = await loadAiSuggestionSummary()
+    if (!summary.length) return
+    const ids = summary.map(s => s.person_id)
+    setAiReviewPersonIds(ids)
+    setAiReviewIndex(0)
+    setAiReviewModalOpen(true)
+    await loadAiReviewItemsForPerson(ids[0])
+  }
+
+  async function goToAiReviewIndex(nextIndex: number) {
+    if (nextIndex < 0 || nextIndex >= aiReviewPersonIds.length) return
+    setAiReviewIndex(nextIndex)
+    await loadAiReviewItemsForPerson(aiReviewPersonIds[nextIndex])
+  }
+
+  async function rejectAiSuggestion(item: PendingSuggestion) {
+    setAiReviewBusy(true)
+    try {
+      await api.persons.rejectSuggestion(item.person_id, item.cluster_id)
+      setAiReviewItems(prev => prev.filter(x => x.id !== item.id))
+      setAiSuggestionsByPerson(prev => prev
+        .map(s => s.person_id === item.person_id ? { ...s, suggestion_count: Math.max(0, s.suggestion_count - 1) } : s)
+        .filter(s => s.suggestion_count > 0))
+      await refreshAiReviewAfterAction(item.person_id)
+    } finally {
+      setAiReviewBusy(false)
+    }
+  }
+
+  async function acceptAiSuggestionsForCurrentPerson() {
+    const personId = aiReviewPersonIds[aiReviewIndex]
+    if (!personId || aiReviewItems.length === 0) return
+    setAiReviewBusy(true)
+    try {
+      const batch = [...aiReviewItems]
+      for (const item of batch) {
+        try {
+          await api.persons.addCluster(item.person_id, item.cluster_id)
+          applyAcceptedSuggestionLocally(item.person_id, {
+            id: item.cluster_id,
+            member_count: item.member_count,
+            representative_thumbnail: item.representative_thumbnail,
+          })
+        } catch {
+          // Keep going; stale/race items are handled by backend queue status updates.
+        }
+      }
+      await refreshAiReviewAfterAction(personId)
+      await loadAiSuggestionSummary()
+    } finally {
+      setAiReviewBusy(false)
+    }
+  }
+
+  useEffect(() => { load() }, [unnamedPage, unnamedSortBy])
+
+  useEffect(() => { void loadAiSuggestionSummary() }, [])
+
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        void loadAiSuggestionSummary()
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => document.removeEventListener('visibilitychange', onVisibility)
+  }, [])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void loadAiSuggestionSummary()
+    }, 15000)
+    return () => window.clearInterval(timer)
+  }, [])
 
   // Lazy-load ignored faces when tab is first activated
   useEffect(() => {
@@ -505,17 +810,46 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     }
   }, [activeTab])
 
+  useEffect(() => {
+    if (activeTab === 'ignored' && ignoredLoaded) {
+      loadIgnored()
+    }
+  }, [ignoredSort])
+
+  async function loadReviewPage(personId: number, page: number) {
+    setReviewLoading(true)
+    try {
+      const offset = page * REVIEW_PAGE_SIZE
+      const faces = await api.faces.byPerson(personId, REVIEW_PAGE_SIZE, offset, reviewSortBy, reviewSortDir)
+      setReviewFaces(faces)
+      setReviewPage(page)
+      setReviewHasMore(faces.length === REVIEW_PAGE_SIZE)
+    } finally {
+      setReviewLoading(false)
+    }
+  }
+
   async function openReview(person: Person) {
     setReviewPerson(person)
     setReviewFaces([])
+    setReviewPage(0)
+    setReviewHasMore(false)
+    setReviewSortBy('detection_conf')
+    setReviewSortDir('desc')
     setReviewPortraitFaceId(null)
+    setReviewFocusFaceId(null)
+    setReviewFocusFaceClusterId(null)
+    setReviewFocusPhotos([])
+    setReviewFocusPhotoIndex(null)
     setConfirmUnname(false)
+    setRecalculateCentroidResult(null)
+    setPreferRecentCentroidPhotos(false)
     setReviewLoading(true)
     try {
-      const faces = await api.faces.byPerson(person.id)
+      const faces = await api.faces.byPerson(person.id, REVIEW_PAGE_SIZE, 0, 'detection_conf', 'desc')
       setReviewFaces(faces)
-      // Determine current portrait face id from representative thumbnail path
-      // No dedicated field returned yet — we'll track it locally via setPortrait calls
+      setReviewPage(0)
+      setReviewHasMore(faces.length === REVIEW_PAGE_SIZE)
     } finally {
       setReviewLoading(false)
     }
@@ -534,10 +868,55 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     }
   }
 
+  async function handleRecalculateCentroid() {
+    if (!reviewPerson) return
+    setRecalculatingCentroid(true)
+    setRecalculateCentroidResult(null)
+    try {
+      const result = await api.persons.recalculateCentroid(reviewPerson.id, preferRecentCentroidPhotos)
+      const modeText = result.prefer_recent_photos ? ' with recent-photo weighting.' : '.'
+      setRecalculateCentroidResult(
+        `Centroid rebuilt from ${result.selected_faces} best face${result.selected_faces === 1 ? '' : 's'}${modeText}`
+      )
+      await load()
+    } catch {
+      setRecalculateCentroidResult('Could not recalculate centroid.')
+    } finally {
+      setRecalculatingCentroid(false)
+    }
+  }
+
   async function ejectFace(faceId: number) {
     await api.faces.removeFromPerson(faceId)
     setReviewFaces(f => f.filter(x => x.id !== faceId))
+    if (reviewFocusFaceId === faceId) {
+      setReviewFocusFaceId(null)
+      setReviewFocusFaceClusterId(null)
+      setReviewFocusPhotos([])
+      setReviewFocusPhotoIndex(null)
+    }
     load() // refresh counts
+  }
+
+  async function previewFacePhotos(face: FaceRow) {
+    setReviewFocusFaceId(face.id)
+    setReviewFocusFaceClusterId(face.cluster_id ?? null)
+    setReviewFocusPhotos([])
+    setReviewFocusPhotoIndex(null)
+    setReviewFocusPhotosLoading(true)
+    try {
+      if (face.cluster_id != null) {
+        const photos = await api.media.list({ cluster_id: face.cluster_id, limit: 80, offset: 0 })
+        setReviewFocusPhotos(photos)
+      } else if (face.media_file_id != null) {
+        const one = await api.media.get(face.media_file_id)
+        setReviewFocusPhotos(one ? [one] : [])
+      } else {
+        setReviewFocusPhotos([])
+      }
+    } finally {
+      setReviewFocusPhotosLoading(false)
+    }
   }
 
   async function handleUnnamePerson() {
@@ -572,6 +951,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   }
 
   async function handleName(clusterId: number) {
+    setNamingError(null)
     const name = nameInput.trim()
     if (!name) return
     const existing = persons.find(p => p.name?.toLowerCase() === name.toLowerCase())
@@ -581,26 +961,60 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     }
     setSaving(true)
     try {
-      await api.persons.fromCluster(clusterId, name)
+      const startedAt = performance.now()
+      const sourceCluster = clusters.find(c => c.id === clusterId)
+      const created = await api.persons.fromCluster(clusterId, name)
       setNamingId(null)
       setNameInput('')
-      const refreshed = await api.persons.list()
-      setPersons(refreshed)
-      // Kick off proactive suggestions for the newly named person
-      const newPerson = refreshed.find(p => p.name?.toLowerCase() === name.toLowerCase())
-      if (newPerson) startSuggestions(newPerson.id, newPerson.name!)
-      load()
+      setClusters(prev => prev.filter(c => c.id !== clusterId))
+      setUnnamedTotal(prev => Math.max(0, prev - 1))
+      setPersons(prev => {
+        if (prev.some(p => p.id === created.person_id)) return prev
+        return [
+          {
+            id: created.person_id,
+            uuid: created.uuid,
+            name,
+            photo_count: sourceCluster?.member_count ?? 0,
+            representative_thumbnail: sourceCluster?.representative_thumbnail ?? null,
+            name_written: 0,
+            merge_sources_count: 0,
+            is_merged: false,
+          },
+          ...prev,
+        ]
+      })
+      startSuggestions(created.person_id, name)
+      logPeopleFlow('name_from_cluster', startedAt, { cluster_id: clusterId, person_id: created.person_id })
+    } catch (e: unknown) {
+      const err = e as { message?: string }
+      setNamingError(err?.message ?? 'Could not name this cluster.')
     } finally { setSaving(false) }
   }
 
-  async function handleMerge(clusterId: number, personId: number) {
+  async function handleMerge(clusterId: number, personId: number, forceSamePhotoOverride = false) {
+    setNamingError(null)
     setSaving(true)
     try {
-      await api.persons.addCluster(personId, clusterId)
+      const startedAt = performance.now()
+      const merged = clusters.find(c => c.id === clusterId)
+      await api.persons.addCluster(personId, clusterId, { forceSamePhotoOverride })
+      applyAcceptedSuggestionLocally(personId, {
+        id: clusterId,
+        member_count: merged?.member_count ?? 0,
+        representative_thumbnail: merged?.representative_thumbnail ?? null,
+      })
       setMergeCandidate(null)
       setNamingId(null)
       setNameInput('')
-      load()
+      logPeopleFlow(
+        forceSamePhotoOverride ? 'manual_merge_cluster_force_override' : 'manual_merge_cluster',
+        startedAt,
+        { cluster_id: clusterId, person_id: personId },
+      )
+    } catch (e: unknown) {
+      const err = e as { message?: string }
+      setNamingError(err?.message ?? 'Could not merge this cluster into the selected person.')
     } finally { setSaving(false) }
   }
 
@@ -652,11 +1066,28 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
           }`}
         >
           Unnamed Faces
-          {clusters.length > 0 && (
+          {unnamedTotal > 0 && (
             <span className={`ml-1.5 text-xs px-1.5 py-0.5 rounded-full ${
               activeTab === 'unnamed' ? 'bg-indigo-600 text-white' : 'bg-gray-800 text-gray-500'
             }`}>
-              {clusters.length}
+              {unnamedTotal}
+            </span>
+          )}
+        </button>
+        <button
+          onClick={() => setActiveTab('ai')}
+          className={`px-4 py-2 text-sm font-medium rounded-t-lg transition-colors -mb-px border-b-2 ${
+            activeTab === 'ai'
+              ? 'border-cyan-500 text-white'
+              : 'border-transparent text-gray-400 hover:text-white'
+          }`}
+        >
+          AI Suggestions
+          {aiSuggestionsByPerson.length > 0 && (
+            <span className={`ml-1.5 text-xs px-1.5 py-0.5 rounded-full ${
+              activeTab === 'ai' ? 'bg-cyan-700 text-white' : 'bg-gray-800 text-gray-500'
+            }`}>
+              {aiSuggestionsByPerson.length}
             </span>
           )}
         </button>
@@ -678,6 +1109,13 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
           )}
         </button>
       </div>
+
+      {namingError && (
+        <div className="mb-4 flex items-center justify-between rounded-xl bg-red-900/25 border border-red-800 px-4 py-2.5">
+          <p className="text-sm text-red-200">Name/Merge failed: {namingError}</p>
+          <button onClick={() => setNamingError(null)} className="text-red-500 hover:text-red-300 text-sm ml-4">✕</button>
+        </div>
+      )}
 
       {/* ── Named-person multi-select merge dialog ────────────────────────── */}
       {namedMergeOpen && (
@@ -904,7 +1342,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
       {/* Face review panel */}
       {reviewPerson && (
         <div className="fixed inset-0 bg-black/70 flex items-start justify-center z-50 overflow-y-auto py-10">
-          <div className="bg-gray-900 rounded-xl p-6 w-full max-w-2xl shadow-xl mx-4">
+          <div className="bg-gray-900 rounded-xl p-6 w-full max-w-2xl shadow-xl mx-4 max-h-[88vh] flex flex-col">
             <div className="flex items-center justify-between mb-4">
               <div>
                 <h2 className="text-white font-semibold text-lg">{reviewPerson.name}</h2>
@@ -932,72 +1370,205 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
                     </button>
                   </>
                 ) : (
-                  <button
-                    onClick={() => setConfirmUnname(true)}
-                    title="Remove name and release faces back to unnamed pool"
-                    className="text-xs px-2.5 py-1 rounded-lg border border-red-800 bg-red-900/20 text-red-400 hover:bg-red-900/40 hover:text-red-300 transition-colors"
-                  >
-                    Un-name
-                  </button>
+                  <>
+                    <label className="text-xs text-gray-300 inline-flex items-center gap-1.5 select-none mr-1">
+                      <input
+                        type="checkbox"
+                        checked={preferRecentCentroidPhotos}
+                        onChange={e => setPreferRecentCentroidPhotos(e.target.checked)}
+                        disabled={recalculatingCentroid}
+                        className="accent-indigo-500"
+                      />
+                      Prefer recent photos
+                    </label>
+                    <button
+                      onClick={handleRecalculateCentroid}
+                      disabled={recalculatingCentroid}
+                      title="Rebuild this person's centroid from best-quality faces, optionally boosting newer photos"
+                      className="text-xs px-2.5 py-1 rounded-lg border border-indigo-800 bg-indigo-900/20 text-indigo-300 hover:bg-indigo-900/40 hover:text-indigo-200 disabled:opacity-40 transition-colors"
+                    >
+                      {recalculatingCentroid ? 'Recalculating…' : 'Recalculate centroid'}
+                    </button>
+                    <button
+                      onClick={() => setConfirmUnname(true)}
+                      title="Remove name and release faces back to unnamed pool"
+                      className="text-xs px-2.5 py-1 rounded-lg border border-red-800 bg-red-900/20 text-red-400 hover:bg-red-900/40 hover:text-red-300 transition-colors"
+                    >
+                      Un-name
+                    </button>
+                  </>
                 )}
                 <button onClick={() => { setReviewPerson(null); setConfirmUnname(false) }}
                   className="text-gray-400 hover:text-white text-xl leading-none px-2">✕</button>
               </div>
             </div>
-            {reviewLoading
-              ? <p className="text-gray-400 text-sm">Loading…</p>
-              : reviewFaces.length === 0
-                ? <p className="text-gray-500 text-sm">No faces assigned.</p>
-                : (
-                  <div className="grid grid-cols-4 sm:grid-cols-6 gap-3">
-                    {reviewFaces.map(f => {
-                      const url = f.thumbnail_path
-                        ? '/thumbnails/' + f.thumbnail_path.split('/thumbnails/').pop()
-                        : null
-                      const isPortrait = reviewPortraitFaceId === f.id
-                      const isSetting = settingPortrait === f.id
-                      return (
-                        <div key={f.id} className="relative group">
-                          <div className={`w-16 h-16 rounded-lg overflow-hidden bg-gray-800 ${
-                            isPortrait ? 'ring-2 ring-yellow-400' : ''
-                          }`}>
-                            {url
-                              ? <img src={url} alt="face" className="w-full h-full object-cover" />
-                              : <span className="flex items-center justify-center h-full text-gray-600 text-xl">?</span>}
-                          </div>
-                          {/* Remove button */}
-                          <button
-                            onClick={() => ejectFace(f.id)}
-                            title="Remove — not this person"
-                            className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-red-600 hover:bg-red-500 text-white rounded-full text-xs leading-none flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
-                            ✕
-                          </button>
-                          {/* Portrait / primary button */}
-                          {!isPortrait && (
+            {recalculateCentroidResult && (
+              <p className="mb-3 text-xs text-indigo-300">{recalculateCentroidResult}</p>
+            )}
+            <div className="flex items-center justify-between mb-3 text-xs">
+              <span className="text-gray-500">
+                Page {reviewPage + 1} · {reviewFaces.length} face{reviewFaces.length !== 1 ? 's' : ''}
+              </span>
+              <div className="flex items-center gap-2">
+                <select
+                  value={reviewSortBy}
+                  onChange={async (e) => {
+                    if (!reviewPerson) return
+                    const nextSort = e.target.value as 'detection_conf' | 'date_taken' | 'id'
+                    setReviewSortBy(nextSort)
+                    setReviewPage(0)
+                    setReviewLoading(true)
+                    try {
+                      const faces = await api.faces.byPerson(reviewPerson.id, REVIEW_PAGE_SIZE, 0, nextSort, reviewSortDir)
+                      setReviewFaces(faces)
+                      setReviewHasMore(faces.length === REVIEW_PAGE_SIZE)
+                    } finally {
+                      setReviewLoading(false)
+                    }
+                  }}
+                  className="bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-gray-200"
+                >
+                  <option value="detection_conf">Confidence</option>
+                  <option value="date_taken">Date</option>
+                  <option value="id">Added</option>
+                </select>
+                <button
+                  onClick={async () => {
+                    if (!reviewPerson) return
+                    const nextDir: 'asc' | 'desc' = reviewSortDir === 'desc' ? 'asc' : 'desc'
+                    setReviewSortDir(nextDir)
+                    setReviewPage(0)
+                    setReviewLoading(true)
+                    try {
+                      const faces = await api.faces.byPerson(reviewPerson.id, REVIEW_PAGE_SIZE, 0, reviewSortBy, nextDir)
+                      setReviewFaces(faces)
+                      setReviewHasMore(faces.length === REVIEW_PAGE_SIZE)
+                    } finally {
+                      setReviewLoading(false)
+                    }
+                  }}
+                  title={reviewSortDir === 'desc' ? 'Descending' : 'Ascending'}
+                  disabled={reviewLoading}
+                  className="px-2.5 py-1 rounded-md border border-gray-700 text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed hover:border-gray-500 transition-colors"
+                >
+                  {reviewSortDir === 'desc' ? '↓' : '↑'}
+                </button>
+                <button
+                  onClick={() => reviewPerson && loadReviewPage(reviewPerson.id, Math.max(0, reviewPage - 1))}
+                  disabled={reviewLoading || reviewPage === 0}
+                  className="px-2.5 py-1 rounded-md border border-gray-700 text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed hover:border-gray-500 transition-colors"
+                >
+                  Prev
+                </button>
+                <button
+                  onClick={() => reviewPerson && loadReviewPage(reviewPerson.id, reviewPage + 1)}
+                  disabled={reviewLoading || !reviewHasMore}
+                  className="px-2.5 py-1 rounded-md border border-gray-700 text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed hover:border-gray-500 transition-colors"
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+            <div className="overflow-y-auto pr-1">
+              {reviewLoading
+                ? <p className="text-gray-400 text-sm">Loading…</p>
+                : reviewFaces.length === 0
+                  ? <p className="text-gray-500 text-sm">No faces assigned.</p>
+                  : (
+                    <>
+                      {(reviewFocusFaceId != null || reviewFocusPhotosLoading) && (
+                        <div className="mb-4 rounded-xl border border-gray-800 bg-gray-950/50 p-3">
+                          <div className="flex items-center justify-between mb-2">
+                            <p className="text-xs text-gray-400">
+                              Photos for selected face
+                              {reviewFocusFaceClusterId != null ? ` · cluster ${reviewFocusFaceClusterId}` : ''}
+                            </p>
                             <button
-                              onClick={() => setPortraitFace(f.id)}
-                              disabled={!!settingPortrait}
-                              title="Set as primary thumbnail"
-                              className="absolute -top-1.5 -left-1.5 w-5 h-5 bg-gray-700 hover:bg-yellow-500 disabled:opacity-40 text-yellow-300 hover:text-white rounded-full text-xs leading-none flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
-                              {isSetting ? '…' : '★'}
+                              onClick={() => {
+                                setReviewFocusFaceId(null)
+                                setReviewFocusFaceClusterId(null)
+                                setReviewFocusPhotos([])
+                                setReviewFocusPhotoIndex(null)
+                              }}
+                              className="text-[11px] text-gray-500 hover:text-gray-300"
+                            >
+                              Clear
                             </button>
+                          </div>
+                          {reviewFocusPhotosLoading ? (
+                            <p className="text-gray-500 text-xs">Loading photos…</p>
+                          ) : reviewFocusPhotos.length === 0 ? (
+                            <p className="text-gray-500 text-xs">No photos found for this face.</p>
+                          ) : (
+                            <div className="grid grid-cols-3 sm:grid-cols-5 gap-2">
+                              {reviewFocusPhotos.map((m, idx) => (
+                                <button
+                                  key={m.id}
+                                  onClick={() => setReviewFocusPhotoIndex(idx)}
+                                  className="aspect-square rounded-md overflow-hidden bg-gray-800 border border-gray-700 hover:border-indigo-500 transition-colors"
+                                  title="Open photo details"
+                                >
+                                  <img src={api.media.thumbnailUrl(m.id)} alt="photo" className="w-full h-full object-cover" />
+                                </button>
+                              ))}
+                            </div>
                           )}
-                          {isPortrait && (
-                            <span
-                              title="Current primary thumbnail"
-                              className="absolute -top-1.5 -left-1.5 w-5 h-5 bg-yellow-500 text-white rounded-full text-xs leading-none flex items-center justify-center">
-                              ★
-                            </span>
-                          )}
-                          <p className="text-gray-500 text-[10px] mt-0.5 text-center truncate">
-                            {(f.detection_conf * 100).toFixed(0)}%
-                          </p>
                         </div>
-                      )
-                    })}
-                  </div>
-                )
-            }
+                      )}
+
+                      <div className="grid grid-cols-4 sm:grid-cols-6 gap-3">
+                        {reviewFaces.map(f => {
+                        const url = f.thumbnail_path
+                          ? '/thumbnails/' + f.thumbnail_path.split('/thumbnails/').pop()
+                          : null
+                        const isPortrait = reviewPortraitFaceId === f.id
+                        const isSetting = settingPortrait === f.id
+                        return (
+                          <div key={f.id} className="relative group">
+                            <div className={`w-16 h-16 rounded-lg overflow-hidden bg-gray-800 ${
+                              isPortrait ? 'ring-2 ring-yellow-400' : ''
+                            } ${
+                              reviewFocusFaceId === f.id ? 'ring-2 ring-indigo-400' : ''
+                            }`}>
+                              {url
+                                ? <img src={url} alt="face" className="w-full h-full object-cover cursor-pointer" onClick={() => previewFacePhotos(f)} />
+                                : <span className="flex items-center justify-center h-full text-gray-600 text-xl">?</span>}
+                            </div>
+                            {/* Remove button */}
+                            <button
+                              onClick={() => ejectFace(f.id)}
+                              title="Remove — not this person"
+                              className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-red-600 hover:bg-red-500 text-white rounded-full text-xs leading-none flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                              ✕
+                            </button>
+                            {/* Portrait / primary button */}
+                            {!isPortrait && (
+                              <button
+                                onClick={() => setPortraitFace(f.id)}
+                                disabled={!!settingPortrait}
+                                title="Set as primary thumbnail"
+                                className="absolute -top-1.5 -left-1.5 w-5 h-5 bg-gray-700 hover:bg-yellow-500 disabled:opacity-40 text-yellow-300 hover:text-white rounded-full text-xs leading-none flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                                {isSetting ? '…' : '★'}
+                              </button>
+                            )}
+                            {isPortrait && (
+                              <span
+                                title="Current primary thumbnail"
+                                className="absolute -top-1.5 -left-1.5 w-5 h-5 bg-yellow-500 text-white rounded-full text-xs leading-none flex items-center justify-center">
+                                ★
+                              </span>
+                            )}
+                            <p className="text-gray-500 text-[10px] mt-0.5 text-center truncate">
+                              {(f.detection_conf * 100).toFixed(0)}%
+                            </p>
+                          </div>
+                        )
+                        })}
+                      </div>
+                    </>
+                  )
+              }
+            </div>
           </div>
         </div>
       )}
@@ -1093,16 +1664,47 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
             <p className="text-gray-300 text-sm mb-6">
               "{nameInput}" is already used. Same person or different?
             </p>
-            <div className="flex gap-3">
+            <div className="flex flex-col gap-2">
               <button onClick={() => handleMerge(namingId!, mergeCandidate.personId)} disabled={saving}
-                className="flex-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg py-2 text-sm font-medium">
+                className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg py-2 text-sm font-medium">
                 Same — merge
               </button>
+              <button onClick={() => handleMerge(namingId!, mergeCandidate.personId, true)} disabled={saving}
+                className="bg-amber-700 hover:bg-amber-600 disabled:opacity-40 text-white rounded-lg py-2 text-sm font-medium">
+                Force merge (override same-photo rule)
+              </button>
               <button onClick={async () => {
+                setNamingError(null)
                 setSaving(true)
                 try {
-                  await api.persons.fromCluster(namingId!, nameInput.trim() + ' (2)')
-                  setMergeCandidate(null); setNamingId(null); setNameInput(''); load()
+                  const altName = nameInput.trim() + ' (2)'
+                  const sourceCluster = clusters.find(c => c.id === namingId!)
+                  const created = await api.persons.fromCluster(namingId!, altName)
+                  setClusters(prev => prev.filter(c => c.id !== namingId!))
+                  setUnnamedTotal(prev => Math.max(0, prev - 1))
+                  setPersons(prev => {
+                    if (prev.some(p => p.id === created.person_id)) return prev
+                    return [
+                      {
+                        id: created.person_id,
+                        uuid: created.uuid,
+                        name: altName,
+                        photo_count: sourceCluster?.member_count ?? 0,
+                        representative_thumbnail: sourceCluster?.representative_thumbnail ?? null,
+                        name_written: 0,
+                        merge_sources_count: 0,
+                        is_merged: false,
+                      },
+                      ...prev,
+                    ]
+                  })
+                  setMergeCandidate(null)
+                  setNamingId(null)
+                  setNameInput('')
+                  startSuggestions(created.person_id, altName)
+                } catch (e: unknown) {
+                  const err = e as { message?: string }
+                  setNamingError(err?.message ?? 'Could not create a separate person from this cluster.')
                 } finally { setSaving(false) }
               }} disabled={saving}
                 className="flex-1 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-white rounded-lg py-2 text-sm font-medium">
@@ -1119,26 +1721,58 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
         </div>
       )}
 
-      {activeTab === 'unnamed' && clusters.length === 0 && persons.length > 0 && (
+      {activeTab === 'unnamed' && unnamedTotal === 0 && persons.length > 0 && (
         <div className="text-gray-500 text-sm mt-12 text-center">
           No unnamed clusters — all faces have been assigned.
         </div>
       )}
 
-      {activeTab === 'named' && persons.length === 0 && clusters.length > 0 && (
+      {activeTab === 'named' && persons.length === 0 && unnamedTotal > 0 && (
         <div className="text-gray-500 text-sm mt-12 text-center">
           No named persons yet. Switch to <button onClick={() => setActiveTab('unnamed')} className="text-indigo-400 hover:text-indigo-300 underline">Unnamed Faces</button> to name some.
         </div>
       )}
 
+      {activeTab === 'ai' && aiSuggestionsByPerson.length === 0 && !aiSuggestionsLoading && (
+        <div className="text-gray-500 text-sm mt-12 text-center">
+          No pending AI suggestions right now.
+        </div>
+      )}
+
       {/* ── Unnamed clusters tab ─────────────────────────────────────────── */}
-      {activeTab === 'unnamed' && clusters.length > 0 && (
+      {activeTab === 'unnamed' && unnamedTotal > 0 && (
         <section className="mb-8">
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
-              Unnamed clusters ({clusters.length})
+              Page {unnamedPage + 1} of {unnamedTotalPages}
             </h2>
             <div className="flex items-center gap-2">
+              <label className="text-xs text-gray-500">Sort</label>
+              <select
+                value={unnamedSortBy}
+                onChange={e => { setUnnamedPage(0); setUnnamedSortBy(e.target.value as 'member_count' | 'created_at') }}
+                className="text-xs px-2.5 py-1 rounded-lg border border-gray-600 bg-gray-800 text-gray-300"
+              >
+                <option value="member_count">Most photos</option>
+                <option value="created_at">Newest added</option>
+              </select>
+              <span className="text-xs text-gray-500">
+                {unnamedPage * UNNAMED_PAGE_SIZE + 1}-{Math.min((unnamedPage + 1) * UNNAMED_PAGE_SIZE, unnamedTotal)}
+              </span>
+              <button
+                onClick={() => setUnnamedPage(p => Math.max(0, p - 1))}
+                disabled={unnamedPage === 0}
+                className="text-xs px-2.5 py-1 rounded-lg border border-gray-600 bg-gray-800 text-gray-400 disabled:opacity-40 hover:text-white hover:border-gray-400 transition-colors"
+              >
+                Prev
+              </button>
+              <button
+                onClick={() => setUnnamedPage(p => ((p + 1) * UNNAMED_PAGE_SIZE < unnamedTotal ? p + 1 : p))}
+                disabled={(unnamedPage + 1) * UNNAMED_PAGE_SIZE >= unnamedTotal}
+                className="text-xs px-2.5 py-1 rounded-lg border border-gray-600 bg-gray-800 text-gray-400 disabled:opacity-40 hover:text-white hover:border-gray-400 transition-colors"
+              >
+                Next
+              </button>
               {selectMode && (
                 <>
                   <button
@@ -1284,6 +1918,70 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
         </section>
       )}
 
+      {/* ── AI Suggestions tab ───────────────────────────────────────────── */}
+      {activeTab === 'ai' && (
+        <section>
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
+              AI Suggestions ({aiSuggestionsByPerson.length} person{aiSuggestionsByPerson.length !== 1 ? 's' : ''})
+            </h2>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => void loadAiSuggestionSummary()}
+                disabled={aiSuggestionsLoading}
+                className="text-xs px-2.5 py-1 rounded-lg border border-gray-600 bg-gray-800 text-gray-300 hover:text-white hover:border-gray-400 disabled:opacity-40 transition-colors"
+              >
+                {aiSuggestionsLoading ? 'Refreshing…' : 'Refresh'}
+              </button>
+              <button
+                onClick={() => void openAiReviewAll()}
+                disabled={aiSuggestionsByPerson.length === 0 || aiSuggestionsLoading}
+                className="text-xs px-2.5 py-1 rounded-lg border border-cyan-700 bg-cyan-900/20 text-cyan-300 hover:bg-cyan-900/40 hover:text-cyan-200 disabled:opacity-40 transition-colors"
+              >
+                Review all
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+            {aiSuggestionsByPerson.map(item => {
+              const livePerson = persons.find(p => p.id === item.person_id)
+              const thumbRaw = livePerson?.representative_thumbnail ?? item.person_thumbnail
+              const thumbUrl = thumbRaw ? '/thumbnails/' + thumbRaw.split('/thumbnails/').pop() : null
+              return (
+                <div key={item.person_id} className="rounded-xl border border-gray-800 bg-gray-900/70 p-4">
+                  <div className="flex items-center gap-3 mb-3">
+                    <div className="w-14 h-14 rounded-lg overflow-hidden bg-gray-800 border border-gray-700 flex items-center justify-center">
+                      {thumbUrl
+                        ? <img src={thumbUrl} alt={item.person_name ?? `Person ${item.person_id}`} className="w-full h-full object-cover" />
+                        : <span className="text-xl">👤</span>}
+                    </div>
+                    <div className="min-w-0">
+                      <p className="text-sm text-white truncate">{item.person_name ?? `Person ${item.person_id}`}</p>
+                      <p className="text-xs text-gray-400">
+                        {item.suggestion_count} suggestion{item.suggestion_count !== 1 ? 's' : ''}
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => void openAiReviewForPerson(item.person_id)}
+                    className="w-full rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium py-2 transition-colors"
+                  >
+                    Review individual
+                  </button>
+                </div>
+              )
+            })}
+          </div>
+
+          {aiSuggestionsPersonTotal > aiSuggestionsByPerson.length && (
+            <p className="mt-3 text-xs text-gray-500">
+              Showing {aiSuggestionsByPerson.length} of {aiSuggestionsPersonTotal} people with pending suggestions.
+            </p>
+          )}
+        </section>
+      )}
+
       {/* ── Named persons tab ───────────────────────────────────────────── */}
       {activeTab === 'named' && persons.length > 0 && (
         <section>
@@ -1335,6 +2033,13 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
                   : <span>no manual review needed</span>}
               </p>
               <button onClick={() => setFindSimilarResult(null)} className="text-indigo-600 hover:text-indigo-400 text-sm ml-4">✕</button>
+            </div>
+          )}
+
+          {findSimilarError && (
+            <div className="mb-4 flex items-center justify-between rounded-xl bg-red-900/25 border border-red-800 px-4 py-2.5">
+              <p className="text-sm text-red-200">Find Similar failed: {findSimilarError}</p>
+              <button onClick={() => setFindSimilarError(null)} className="text-red-500 hover:text-red-300 text-sm ml-4">✕</button>
             </div>
           )}
 
@@ -1477,7 +2182,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
                   )}
                   {!namedSelectMode && (
                     <button
-                      onClick={() => startSuggestions(p.id, p.name!)}
+                      onClick={() => { setPersonSimilarDialogPerson({ id: p.id, name: p.name! }); setPersonSimilarDialogOpen(true) }}
                       title="Find similar faces"
                       className="text-xs text-gray-600 hover:text-indigo-400 transition-colors"
                     >
@@ -1646,6 +2351,161 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
         </div>
       )}
 
+      {aiReviewModalOpen && aiReviewPersonIds.length > 0 && (() => {
+        const currentPersonId = aiReviewPersonIds[aiReviewIndex]
+        const summary = aiSuggestionsByPerson.find(s => s.person_id === currentPersonId)
+        const personName = summary?.person_name ?? `Person ${currentPersonId}`
+        const isReviewAll = aiReviewPersonIds.length > 1
+        return (
+          <div className="fixed inset-0 bg-black/70 flex items-start justify-center z-50 overflow-y-auto py-8">
+            <div className="bg-gray-900 border border-gray-700 rounded-2xl p-6 w-full max-w-5xl shadow-2xl mx-4">
+              <div className="flex items-center justify-between mb-4">
+                <div>
+                  <p className="text-white font-semibold text-lg">AI Suggestions — {personName}</p>
+                  <p className="text-xs text-gray-400 mt-0.5">
+                    {isReviewAll
+                      ? `Reviewing person ${aiReviewIndex + 1} of ${aiReviewPersonIds.length}`
+                      : 'Reviewing one named person'}
+                    {' · '}
+                    {aiReviewItems.length} suggestion{aiReviewItems.length !== 1 ? 's' : ''} remaining
+                  </p>
+                </div>
+                <button
+                  onClick={() => {
+                    setAiReviewModalOpen(false)
+                    setAiReviewItems([])
+                    setAiReviewPersonIds([])
+                    setAiReviewIndex(0)
+                  }}
+                  className="text-gray-400 hover:text-white text-xl leading-none px-2"
+                >
+                  ✕
+                </button>
+              </div>
+
+              {aiReviewItems.length === 0 ? (
+                <div className="rounded-xl border border-gray-800 bg-gray-950/50 p-6 text-center">
+                  <p className="text-gray-400 text-sm">No pending suggestions for this person.</p>
+                  {isReviewAll && aiReviewIndex + 1 < aiReviewPersonIds.length && (
+                    <button
+                      onClick={() => void goToAiReviewIndex(aiReviewIndex + 1)}
+                      className="mt-3 text-xs px-3 py-1.5 rounded-lg bg-cyan-700 hover:bg-cyan-600 text-white"
+                    >
+                      Next person
+                    </button>
+                  )}
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3 mb-5">
+                  {aiReviewItems.map(item => {
+                    const thumbUrl = item.representative_thumbnail
+                      ? '/thumbnails/' + item.representative_thumbnail.split('/thumbnails/').pop()
+                      : null
+                    return (
+                      <div key={item.id} className="relative rounded-xl border border-gray-800 bg-gray-950/40 p-2">
+                        <button
+                          onClick={() => void rejectAiSuggestion(item)}
+                          disabled={aiReviewBusy}
+                          title="Reject this suggestion"
+                          className="absolute top-1 right-1 w-5 h-5 rounded-full bg-red-700 hover:bg-red-600 disabled:opacity-40 text-white text-xs flex items-center justify-center"
+                        >
+                          ✕
+                        </button>
+                        <div className="w-full aspect-square rounded-lg overflow-hidden bg-gray-800 border border-gray-700 mb-2">
+                          {thumbUrl
+                            ? <img src={thumbUrl} alt="suggested face" className="w-full h-full object-cover" />
+                            : <span className="w-full h-full flex items-center justify-center text-gray-500 text-2xl">?</span>}
+                        </div>
+                        <p className="text-xs text-gray-200">{Math.round(item.similarity * 100)}% match</p>
+                        <p className="text-[11px] text-gray-500">{item.member_count} face{item.member_count !== 1 ? 's' : ''}</p>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  {isReviewAll && (
+                    <>
+                      <button
+                        onClick={() => void goToAiReviewIndex(aiReviewIndex - 1)}
+                        disabled={aiReviewBusy || aiReviewIndex === 0}
+                        className="text-xs px-2.5 py-1.5 rounded-lg border border-gray-700 text-gray-300 disabled:opacity-40"
+                      >
+                        Prev person
+                      </button>
+                      <button
+                        onClick={() => void goToAiReviewIndex(aiReviewIndex + 1)}
+                        disabled={aiReviewBusy || aiReviewIndex >= aiReviewPersonIds.length - 1}
+                        className="text-xs px-2.5 py-1.5 rounded-lg border border-gray-700 text-gray-300 disabled:opacity-40"
+                      >
+                        Next person
+                      </button>
+                    </>
+                  )}
+                </div>
+                <button
+                  onClick={() => void acceptAiSuggestionsForCurrentPerson()}
+                  disabled={aiReviewBusy || aiReviewItems.length === 0}
+                  className="rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white text-sm font-semibold px-4 py-2.5 transition-colors"
+                >
+                  {aiReviewBusy
+                    ? 'Applying…'
+                    : `Accept remaining (${aiReviewItems.length})`}
+                </button>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
+
+      {/* ── Per-person Find Similar threshold dialog ─────────────────────────── */}
+      {personSimilarDialogOpen && personSimilarDialogPerson && (
+        <div className="fixed inset-0 bg-black/75 flex items-center justify-center z-50">
+          <div className="bg-gray-900 border border-gray-700 rounded-2xl p-7 max-w-sm w-full shadow-2xl mx-4">
+            <p className="text-white font-semibold text-lg mb-1">Find Similar — {personSimilarDialogPerson.name}</p>
+            <p className="text-gray-400 text-sm mb-5">
+              Scans all {clusters.length} unnamed cluster{clusters.length !== 1 ? 's' : ''} for faces that may belong to this person.
+            </p>
+
+            <label className="block text-xs text-gray-400 mb-2">
+              Auto-merge threshold
+              <span className="ml-1 text-gray-600">(above this → merged without asking)</span>
+            </label>
+            <div className="flex items-center gap-3 mb-2">
+              <input
+                type="range" min={50} max={99} step={1}
+                value={Math.round(findSimilarThreshold * 100)}
+                onChange={e => setFindSimilarThreshold(Number(e.target.value) / 100)}
+                className="flex-1 accent-indigo-500"
+              />
+              <span className="text-sm text-white font-mono w-10 text-right">
+                {Math.round(findSimilarThreshold * 100)}%
+              </span>
+            </div>
+            <p className="text-xs text-gray-600 mb-6">
+              Matches between 50% and {Math.round(findSimilarThreshold * 100)}% will be shown for manual review.
+            </p>
+
+            <div className="flex gap-3">
+              <button
+                onClick={handlePersonSimilarConfirm}
+                className="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl py-2.5 text-sm font-semibold transition-colors"
+              >
+                Scan now
+              </button>
+              <button
+                onClick={() => setPersonSimilarDialogOpen(false)}
+                className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-xl py-2.5 text-sm font-medium transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── Connections graph modal ────────────────────────────────────────── */}
       {connectionsPersonId !== null && (
         <ConnectionsGraph
@@ -1790,6 +2650,19 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
             <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
               Always-ignored faces ({ignoredPersons.length})
             </h2>
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-gray-500">Sort</label>
+              <select
+                value={ignoredSort}
+                onChange={e => setIgnoredSort(e.target.value as 'photos_desc' | 'photos_asc' | 'newest' | 'oldest')}
+                className="text-xs px-2.5 py-1 rounded-lg border border-gray-600 bg-gray-800 text-gray-300"
+              >
+                <option value="photos_desc">Most photos</option>
+                <option value="photos_asc">Least photos</option>
+                <option value="newest">Recently ignored</option>
+                <option value="oldest">Oldest ignored</option>
+              </select>
+            </div>
           </div>
 
           {ignoredLoading && (
@@ -1838,6 +2711,23 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
             </div>
           )}
         </section>
+      )}
+
+      {reviewFocusPhotoIndex != null && reviewFocusPhotos[reviewFocusPhotoIndex] && (
+        <PhotoDetail
+          mediaId={reviewFocusPhotos[reviewFocusPhotoIndex].id}
+          filePath={reviewFocusPhotos[reviewFocusPhotoIndex].file_path}
+          canGoPrev={reviewFocusPhotoIndex > 0}
+          canGoNext={reviewFocusPhotoIndex < reviewFocusPhotos.length - 1}
+          onNavigate={(delta: number) => {
+            setReviewFocusPhotoIndex(prev => {
+              if (prev == null) return prev
+              const next = Math.max(0, Math.min(reviewFocusPhotos.length - 1, prev + delta))
+              return next
+            })
+          }}
+          onClose={() => setReviewFocusPhotoIndex(null)}
+        />
       )}
     </div>
   )

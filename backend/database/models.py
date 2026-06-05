@@ -14,6 +14,7 @@ import uuid as _uuid
 # Media
 # ---------------------------------------------------------------------------
 class MediaFileBase(BaseModel):
+    asset_id: Optional[str] = None
     file_path: str
     file_hash: str
     file_size: Optional[int] = None
@@ -50,12 +51,14 @@ class PersonCreate(BaseModel):
 class Person(BaseModel):
     id: int
     uuid: str
+    person_guid: Optional[str] = None
     name: Optional[str] = None
     created_at: str
     named_at: Optional[str] = None
     photo_count: int = 0
     is_merged: bool = False
     merged_into_id: Optional[int] = None
+    status: str = "active"
 
     class Config:
         from_attributes = True
@@ -66,12 +69,15 @@ class Person(BaseModel):
 # ---------------------------------------------------------------------------
 class Cluster(BaseModel):
     id: int
+    cluster_guid: Optional[str] = None
     person_id: Optional[int] = None
     member_count: int = 0
     intra_similarity: Optional[float] = None
     is_high_conf: bool = False
     created_at: str
     last_updated_at: str
+    is_active: bool = True
+    retired_at: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -82,12 +88,17 @@ class Cluster(BaseModel):
 # ---------------------------------------------------------------------------
 class Face(BaseModel):
     id: int
+    face_guid: Optional[str] = None
     media_file_id: int
     bbox_x: Optional[float] = None
     bbox_y: Optional[float] = None
     bbox_w: Optional[float] = None
     bbox_h: Optional[float] = None
     detection_conf: Optional[float] = None
+    face_sharpness: Optional[float] = None
+    pose_yaw: Optional[float] = None
+    pose_pitch: Optional[float] = None
+    pose_roll: Optional[float] = None
     thumbnail_path: Optional[str] = None
     person_id: Optional[int] = None
     cluster_id: Optional[int] = None

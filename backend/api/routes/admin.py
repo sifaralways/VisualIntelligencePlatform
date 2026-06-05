@@ -50,12 +50,26 @@ async def get_stats():
 
         tables = [
             "media_files", "faces", "embeddings",
-            "clusters", "persons", "writeback_queue",
+            "clusters", "persons",
         ]
         result = {}
         for t in tables:
             rows = await db.execute_fetchall(f"SELECT COUNT(*) as n FROM {t}")
             result[t] = rows[0]["n"]
+
+        # Queue semantics: dashboard expects pending items to write, not history.
+        pending_row = await (await db.execute(
+            "SELECT COUNT(*) AS n FROM writeback_queue WHERE status='pending'"
+        )).fetchone()
+        total_row = await (await db.execute(
+            "SELECT COUNT(*) AS n FROM writeback_queue"
+        )).fetchone()
+        failed_row = await (await db.execute(
+            "SELECT COUNT(*) AS n FROM writeback_queue WHERE status='failed'"
+        )).fetchone()
+        result["writeback_queue"] = int(pending_row["n"] if pending_row else 0)
+        result["writeback_queue_total"] = int(total_row["n"] if total_row else 0)
+        result["writeback_queue_failed"] = int(failed_row["n"] if failed_row else 0)
 
         # Extra detail
         rows = await db.execute_fetchall(
@@ -480,7 +494,9 @@ async def contacts_match(req: ContactsMatchRequest):
                    MIN(f.thumbnail_path) AS rep_thumb
             FROM clusters c
             LEFT JOIN faces f ON f.cluster_id = c.id AND f.thumbnail_path IS NOT NULL
-            WHERE c.person_id IS NULL
+            LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = c.cluster_guid
+            LEFT JOIN persons p ON p.person_guid = cpc.person_guid AND p.is_merged = 0 AND p.is_ignored = 0
+            WHERE p.id IS NULL
             GROUP BY c.id
             ORDER BY c.member_count DESC
         """)

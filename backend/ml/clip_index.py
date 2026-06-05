@@ -86,6 +86,15 @@ class ClipFaissIndex:
         meta_path = settings.clip_faiss_path.with_suffix(".meta.pkl")
 
         try:
+            if not ids_path.exists():
+                logger.warning(
+                    "ClipFaissIndex metadata missing (%s); ignoring stale index and rebuilding when needed",
+                    ids_path,
+                )
+                self._index = None
+                self._media_ids = []
+                self._dim = 0
+                return False
             self._index = faiss.read_index(str(settings.clip_faiss_path))
             with open(ids_path, "rb") as f:
                 self._media_ids = pickle.load(f)

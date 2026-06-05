@@ -22,6 +22,7 @@ from pathlib import Path
 from backend.config import settings
 from backend.database.db import get_db
 from backend.ml.analysis_builder import merge_analysis_document, build_hierarchical_subjects
+from backend.scanner.hasher import compute_hash
 from backend.writeback.exiftool import ExifToolWriter
 from backend.writeback.fields import build_field_map, FaceRegion, VIP_SUBJECT_PREFIXES
 
@@ -422,33 +423,80 @@ async def execute_writes(queue_ids: list[int] | None = None) -> dict:
     queue_written: list[tuple] = []
     media_written: list[tuple] = []
     queue_failed:  list[tuple] = []
+    hash_refresh_failures = 0
 
+    media_path_by_id = {
+        int(r["media_file_id"]): Path(r["file_path"])
+        for r in rows
+    }
+
+    media_hash_updates: dict[int, str] = {}
     for queue_id, media_id, success, msg in write_results:
         if msg == "skipped":
             continue
         if success:
             queue_written.append((queue_id,))
             media_written.append((media_id,))
+            file_path = media_path_by_id.get(int(media_id))
+            if file_path is not None and file_path.exists():
+                try:
+                    media_hash_updates[int(media_id)] = compute_hash(file_path)
+                except Exception as exc:
+                    logger.warning(
+                        "Could not refresh file_hash after writeback for media_id=%d (%s): %s",
+                        media_id,
+                        file_path,
+                        exc,
+                    )
+            else:
+                logger.warning(
+                    "Skipping file_hash refresh for media_id=%d because file is unavailable at %s",
+                    media_id,
+                    file_path,
+                )
         else:
             queue_failed.append((msg, queue_id))
 
     async with get_db() as db:
-        if queue_written:
-            await db.executemany(
-                "UPDATE writeback_queue SET status='written', written_at=datetime('now') WHERE id=?",
-                queue_written,
-            )
-            await db.executemany(
-                "UPDATE media_files SET writeback_done=1, writeback_at=datetime('now') WHERE id=?",
-                media_written,
-            )
         if queue_failed:
             await db.executemany(
                 "UPDATE writeback_queue SET status='failed', error_msg=? WHERE id=?",
                 queue_failed,
             )
 
-    return {"written": len(queue_written), "failed": len(queue_failed)}
+        # Update media rows one-by-one so a hash uniqueness conflict on one file
+        # does not roll back the whole writeback batch.
+        for (queue_id,), (media_id,) in zip(queue_written, media_written):
+            await db.execute(
+                "UPDATE writeback_queue SET status='written', written_at=datetime('now') WHERE id=?",
+                (queue_id,),
+            )
+            try:
+                new_hash = media_hash_updates.get(int(media_id))
+                if new_hash:
+                    await db.execute(
+                        """
+                        UPDATE media_files
+                        SET writeback_done=1,
+                            writeback_at=datetime('now'),
+                            file_hash=?
+                        WHERE id=?
+                        """,
+                        (new_hash, media_id),
+                    )
+                else:
+                    await db.execute(
+                        "UPDATE media_files SET writeback_done=1, writeback_at=datetime('now') WHERE id=?",
+                        (media_id,),
+                    )
+            except Exception as exc:
+                hash_refresh_failures += 1
+                await db.execute(
+                    "UPDATE writeback_queue SET status='failed', error_msg=? WHERE id=?",
+                    (f"Hash refresh failed after writeback: {exc}", queue_id),
+                )
+
+    return {"written": max(0, len(queue_written) - hash_refresh_failures), "failed": len(queue_failed) + hash_refresh_failures}
 
 
 async def _build_fields_batch(media_ids: list[int]) -> dict[int, dict]:
@@ -471,14 +519,16 @@ async def _build_fields_batch(media_ids: list[int]) -> dict[int, dict]:
         person_rows = await db.execute_fetchall(f"""
             SELECT DISTINCT f.media_file_id, p.name, f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h
             FROM faces f
-            JOIN persons p ON p.id = f.person_id
+                        JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                        JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                        JOIN persons p ON p.person_guid = cpc.person_guid
             WHERE f.media_file_id IN ({ph})
               AND p.name IS NOT NULL
               AND p.is_merged = 0
         """, media_ids)
 
         meta_rows = await db.execute_fetchall(f"""
-            SELECT id, gps_lat, gps_lon, vip_id
+            SELECT id, gps_lat, gps_lon, vip_id, asset_id
             FROM media_files WHERE id IN ({ph})
         """, media_ids)
 
@@ -545,18 +595,26 @@ async def _build_fields_batch(media_ids: list[int]) -> dict[int, dict]:
         meta    = meta_by_mid.get(media_id)
         gps_lat = meta["gps_lat"] if meta else None
         gps_lon = meta["gps_lon"] if meta else None
-        vip_id  = meta["vip_id"]  if meta else None
+        stable_id = None
+        if meta:
+            stable_id = meta["asset_id"] if "asset_id" in meta.keys() and meta["asset_id"] else meta["vip_id"]
 
         objects: list[str]   = []
         animals: list[str]   = []
         geography: list[str] = []
         places: list[str]    = []
+        captions: list[str]  = []
+        ocr_lines: list[str] = []
+        region_lines: list[str] = []
         for t in tag_list:
             cat, label = t["category"], t["label"]
             if cat == "object":       objects.append(label)
             elif cat == "animal":     animals.append(label)
             elif cat == "geography":  geography.append(label)
             elif cat == "place":      places.append(label)
+            elif cat == "caption":    captions.append(label)
+            elif cat == "ocr":        ocr_lines.append(label)
+            elif cat == "region":     region_lines.append(label)
 
         hierarchical_subjects: list[str] | None = None
         doc = docs_by_mid.get(media_id, {})
@@ -573,8 +631,11 @@ async def _build_fields_batch(media_ids: list[int]) -> dict[int, dict]:
             places=places or None,
             gps_lat=gps_lat,
             gps_lon=gps_lon,
-            vip_id=vip_id,
+            vip_id=stable_id,
             hierarchical_subjects=hierarchical_subjects,
+            florence_caption=(captions[0] if captions else None),
+            florence_ocr_lines=ocr_lines or None,
+            florence_region_lines=region_lines or None,
         )
 
     return result
@@ -592,7 +653,9 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
         person_rows = await db.execute_fetchall("""
             SELECT DISTINCT p.name, f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h
             FROM faces f
-            JOIN persons p ON p.id = f.person_id
+                        JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+                        JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+                        JOIN persons p ON p.person_guid = cpc.person_guid
             WHERE f.media_file_id = ?
               AND p.name IS NOT NULL
               AND p.is_merged = 0
@@ -601,7 +664,7 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
         # GPS + vip_id from media_files
         meta_row = await (
             await db.execute(
-                "SELECT gps_lat, gps_lon, vip_id FROM media_files WHERE id=?", (media_file_id,)
+                "SELECT gps_lat, gps_lon, vip_id, asset_id FROM media_files WHERE id=?", (media_file_id,)
             )
         ).fetchone()
 
@@ -640,13 +703,18 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
 
     gps_lat = meta_row["gps_lat"] if meta_row else None
     gps_lon = meta_row["gps_lon"] if meta_row else None
-    vip_id  = meta_row["vip_id"]  if meta_row else None
+    stable_id = None
+    if meta_row:
+        stable_id = meta_row["asset_id"] if "asset_id" in meta_row.keys() and meta_row["asset_id"] else meta_row["vip_id"]
 
     # Group tags by category
     objects: list[str] = []
     animals: list[str] = []
     geography: list[str] = []
     places: list[str] = []
+    captions: list[str] = []
+    ocr_lines: list[str] = []
+    region_lines: list[str] = []
     for t in tag_rows:
         cat, label = t["category"], t["label"]
         if cat == "object":
@@ -657,6 +725,12 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
             geography.append(label)
         elif cat == "place":
             places.append(label)
+        elif cat == "caption":
+            captions.append(label)
+        elif cat == "ocr":
+            ocr_lines.append(label)
+        elif cat == "region":
+            region_lines.append(label)
 
     # Build hierarchical subjects from effective document labels
     hierarchical_subjects: list[str] | None = None
@@ -673,8 +747,11 @@ async def _build_fields_for_file(media_file_id: int) -> dict:
         places=places or None,
         gps_lat=gps_lat,
         gps_lon=gps_lon,
-        vip_id=vip_id,
+        vip_id=stable_id,
         hierarchical_subjects=hierarchical_subjects,
+        florence_caption=(captions[0] if captions else None),
+        florence_ocr_lines=ocr_lines or None,
+        florence_region_lines=region_lines or None,
     )
 
 
@@ -747,10 +824,28 @@ async def write_single_file(media_file_id: int) -> dict:
         raise RuntimeError(f"ExifTool write failed: {msg}")
 
     async with get_db() as db:
-        await db.execute(
-            "UPDATE media_files SET writeback_done=1, writeback_at=datetime('now') WHERE id=?",
-            (media_file_id,)
-        )
+        new_hash = None
+        try:
+            new_hash = compute_hash(file_path)
+        except Exception as exc:
+            logger.warning("write_single_file: hash refresh failed for media_id=%d: %s", media_file_id, exc)
+
+        if new_hash:
+            await db.execute(
+                """
+                UPDATE media_files
+                SET writeback_done=1,
+                    writeback_at=datetime('now'),
+                    file_hash=?
+                WHERE id=?
+                """,
+                (new_hash, media_file_id),
+            )
+        else:
+            await db.execute(
+                "UPDATE media_files SET writeback_done=1, writeback_at=datetime('now') WHERE id=?",
+                (media_file_id,)
+            )
 
     logger.info("Single write OK for media_id=%d — %d fields", media_file_id, len(fields))
     return {"status": "written", "fields_written": sorted(fields.keys())}

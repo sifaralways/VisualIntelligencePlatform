@@ -536,7 +536,7 @@ async def _unnamed_face_rows(limit: int, media_ids: list[int] | None = None) -> 
     limit = max(1, min(limit, 500))
     params: list[object] = []
     where_parts = [
-        "f.person_id IS NULL",
+        "owner.id IS NULL",
         "mf.removed_from_app = 0",
         "mf.is_stub = 0",
     ]
@@ -552,6 +552,9 @@ async def _unnamed_face_rows(limit: int, media_ids: list[int] | None = None) -> 
         "mf.file_path, mf.date_taken, f.detection_conf "
         "FROM faces f "
         "JOIN media_files mf ON mf.id = f.media_file_id "
+        "LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid "
+        "LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid "
+        "LEFT JOIN persons owner ON owner.person_guid = cpc.person_guid AND owner.is_merged = 0 AND owner.is_ignored = 0 "
         f"WHERE {' AND '.join(where_parts)} "
         "ORDER BY COALESCE(f.detection_conf, 0) DESC, f.id DESC "
         "LIMIT ?"
@@ -561,6 +564,9 @@ async def _unnamed_face_rows(limit: int, media_ids: list[int] | None = None) -> 
         "SELECT COUNT(*) AS c "
         "FROM faces f "
         "JOIN media_files mf ON mf.id = f.media_file_id "
+        "LEFT JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid "
+        "LEFT JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid "
+        "LEFT JOIN persons owner ON owner.person_guid = cpc.person_guid AND owner.is_merged = 0 AND owner.is_ignored = 0 "
         f"WHERE {' AND '.join(where_parts)}"
     )
 
@@ -639,13 +645,22 @@ async def _show_unnamed_faces(plan: AssistantPlan, state: AssistantState, limit:
 async def _count_named_faces(state: AssistantState) -> ExecutionResult:
     async with get_db() as db:
         identified = await db.execute_fetchall(
-            "SELECT COUNT(*) AS c FROM faces WHERE person_id IS NOT NULL"
+            """
+            SELECT COUNT(*) AS c
+            FROM faces f
+            JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+            JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+            JOIN persons p ON p.person_guid = cpc.person_guid
+            WHERE p.is_merged = 0
+            """
         )
         named = await db.execute_fetchall(
             """
             SELECT COUNT(*) AS c
             FROM faces f
-            JOIN persons p ON p.id = f.person_id
+            JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
+            JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
+            JOIN persons p ON p.person_guid = cpc.person_guid
             WHERE p.name IS NOT NULL
               AND p.name != ''
               AND p.is_merged = 0

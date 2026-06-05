@@ -6,11 +6,17 @@ import logging
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 
 from backend.database.db import get_db
+from backend.writeback.engine import execute_writes
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+class FolderWritebackRequest(BaseModel):
+    path_prefix: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +64,7 @@ async def list_folders():
 async def list_subfolders(folder_id: int):
     """
     Return every unique directory path that exists below a scanned folder's
-    root, together with the recursive photo count for each.
+    root, together with recursive photo and pending writeback counts for each.
 
     The frontend builds a tree from this flat list.  A path like
     /Volumes/Photos/2023/January will appear as one entry; clicking it
@@ -74,9 +80,21 @@ async def list_subfolders(folder_id: int):
 
         root: str = folder_row["folder_path"]
 
-        # Fetch all active file paths under the root in one query.
+        # Fetch all active file paths under the root in one query and annotate
+        # whether each file currently has pending writeback work.
         rows = await db.execute_fetchall(
-            "SELECT file_path FROM media_files WHERE file_path LIKE ? AND removed_from_app=0",
+            """
+            SELECT
+                mf.file_path,
+                CASE WHEN EXISTS (
+                    SELECT 1 FROM writeback_queue wq
+                    WHERE wq.media_file_id = mf.id
+                      AND wq.status = 'pending'
+                ) THEN 1 ELSE 0 END AS has_pending_writeback
+            FROM media_files mf
+            WHERE mf.file_path LIKE ?
+              AND mf.removed_from_app = 0
+            """,
             (root + "/%",),
         )
 
@@ -84,23 +102,87 @@ async def list_subfolders(folder_id: int):
     # the root and each file.  Count each file once for every ancestor dir.
     from collections import defaultdict
     counts: dict[str, int] = defaultdict(int)
+    pending_counts: dict[str, int] = defaultdict(int)
 
     root_prefix = root + "/"
     for row in rows:
         rel = row["file_path"][len(root_prefix):]   # e.g. "2023/January/IMG.jpg"
         parts = rel.split("/")
+        has_pending = int(row["has_pending_writeback"] or 0)
         # parts[-1] is the file name; parts[:-1] are the directory segments
         for depth in range(1, len(parts)):
             sub = root_prefix + "/".join(parts[:depth])
             counts[sub] += 1
+            if has_pending:
+                pending_counts[sub] += 1
 
     # Sort so that parents always precede their children (lexicographic on path
     # works because we use full absolute paths).
     results = [
-        {"path": p, "name": p.split("/")[-1], "photo_count": c}
+        {
+            "path": p,
+            "name": p.split("/")[-1],
+            "photo_count": c,
+            "pending_writeback_count": pending_counts.get(p, 0),
+        }
         for p, c in sorted(counts.items())
     ]
     return results
+
+
+@router.post("/{folder_id}/writeback")
+async def writeback_folder_scope(folder_id: int, req: FolderWritebackRequest):
+    """Execute pending writeback for a folder (or a scoped subfolder prefix)."""
+    async with get_db() as db:
+        folder_row = await (
+            await db.execute(
+                "SELECT folder_path FROM scan_state WHERE id=?",
+                (folder_id,),
+            )
+        ).fetchone()
+
+    if not folder_row:
+        raise HTTPException(status_code=404, detail="Folder not found")
+
+    folder_root = Path(folder_row["folder_path"]).resolve()
+    if req.path_prefix:
+        scope_path = Path(req.path_prefix).resolve()
+        if scope_path != folder_root and folder_root not in scope_path.parents:
+            raise HTTPException(status_code=400, detail="path_prefix must be inside the selected folder")
+    else:
+        scope_path = folder_root
+
+    path_like = str(scope_path) + "/%"
+    async with get_db() as db:
+        rows = await db.execute_fetchall(
+            """
+            SELECT wq.id
+            FROM writeback_queue wq
+            JOIN media_files mf ON mf.id = wq.media_file_id
+            WHERE wq.status = 'pending'
+              AND mf.removed_from_app = 0
+              AND mf.file_path LIKE ?
+            """,
+            (path_like,),
+        )
+
+    queue_ids = [int(r["id"]) for r in rows]
+    if not queue_ids:
+        return {
+            "status": "ok",
+            "scope": str(scope_path),
+            "pending": 0,
+            "written": 0,
+            "failed": 0,
+        }
+
+    result = await execute_writes(queue_ids)
+    return {
+        "status": "ok",
+        "scope": str(scope_path),
+        "pending": len(queue_ids),
+        **result,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -113,8 +195,12 @@ async def remove_folder_from_app(folder_id: int, force: bool = False):
     Soft-remove all photos in a scanned folder.
 
     Sets removed_from_app=1 on every active media_file whose path is under
-    the folder's root.  The DB rows (file_hash, vip_id…) are preserved so
+    the folder's root. The DB rows (file_hash, vip_id…) are preserved so
     a rescan can re-use them.
+
+    Non-face artifacts for those photos are purged so they can be rebuilt on
+    re-scan: media_tags, photo_analysis, clip_embeddings, writeback_queue.
+    Face-related rows (faces/embeddings/clusters/person links) are kept.
 
     If force=False and there are pending writeback entries, returns a warning
     payload.  The client should confirm with the user and re-call with
@@ -155,6 +241,51 @@ async def remove_folder_from_app(folder_id: int, force: bool = False):
 
         result = await db.execute(
             "UPDATE media_files SET removed_from_app=1 WHERE file_path LIKE ? AND removed_from_app=0",
+            (path_prefix,),
+        )
+        tags_result = await db.execute(
+            """
+            DELETE FROM media_tags
+            WHERE media_file_id IN (
+                SELECT id FROM media_files WHERE file_path LIKE ?
+            )
+            """,
+            (path_prefix,),
+        )
+        analysis_result = await db.execute(
+            """
+            DELETE FROM photo_analysis
+            WHERE media_file_id IN (
+                SELECT id FROM media_files WHERE file_path LIKE ?
+            )
+            """,
+            (path_prefix,),
+        )
+        clip_result = await db.execute(
+            """
+            DELETE FROM clip_embeddings
+            WHERE media_file_id IN (
+                SELECT id FROM media_files WHERE file_path LIKE ?
+            )
+            """,
+            (path_prefix,),
+        )
+        queue_result = await db.execute(
+            """
+            DELETE FROM writeback_queue
+            WHERE media_file_id IN (
+                SELECT id FROM media_files WHERE file_path LIKE ?
+            )
+            """,
+            (path_prefix,),
+        )
+        await db.execute(
+            """
+            UPDATE media_files
+            SET tags_done = 0,
+                florence_done = 0
+            WHERE file_path LIKE ?
+            """,
             (path_prefix,),
         )
         # Remove the scan_state row so the folder disappears from the sidebar
@@ -201,5 +332,9 @@ async def remove_folder_from_app(folder_id: int, force: bool = False):
         )
 
     return {"status": "ok", "removed": result.rowcount,
+            "non_face_tags_deleted": tags_result.rowcount,
+            "photo_analysis_deleted": analysis_result.rowcount,
+            "clip_embeddings_deleted": clip_result.rowcount,
+            "writeback_rows_deleted": queue_result.rowcount,
             "deleted_photo_thumbs": deleted_thumbs,
             "deleted_previews": deleted_previews}

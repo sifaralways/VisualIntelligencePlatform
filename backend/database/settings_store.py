@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # Parameter catalogue — single source of truth for defaults + UI metadata
 # ---------------------------------------------------------------------------
 # Each entry: default value, type, min, max, step, human label, description, group.
-# type is one of "float" | "int".
+# type is one of "float" | "int" | "bool".
 
 DEFAULTS: dict[str, dict[str, Any]] = {
     "face_detection_mode": {
@@ -110,6 +110,12 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "description": "Clusters above this intra-similarity score show a green tick in the People tab.",
         "group": "Clustering",
     },
+    "person_centroid_max_faces": {
+        "value": 100, "type": "int", "min": 10, "max": 500, "step": 10,
+        "label": "Centroid exemplar faces",
+        "description": "Maximum number of best-quality faces retained per person to build their centroid.",
+        "group": "Clustering",
+    },
     "auto_name_threshold": {
         "value": 0.98, "type": "float", "min": 0.70, "max": 0.99, "step": 0.01,
         "label": "Auto-merge threshold",
@@ -128,6 +134,88 @@ DEFAULTS: dict[str, dict[str, Any]] = {
             "Matches below this are ignored. Must be ≤ Auto-merge threshold."
         ),
         "group": "Clustering",
+    },
+    "unnamed_auto_merge_threshold": {
+        "value": 0.91, "type": "float", "min": 0.70, "max": 0.99, "step": 0.01,
+        "label": "Unnamed auto-merge threshold",
+        "description": (
+            "Cosine similarity at or above which an unnamed singleton face is automatically merged "
+            "into another unnamed cluster. Higher values reduce false merges. "
+            "Same-photo conflicts are always blocked."
+        ),
+        "group": "Clustering",
+    },
+    "merge_multi_anchor_enabled": {
+        "value": 0, "type": "bool", "min": 0, "max": 1, "step": 1,
+        "label": "Multi-anchor merge retrieval",
+        "description": "Use multiple person anchors (centroid + portrait + variation) for merge-suggestion candidate retrieval. Improves recall, with small additional CPU.",
+        "group": "Background Suggestions",
+        "options": [
+            {"value": 0, "label": "Off"},
+            {"value": 1, "label": "On"},
+        ],
+    },
+    "merge_multi_anchor_max": {
+        "value": 4, "type": "int", "min": 1, "max": 6, "step": 1,
+        "label": "Multi-anchor max anchors",
+        "description": "Maximum number of anchors used when multi-anchor retrieval is enabled.",
+        "group": "Background Suggestions",
+    },
+    "suggestion_worker_enabled": {
+        "value": 1, "type": "bool", "min": 0, "max": 1, "step": 1,
+        "label": "Quality suggestion worker",
+        "description": "Run proactive background suggestion generation when UI is idle.",
+        "group": "Background Suggestions",
+        "options": [
+            {"value": 0, "label": "Off"},
+            {"value": 1, "label": "On"},
+        ],
+    },
+    "suggestion_worker_idle_sec": {
+        "value": 20, "type": "int", "min": 5, "max": 300, "step": 5,
+        "label": "Idle threshold (s)",
+        "description": "Minimum user-idle time before quality-first background jobs can run.",
+        "group": "Background Suggestions",
+    },
+    "suggestion_worker_sleep_sec": {
+        "value": 15, "type": "int", "min": 2, "max": 300, "step": 1,
+        "label": "Worker cycle interval (s)",
+        "description": "Delay between background suggestion cycles.",
+        "group": "Background Suggestions",
+    },
+    "suggestion_worker_person_batch": {
+        "value": 8, "type": "int", "min": 1, "max": 50, "step": 1,
+        "label": "People per cycle",
+        "description": "How many named people are refreshed per quality-first cycle.",
+        "group": "Background Suggestions",
+    },
+    "suggestion_worker_max_per_person": {
+        "value": 25, "type": "int", "min": 5, "max": 100, "step": 1,
+        "label": "Max pending suggestions per person",
+        "description": "Maximum queued quality suggestions stored for each person.",
+        "group": "Background Suggestions",
+    },
+    "suggestion_worker_min_sim": {
+        "value": 0.45, "type": "float", "min": 0.20, "max": 0.95, "step": 0.01,
+        "label": "Background min similarity",
+        "description": "Lower bound for quality-first suggestion generation.",
+        "group": "Background Suggestions",
+    },
+    "suggestion_worker_min_margin": {
+        "value": 0.02, "type": "float", "min": 0.00, "max": 0.30, "step": 0.01,
+        "label": "Background min competitor margin",
+        "description": "Minimum margin versus nearest competing person in quality-first mode.",
+        "group": "Background Suggestions",
+    },
+    "suggestion_faiss_stale_ratio": {
+        "value": 0.08, "type": "float", "min": 0.00, "max": 0.50, "step": 0.01,
+        "label": "Suggestion FAISS stale ratio",
+        "description": (
+            "If |faiss_vectors - embedding_rows| / embedding_rows exceeds this ratio, "
+            "suggestion retrieval skips FAISS shortlist and falls back to DB candidate scan "
+            "to avoid missing valid matches from stale indices."
+        ),
+        "group": "Background Suggestions",
     },
     "yolo_conf_threshold": {
         "value": 0.50, "type": "float", "min": 0.1, "max": 0.95, "step": 0.05,
@@ -190,6 +278,32 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         ),
         "group": "System",
     },
+    "florence_concurrency": {
+        "value": 1, "type": "int", "min": 1, "max": 4, "step": 1,
+        "label": "Florence parallel workers",
+        "description": (
+            "How many Florence batch jobs run at once during Phase 4. "
+            "Start with 1 for stability. Increase to 2 only if florence_wait is low and memory headroom is healthy."
+        ),
+        "group": "System",
+    },
+    "florence_inference_batch_size": {
+        "value": 8, "type": "int", "min": 1, "max": 16, "step": 1,
+        "label": "Florence micro-batch size",
+        "description": (
+            "Images processed together inside one Florence generation call. "
+            "Higher values can improve MPS utilization but increase memory use."
+        ),
+        "group": "System",
+    },
+    "florence_num_beams": {
+        "value": 1, "type": "int", "min": 1, "max": 4, "step": 1,
+        "label": "Florence beam width",
+        "description": (
+            "Generation beam width for Florence. 1 is fastest. Higher values may improve text quality but can be much slower."
+        ),
+        "group": "System",
+    },
     "exif_batch_size": {
         "value": 500, "type": "int", "min": 10, "max": 1000, "step": 10,
         "label": "Phase 1 ExifTool batch size",
@@ -209,6 +323,76 @@ DEFAULTS: dict[str, dict[str, Any]] = {
             "0.65 is a reliable default. Takes effect on the next scan."
         ),
         "group": "Content Safety",
+    },
+    "object_detector_enabled": {
+        "value": 1, "type": "bool", "min": 0, "max": 1, "step": 1,
+        "label": "Object detector enabled",
+        "description": "Enable YOLO-based object and animal base detection during Phase 4 tagging.",
+        "group": "ML Modules",
+        "options": [
+            {"value": 0, "label": "Off"},
+            {"value": 1, "label": "On"},
+        ],
+    },
+    "scene_classifier_enabled": {
+        "value": 1, "type": "bool", "min": 0, "max": 1, "step": 1,
+        "label": "Scene classifier enabled",
+        "description": "Enable Places365 scene and geography tagging.",
+        "group": "ML Modules",
+        "options": [
+            {"value": 0, "label": "Off"},
+            {"value": 1, "label": "On"},
+        ],
+    },
+    "landmark_recogniser_enabled": {
+        "value": 1, "type": "bool", "min": 0, "max": 1, "step": 1,
+        "label": "Landmark recogniser enabled",
+        "description": "Enable landmark recognition using GLDv2 or OpenCLIP fallback.",
+        "group": "ML Modules",
+        "options": [
+            {"value": 0, "label": "Off"},
+            {"value": 1, "label": "On"},
+        ],
+    },
+    "species_classifier_enabled": {
+        "value": 1, "type": "bool", "min": 0, "max": 1, "step": 1,
+        "label": "Species classifier enabled",
+        "description": "Enable BioCLIP species classification when an animal is detected.",
+        "group": "ML Modules",
+        "options": [
+            {"value": 0, "label": "Off"},
+            {"value": 1, "label": "On"},
+        ],
+    },
+    "geo_resolver_enabled": {
+        "value": 1, "type": "bool", "min": 0, "max": 1, "step": 1,
+        "label": "Geo resolver enabled",
+        "description": "Enable GPS-to-place resolution for photos with location coordinates.",
+        "group": "ML Modules",
+        "options": [
+            {"value": 0, "label": "Off"},
+            {"value": 1, "label": "On"},
+        ],
+    },
+    "explicit_detector_enabled": {
+        "value": 1, "type": "bool", "min": 0, "max": 1, "step": 1,
+        "label": "Explicit detector enabled",
+        "description": "Enable NudeNet explicit-content detection during tagging.",
+        "group": "ML Modules",
+        "options": [
+            {"value": 0, "label": "Off"},
+            {"value": 1, "label": "On"},
+        ],
+    },
+    "florence_enabled": {
+        "value": 0, "type": "bool", "min": 0, "max": 1, "step": 1,
+        "label": "Florence enabled",
+        "description": "Enable Florence-2 captioning and OCR enrichment during Phase 4 tagging.",
+        "group": "ML Modules",
+        "options": [
+            {"value": 0, "label": "Off"},
+            {"value": 1, "label": "On"},
+        ],
     },
     "exif_batch_timeout": {
         "value": 300, "type": "int", "min": 30, "max": 3600, "step": 30,
