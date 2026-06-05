@@ -20,7 +20,12 @@ from backend.face_quality import face_quality_score_from_row, select_top_face_ro
 logger = logging.getLogger(__name__)
 
 
-async def rebuild_person_centroid_faces(db, person_id: int) -> int:
+async def rebuild_person_centroid_faces(
+    db,
+    person_id: int,
+    *,
+    prefer_recent_photos: bool = False,
+) -> int:
     max_faces = max(1, int(settings_store.get("person_centroid_max_faces") or 100))
     rows = await db.execute_fetchall("""
         SELECT e.face_id,
@@ -32,9 +37,11 @@ async def rebuild_person_centroid_faces(db, person_id: int) -> int:
                f.face_sharpness,
                f.pose_yaw,
                f.pose_pitch,
-               f.pose_roll
+               f.pose_roll,
+               mf.date_taken
         FROM embeddings e
         JOIN faces f ON f.id = e.face_id
+        JOIN media_files mf ON mf.id = f.media_file_id
         JOIN v_face_cluster_current fcc ON fcc.face_guid = f.face_guid
         JOIN v_cluster_person_current cpc ON cpc.cluster_guid = fcc.cluster_guid
         JOIN persons p ON p.person_guid = cpc.person_guid
@@ -46,7 +53,11 @@ async def rebuild_person_centroid_faces(db, person_id: int) -> int:
     if not rows:
         return 0
 
-    selected_rows = select_top_face_rows(rows, max_faces=max_faces)
+    selected_rows = select_top_face_rows(
+        rows,
+        max_faces=max_faces,
+        prefer_recent_photos=prefer_recent_photos,
+    )
     await db.executemany(
         """
         INSERT INTO person_centroid_faces (person_id, face_id, quality_score)
@@ -60,7 +71,12 @@ async def rebuild_person_centroid_faces(db, person_id: int) -> int:
     return len(selected_rows)
 
 
-async def update_person_centroid(db, person_id: int) -> None:
+async def update_person_centroid(
+    db,
+    person_id: int,
+    *,
+    prefer_recent_photos: bool = False,
+) -> None:
     """
     Recompute and store the normalised centroid for a named person.
 
@@ -76,7 +92,11 @@ async def update_person_centroid(db, person_id: int) -> None:
     If the person has no remaining embeddings (all photos deleted), the centroid
     is set to NULL so the person is skipped in matching until new photos arrive.
     """
-    selected_count = await rebuild_person_centroid_faces(db, person_id)
+    selected_count = await rebuild_person_centroid_faces(
+        db,
+        person_id,
+        prefer_recent_photos=prefer_recent_photos,
+    )
 
     rows = await db.execute_fetchall("""
         SELECT e.vector,
@@ -87,10 +107,12 @@ async def update_person_centroid(db, person_id: int) -> None:
                f.face_sharpness,
                f.pose_yaw,
                f.pose_pitch,
-               f.pose_roll
+             f.pose_roll,
+             mf.date_taken
         FROM person_centroid_faces pcf
         JOIN embeddings e ON e.face_id = pcf.face_id
         JOIN faces f ON f.id = pcf.face_id
+         JOIN media_files mf ON mf.id = f.media_file_id
         WHERE pcf.person_id = ?
         ORDER BY pcf.quality_score DESC, pcf.face_id DESC
     """, (person_id,))
@@ -111,7 +133,10 @@ async def update_person_centroid(db, person_id: int) -> None:
         )
         return
 
-    centroid = weighted_centroid_from_rows(rows)
+    centroid = weighted_centroid_from_rows(
+        rows,
+        prefer_recent_photos=prefer_recent_photos,
+    )
     if centroid is None:
         await db.execute(
             "UPDATE persons SET centroid_n=0 WHERE id=?",
@@ -128,7 +153,10 @@ async def update_person_centroid(db, person_id: int) -> None:
         (centroid.tobytes(), selected_count, person_id),
     )
     logger.debug(
-        "Updated centroid for person_id=%d from %d exemplar faces", person_id, selected_count
+        "Updated centroid for person_id=%d from %d exemplar faces (prefer_recent_photos=%s)",
+        person_id,
+        selected_count,
+        prefer_recent_photos,
     )
 
 

@@ -593,6 +593,10 @@ class IgnoredPersonSuggestionRequest(BaseModel):
     limit: int = 8
 
 
+class RecalculateCentroidRequest(BaseModel):
+    prefer_recent_photos: bool = False
+
+
 @router.get("")
 async def list_persons(
     folder_id: int | None = None,
@@ -1949,7 +1953,8 @@ async def set_portrait_face(person_id: int, face_id: int):
 
 
 @router.post("/{person_id}/recalculate-centroid")
-async def recalculate_person_centroid(person_id: int):
+async def recalculate_person_centroid(person_id: int, req: RecalculateCentroidRequest | None = None):
+    prefer_recent_photos = bool(req.prefer_recent_photos) if req else False
     async with get_db() as db:
         person = await (
             await db.execute(
@@ -1960,7 +1965,7 @@ async def recalculate_person_centroid(person_id: int):
         if not person:
             raise HTTPException(status_code=404, detail="Person not found")
 
-        await update_person_centroid(db, person_id)
+        await update_person_centroid(db, person_id, prefer_recent_photos=prefer_recent_photos)
         selected_row = await (
             await db.execute(
                 "SELECT COUNT(*) AS n FROM person_centroid_faces WHERE person_id=?",
@@ -1973,6 +1978,7 @@ async def recalculate_person_centroid(person_id: int):
         "person_id": person_id,
         "person_name": person["name"],
         "selected_faces": int(selected_row["n"] or 0) if selected_row else 0,
+        "prefer_recent_photos": prefer_recent_photos,
     }
 
 

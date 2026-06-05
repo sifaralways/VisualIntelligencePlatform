@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
 
 import numpy as np
@@ -115,35 +116,116 @@ def face_quality_score_from_row(row: Any) -> float:
     )
 
 
-def select_top_face_rows(rows: list, max_faces: int) -> list:
+def _row_date_taken(row: Any) -> str | None:
+    keys = set(row.keys()) if hasattr(row, "keys") else set()
+    if "date_taken" not in keys:
+        return None
+    value = row["date_taken"]
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _parse_date_taken_timestamp(raw: str | None) -> float | None:
+    if not raw:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        pass
+
+    for fmt in (
+        "%Y:%m:%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d",
+    ):
+        try:
+            return datetime.strptime(text, fmt).timestamp()
+        except Exception:
+            continue
+    return None
+
+
+def _compute_row_recency_scores(rows: list) -> list[float]:
+    timestamps = [_parse_date_taken_timestamp(_row_date_taken(row)) for row in rows]
+    valid = [ts for ts in timestamps if ts is not None]
+    if len(valid) < 2:
+        return [0.0] * len(rows)
+
+    t_min = min(valid)
+    t_max = max(valid)
+    if t_max <= t_min:
+        return [0.0] * len(rows)
+
+    span = t_max - t_min
+    scores: list[float] = []
+    for ts in timestamps:
+        if ts is None:
+            scores.append(0.0)
+            continue
+        scores.append(float((ts - t_min) / span))
+    return scores
+
+
+def select_top_face_rows(
+    rows: list,
+    max_faces: int,
+    *,
+    prefer_recent_photos: bool = False,
+    recency_boost: float = 0.35,
+) -> list:
     if max_faces <= 0 or len(rows) <= max_faces:
         return list(rows)
-    ranked = sorted(rows, key=face_quality_score_from_row, reverse=True)
+
+    if not prefer_recent_photos:
+        ranked = sorted(rows, key=face_quality_score_from_row, reverse=True)
+        return ranked[:max_faces]
+
+    recency_scores = _compute_row_recency_scores(rows)
+
+    def _combined_rank(entry: tuple[Any, float]) -> float:
+        row, recency = entry
+        quality = face_quality_score_from_row(row)
+        return quality * (1.0 + max(0.0, recency_boost) * recency)
+
+    ranked_pairs = sorted(zip(rows, recency_scores), key=_combined_rank, reverse=True)
+    ranked = [row for row, _ in ranked_pairs]
     return ranked[:max_faces]
 
 
-def weighted_centroid_from_rows(rows: list) -> np.ndarray | None:
+def weighted_centroid_from_rows(
+    rows: list,
+    *,
+    prefer_recent_photos: bool = False,
+    recency_boost: float = 0.35,
+) -> np.ndarray | None:
     if not rows:
         return None
 
     vecs: list[np.ndarray] = []
     weights: list[float] = []
-    for row in rows:
+    recency_scores = _compute_row_recency_scores(rows) if prefer_recent_photos else [0.0] * len(rows)
+    for row, recency in zip(rows, recency_scores):
         vec = np.frombuffer(row["vector"], dtype=np.float32)
         vecs.append(vec)
         keys = set(row.keys()) if hasattr(row, "keys") else set()
         quality = row_quality_values(row)
-        weights.append(
-            face_sample_weight(
-                row["detection_conf"] if "detection_conf" in keys else None,
-                row["bbox_w"] if "bbox_w" in keys else None,
-                row["bbox_h"] if "bbox_h" in keys else None,
-                quality["face_sharpness"],
-                quality["pose_yaw"],
-                quality["pose_pitch"],
-                quality["pose_roll"],
-            )
+        base_weight = face_sample_weight(
+            row["detection_conf"] if "detection_conf" in keys else None,
+            row["bbox_w"] if "bbox_w" in keys else None,
+            row["bbox_h"] if "bbox_h" in keys else None,
+            quality["face_sharpness"],
+            quality["pose_yaw"],
+            quality["pose_pitch"],
+            quality["pose_roll"],
         )
+        weights.append(base_weight * (1.0 + max(0.0, recency_boost) * recency))
 
     arr = np.stack(vecs)
     w = np.asarray(weights, dtype=np.float32)

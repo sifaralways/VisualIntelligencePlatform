@@ -342,9 +342,12 @@ export const api = {
       request<{ status: string; person_id: number; portrait_face_id: number }>(
         `/persons/${personId}/set-portrait/${faceId}`, { method: 'POST' }
       ),
-    recalculateCentroid: (personId: number) =>
-      request<{ status: string; person_id: number; person_name: string | null; selected_faces: number }>(
-        `/persons/${personId}/recalculate-centroid`, { method: 'POST' }
+    recalculateCentroid: (personId: number, preferRecentPhotos = false) =>
+      request<{ status: string; person_id: number; person_name: string | null; selected_faces: number; prefer_recent_photos: boolean }>(
+        `/persons/${personId}/recalculate-centroid`, {
+          method: 'POST',
+          body: JSON.stringify({ prefer_recent_photos: preferRecentPhotos }),
+        }
       ),
     assignFace: (faceId: number, name: string) =>
       request<{ status: string; face_id: number; person_id: number }>(

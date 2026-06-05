@@ -57,6 +57,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
   const [reviewPortraitFaceId, setReviewPortraitFaceId] = useState<number | null>(null)
   const [recalculatingCentroid, setRecalculatingCentroid] = useState(false)
   const [recalculateCentroidResult, setRecalculateCentroidResult] = useState<string | null>(null)
+  const [preferRecentCentroidPhotos, setPreferRecentCentroidPhotos] = useState(false)
   const [settingPortrait, setSettingPortrait] = useState<number | null>(null)
   const [reviewFocusFaceId, setReviewFocusFaceId] = useState<number | null>(null)
   const [reviewFocusFaceClusterId, setReviewFocusFaceClusterId] = useState<number | null>(null)
@@ -842,6 +843,7 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     setReviewFocusPhotoIndex(null)
     setConfirmUnname(false)
     setRecalculateCentroidResult(null)
+    setPreferRecentCentroidPhotos(false)
     setReviewLoading(true)
     try {
       const faces = await api.faces.byPerson(person.id, REVIEW_PAGE_SIZE, 0, 'detection_conf', 'desc')
@@ -871,8 +873,11 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
     setRecalculatingCentroid(true)
     setRecalculateCentroidResult(null)
     try {
-      const result = await api.persons.recalculateCentroid(reviewPerson.id)
-      setRecalculateCentroidResult(`Centroid rebuilt from ${result.selected_faces} best face${result.selected_faces === 1 ? '' : 's'}.`)
+      const result = await api.persons.recalculateCentroid(reviewPerson.id, preferRecentCentroidPhotos)
+      const modeText = result.prefer_recent_photos ? ' with recent-photo weighting.' : '.'
+      setRecalculateCentroidResult(
+        `Centroid rebuilt from ${result.selected_faces} best face${result.selected_faces === 1 ? '' : 's'}${modeText}`
+      )
       await load()
     } catch {
       setRecalculateCentroidResult('Could not recalculate centroid.')
@@ -1366,10 +1371,20 @@ export default function PeoplePage({ onSelectPerson, onSelectCluster }: Props) {
                   </>
                 ) : (
                   <>
+                    <label className="text-xs text-gray-300 inline-flex items-center gap-1.5 select-none mr-1">
+                      <input
+                        type="checkbox"
+                        checked={preferRecentCentroidPhotos}
+                        onChange={e => setPreferRecentCentroidPhotos(e.target.checked)}
+                        disabled={recalculatingCentroid}
+                        className="accent-indigo-500"
+                      />
+                      Prefer recent photos
+                    </label>
                     <button
                       onClick={handleRecalculateCentroid}
                       disabled={recalculatingCentroid}
-                      title="Rebuild this person's centroid from the current best-quality assigned faces"
+                      title="Rebuild this person's centroid from best-quality faces, optionally boosting newer photos"
                       className="text-xs px-2.5 py-1 rounded-lg border border-indigo-800 bg-indigo-900/20 text-indigo-300 hover:bg-indigo-900/40 hover:text-indigo-200 disabled:opacity-40 transition-colors"
                     >
                       {recalculatingCentroid ? 'Recalculating…' : 'Recalculate centroid'}
